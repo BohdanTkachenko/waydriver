@@ -68,7 +68,8 @@
 
       };
 
-      apps.${system}.coverage = {
+      apps.${system} = {
+        coverage = {
         type = "app";
         program =
           let
@@ -97,6 +98,41 @@
             '';
           in
           "${script}/bin/waydriver-coverage";
+      };
+
+        # nix run .# — launches the MCP server with runtime deps on PATH
+        mcp = {
+        type = "app";
+        program =
+          let
+            wrapper = pkgs.writeShellScriptBin "waydriver-mcp" ''
+              export PATH="${
+                pkgs.lib.makeBinPath [
+                  pkgs.dbus
+                  pkgs.at-spi2-core
+                  pkgs.mutter
+                  pkgs.pipewire
+                  pkgs.wireplumber
+                  pkgs.gst_all_1.gstreamer
+                  pkgs.gst_all_1.gst-plugins-base
+                  pkgs.gst_all_1.gst-plugins-good
+                ]
+              }:$PATH"
+              # at-spi-bus-launcher lives in libexec
+              export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
+              # D-Bus service files for AT-SPI registry auto-activation
+              export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${
+                pkgs.lib.concatStringsSep ":" [
+                  "${pkgs.gsettings-desktop-schemas}/share"
+                ]
+              }:''${XDG_DATA_DIRS:-/run/current-system/sw/share}"
+              # GStreamer plugin paths (core, base, good, pipewire)
+              export GST_PLUGIN_PATH="${gstPluginPath}"
+              exec ${self.packages.${system}.default}/bin/waydriver-mcp "$@"
+            '';
+          in
+          "${wrapper}/bin/waydriver-mcp";
+        };
       };
 
       checks.${system}.tests = pkgs.rustPlatform.buildRustPackage {

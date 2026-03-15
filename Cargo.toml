@@ -5,6 +5,7 @@ members = [
     "crates/waydriver-compositor-mutter",
     "crates/waydriver-input-mutter",
     "crates/waydriver-capture-mutter",
+    "crates/waydriver-mcp",
 ]
 
 [workspace.package]
@@ -17,10 +18,12 @@ homepage = "https://github.com/BohdanTkachenko/waydriver"
 authors = ["Bohdan Tkachenko <bohdan@tkachenko.dev>"]
 
 [workspace.dependencies]
+rmcp = { version = "1.2", features = ["server", "macros", "transport-io"] }
 atspi = { version = "0.29", features = ["proxies", "connection"] }
 zbus = "5"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+schemars = "1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

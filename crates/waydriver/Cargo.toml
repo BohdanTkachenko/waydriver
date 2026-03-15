@@ -12,6 +12,10 @@ readme = "../../README.md"
 keywords = ["wayland", "testing", "gui", "atspi", "accessibility"]
 categories = ["development-tools::testing", "gui"]
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 async-trait.workspace = true
 atspi.workspace = true
