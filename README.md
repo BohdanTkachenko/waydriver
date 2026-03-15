@@ -7,6 +7,8 @@
 
 A Rust library for headless GUI application testing on Wayland. Launches apps in isolated compositor sessions, interacts with them via AT-SPI accessibility APIs, and captures screenshots via PipeWire.
 
+The repo also contains `waydriver-mcp`, a standalone MCP server binary built on top of the library that lets AI assistants drive GTK4 apps directly — see [MCP server](#mcp-server) below.
+
 ## How it works
 
 Each test session creates an isolated environment with a headless compositor, input injection, and screen capture:
@@ -54,6 +56,7 @@ Currently only Mutter is implemented (`waydriver-compositor-mutter`, `waydriver-
 | `waydriver-compositor-mutter` | `CompositorRuntime` impl — manages Mutter, PipeWire, WirePlumber, private D-Bus              |
 | `waydriver-input-mutter`      | `InputBackend` impl — keyboard/pointer via Mutter RemoteDesktop                              |
 | `waydriver-capture-mutter`    | `CaptureBackend` impl — screenshots via Mutter ScreenCast + PipeWire                         |
+| `waydriver-mcp`               | Binary — MCP JSON-RPC server over stdio that exposes the library to AI assistants            |
 
 ## Usage
 
@@ -94,6 +97,44 @@ waydriver::atspi::click_element(
 
 session.kill().await?;
 ```
+
+## MCP server
+
+`waydriver-mcp` is a standalone binary that exposes the library over the [Model Context Protocol](https://modelcontextprotocol.io), letting AI assistants (Claude Desktop, Claude Code, etc.) drive GTK4 apps in isolated headless sessions. It speaks JSON-RPC over stdio and constructs the Mutter backends internally — clients only see the high-level tools below.
+
+| Tool              | Purpose                                                          |
+| ----------------- | ---------------------------------------------------------------- |
+| `start_session`   | Spawn a headless Mutter session and launch a command inside it   |
+| `list_sessions`   | List active session ids, app names, and Wayland displays         |
+| `kill_session`    | Tear down a session and clean up all child processes             |
+| `inspect_ui`      | Dump the AT-SPI accessibility tree of the running app            |
+| `click_element`   | Click a widget by its accessible name (via AT-SPI action)        |
+| `type_text`       | Type a string into a focused element through the input backend   |
+| `press_key`       | Press a named key (`Return`, `Tab`, `Escape`, letters, …)        |
+| `find_element`    | Find a widget by accessible name and return its role and path    |
+| `move_pointer`    | Move the pointer by a relative offset in logical pixels          |
+| `pointer_click`   | Press and release a pointer button (defaults to left click)      |
+| `take_screenshot` | Capture a PNG via the keepalive ScreenCast stream and return its path |
+
+Build and run with Nix — the wrapper injects the runtime env vars (`GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, `at-spi2-core/libexec`) that the raw binary lacks:
+
+```sh
+nix run .#mcp
+```
+
+Example MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "waydriver": {
+      "command": "/path/to/waydriver-mcp"
+    }
+  }
+}
+```
+
+Sessions are kept in an in-memory `HashMap` keyed by id, so multiple apps can run concurrently within one server process.
 
 ## Requirements
 

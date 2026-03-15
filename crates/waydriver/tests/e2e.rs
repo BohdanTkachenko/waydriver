@@ -119,7 +119,7 @@ async fn accessibility_tree_inspection() -> anyhow::Result<()> {
 
     // Dump the accessibility tree and verify it has content.
     let tree = waydriver::atspi::dump_app_tree(
-        &session.a11y_connection,
+        session.a11y_connection.as_ref().unwrap(),
         &session.app_bus_name,
         &session.app_path,
     )
@@ -134,7 +134,7 @@ async fn accessibility_tree_inspection() -> anyhow::Result<()> {
 
     // Find a known element — the "1" button.
     let (bus, path, role) = waydriver::atspi::find_element_by_name(
-        &session.a11y_connection,
+        session.a11y_connection.as_ref().unwrap(),
         &session.app_bus_name,
         &session.app_path,
         "1",
@@ -146,7 +146,7 @@ async fn accessibility_tree_inspection() -> anyhow::Result<()> {
 
     // Search for a non-existent element — should return ElementNotFound.
     let err = waydriver::atspi::find_element_by_name(
-        &session.a11y_connection,
+        session.a11y_connection.as_ref().unwrap(),
         &session.app_bus_name,
         &session.app_path,
         "nonexistent_element_xyz_12345",
@@ -177,7 +177,7 @@ async fn click_element_changes_display() -> anyhow::Result<()> {
 
     // Click "5" via AT-SPI, then wake GTK's event loop.
     let result = waydriver::atspi::click_element(
-        &session.a11y_connection,
+        session.a11y_connection.as_ref().unwrap(),
         &session.app_bus_name,
         &session.app_path,
         "5",
@@ -193,7 +193,7 @@ async fn click_element_changes_display() -> anyhow::Result<()> {
 
     // Click "3" via AT-SPI + wake.
     waydriver::atspi::click_element(
-        &session.a11y_connection,
+        session.a11y_connection.as_ref().unwrap(),
         &session.app_bus_name,
         &session.app_path,
         "3",

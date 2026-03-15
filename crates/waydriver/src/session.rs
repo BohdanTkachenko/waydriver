@@ -30,7 +30,7 @@ pub struct Session {
     pub app_name: String,
     pub app_bus_name: String,
     pub app_path: String,
-    pub a11y_connection: AccessibilityConnection,
+    pub a11y_connection: Option<AccessibilityConnection>,
     // Field declaration order matches the required shutdown sequence (app before
     // input/capture before compositor). The Drop impl sends SIGKILL to the app;
     // implicit field drops then release input/capture Arc refs before the
@@ -88,7 +88,7 @@ impl Session {
             app_name: cfg.app_name,
             app_bus_name,
             app_path,
-            a11y_connection,
+            a11y_connection: Some(a11y_connection),
             app,
             keepalive_stream,
             input,
@@ -134,6 +134,16 @@ impl Session {
         self.input.press_keysym(keysym).await
     }
 
+    /// Move the pointer by a relative offset in logical pixels.
+    pub async fn pointer_motion_relative(&self, dx: f64, dy: f64) -> Result<()> {
+        self.input.pointer_motion_relative(dx, dy).await
+    }
+
+    /// Press and release a pointer button (Linux evdev code, e.g. BTN_LEFT = 0x110).
+    pub async fn pointer_button(&self, button: u32) -> Result<()> {
+        self.input.pointer_button(button).await
+    }
+
     /// Wayland display socket name this session is running against.
     pub fn wayland_display(&self) -> &str {
         self.compositor.wayland_display()
@@ -146,6 +156,39 @@ impl Session {
             .as_ref()
             .ok_or_else(|| Error::Screenshot("no keepalive stream".into()))?;
         self.capture.grab_screenshot(stream).await
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Session {
+    /// Create a Session for testing without starting a real compositor or
+    /// connecting to D-Bus. AT-SPI tools will not work on test sessions.
+    pub fn new_for_test(
+        id: String,
+        app_name: String,
+        input: Box<dyn InputBackend>,
+        capture: Box<dyn CaptureBackend>,
+        compositor: Box<dyn CompositorRuntime>,
+    ) -> Self {
+        let app = Command::new("sleep")
+            .arg("86400")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn sleep for test session");
+
+        Session {
+            id,
+            app_name,
+            app_bus_name: String::new(),
+            app_path: String::new(),
+            a11y_connection: None,
+            app,
+            keepalive_stream: None,
+            input,
+            capture,
+            compositor,
+        }
     }
 }
 

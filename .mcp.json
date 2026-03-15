@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "waydriver-mcp": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "-p",
+        "waydriver-mcp"
+      ]
+    }
+  }
+}

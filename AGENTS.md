@@ -23,23 +23,34 @@ cargo clippy --workspace
 cargo fmt --all
 ```
 
+### Build and run (MCP binary)
+
+```sh
+nix build           # builds ./result/bin/waydriver (unwrapped)
+nix run .#mcp       # runs the wrapper with runtime deps injected (see flake.nix apps)
+```
+
+The `nix run` wrapper is the only way the server will function at runtime — it injects `GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, and the `at-spi2-core/libexec` path. Running the raw binary from `target/debug` will fail to launch subprocess dependencies.
+
 ## Architecture
 
-### Workspace layout — four crates
+### Workspace layout — five crates
 
 The project is a Cargo workspace under `crates/` with the naming convention `waydriver-<role>-<backend>` for concrete implementations. Trait definitions live in the umbrella library (`waydriver`); each concrete implementation of a trait is a separate sibling crate. Future backends (`waydriver-input-libei`, `waydriver-capture-wlr`, `waydriver-compositor-sway`) slot in as additive siblings.
 
-| Crate | Purpose |
-|---|---|
-| **`waydriver`** | Umbrella library. Trait definitions (`CompositorRuntime`, `InputBackend`, `CaptureBackend`), `Session` (holds three `Box<dyn Trait>` fields), AT-SPI client, keysym helpers, shared `grab_png` GStreamer helper, `Error`/`Result`. Zero mutter-specific code. |
-| **`waydriver-compositor-mutter`** | `MutterCompositor` impl of `CompositorRuntime`. Owns mutter/pipewire/wireplumber child processes + private D-Bus. Exposes `Arc<MutterState>` via `state()` after `start()`. |
-| **`waydriver-input-mutter`** | `MutterInput` impl of `InputBackend`. Wraps `Arc<MutterState>`, calls `org.gnome.Mutter.RemoteDesktop.Session.NotifyKeyboardKeysym` / `NotifyPointerMotionRelative`. |
-| **`waydriver-capture-mutter`** | `MutterCapture` impl of `CaptureBackend`. Wraps `Arc<MutterState>`, creates ScreenCast sessions, returns PipeWire node ids. |
+| Crate                             | Purpose                                                                                                                                                                                                                                                       |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`waydriver`**                   | Umbrella library. Trait definitions (`CompositorRuntime`, `InputBackend`, `CaptureBackend`), `Session` (holds three `Box<dyn Trait>` fields), AT-SPI client, keysym helpers, shared `grab_png` GStreamer helper, `Error`/`Result`. Zero mutter-specific code. |
+| **`waydriver-compositor-mutter`** | `MutterCompositor` impl of `CompositorRuntime`. Owns mutter/pipewire/wireplumber child processes + private D-Bus. Exposes `Arc<MutterState>` via `state()` after `start()`.                                                                                   |
+| **`waydriver-input-mutter`**      | `MutterInput` impl of `InputBackend`. Wraps `Arc<MutterState>`, calls `org.gnome.Mutter.RemoteDesktop.Session.NotifyKeyboardKeysym` / `NotifyPointerMotionRelative`.                                                                                          |
+| **`waydriver-capture-mutter`**    | `MutterCapture` impl of `CaptureBackend`. Wraps `Arc<MutterState>`, creates ScreenCast sessions, returns PipeWire node ids.                                                                                                                                   |
+| **`waydriver-mcp`**               | Binary. MCP JSON-RPC server over stdio. Constructs the three mutter impls, wires them into `Session::start`. Only crate depending on `rmcp`/`schemars`.                                                                                                       |
 
 **Dependency DAG** (must hold strictly — verify via `cargo tree -e normal -p <crate>`):
-- `waydriver` has no deps on any `waydriver-*-mutter` crate.
+- `waydriver` has no deps on any `waydriver-*-mutter` crate or `rmcp`.
 - `waydriver-compositor-mutter` depends on `waydriver` only.
 - `waydriver-input-mutter` and `waydriver-capture-mutter` depend on `waydriver` + `waydriver-compositor-mutter` (for `MutterState`).
+- `waydriver-mcp` depends on all four library crates.
 
 ### Session lifecycle
 
@@ -96,9 +107,17 @@ The signal subscription must happen **before** `Session.Start` — mutter emits 
 
 `Session::take_screenshot` uses the keepalive stream (started during `Session::start`) via `CaptureBackend::grab_screenshot`, avoiding per-screenshot stream setup/teardown overhead.
 
+### MCP server scaffolding
+
+- `crates/waydriver-mcp/src/main.rs` wires `UiTestServer` to stdio via `rmcp`. **All logging must go to stderr** — stdout is the JSON-RPC transport. `tracing_subscriber` is configured with `with_writer(std::io::stderr)`; don't `println!` anywhere.
+- Uses `rmcp`'s `#[tool_router]` / `#[tool]` macros. Each tool method takes `Parameters<T>` where `T` derives `Deserialize + JsonSchema` — the schema is what the MCP client (Claude) sees.
+- Session state lives in `Arc<RwLock<HashMap<String, Session>>>`. Read-only tools take a `.read()` lock, `start_session`/`kill_session` take `.write()`.
+
 ### Error model
 
 `waydriver::error` defines a single `Error` enum (`thiserror`); `Result<T>` is an alias.
+
+Inside the MCP binary, errors are mapped to `rmcp::ErrorData` via `McpError::internal_error(e.to_string(), None)` or `McpError::invalid_params` for missing-session lookups. Keep that distinction — user-visible "you passed a bad session id" is `invalid_params`, everything else is `internal_error`.
 
 ## Testing notes
 
