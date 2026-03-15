@@ -1,0 +1,6 @@
+.direnv
+.nix-profile
+/target
+/result
+/app.log
+test_*.sh

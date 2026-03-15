@@ -1,0 +1,352 @@
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+
+use atspi::connection::AccessibilityConnection;
+use tokio::process::{Child, Command};
+
+use crate::atspi as atspi_client;
+use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend};
+use crate::error::{Error, Result};
+
+/// Parameters for spawning the target application inside a session.
+pub struct SessionConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    /// Accessible name used to look the app up in the AT-SPI registry.
+    pub app_name: String,
+}
+
+/// A running UI test session: a compositor, input + capture backends, the
+/// target application process, and an AT-SPI connection to drive it.
+///
+/// Construct via [`Session::start`]. Callers are responsible for pre-starting
+/// the compositor (so they can wire mutually-dependent backends like
+/// `waydriver-input-mutter` / `waydriver-capture-mutter`, which share state
+/// with the compositor via `Arc<MutterState>`).
+pub struct Session {
+    pub id: String,
+    pub app_name: String,
+    pub app_bus_name: String,
+    pub app_path: String,
+    pub a11y_connection: AccessibilityConnection,
+    // Field declaration order matches the required shutdown sequence (app before
+    // input/capture before compositor). The Drop impl sends SIGKILL to the app;
+    // implicit field drops then release input/capture Arc refs before the
+    // compositor's own Drop kills its child processes.
+    app: Child,
+    /// A persistent ScreenCast stream kept alive so mutter composites
+    /// continuously in headless mode. Without this, the compositor never
+    /// sends Wayland frame callbacks and GTK4 apps cannot repaint after
+    /// their initial render.
+    keepalive_stream: Option<crate::backend::PipeWireStream>,
+    input: Box<dyn InputBackend>,
+    capture: Box<dyn CaptureBackend>,
+    compositor: Box<dyn CompositorRuntime>,
+}
+
+impl Session {
+    /// Build a session from a pre-started compositor plus matching input and
+    /// capture backends. The caller is responsible for calling
+    /// [`CompositorRuntime::start`] before passing the compositor in; this is
+    /// what lets the caller construct backend-specific input/capture types
+    /// from whatever state the compositor exposes after startup (for mutter,
+    /// that's `waydriver_compositor_mutter::MutterCompositor::state()`).
+    pub async fn start(
+        compositor: Box<dyn CompositorRuntime>,
+        input: Box<dyn InputBackend>,
+        capture: Box<dyn CaptureBackend>,
+        cfg: SessionConfig,
+    ) -> Result<Self> {
+        let id = compositor.id().to_string();
+        tracing::info!(id, "starting session");
+
+        let dbus_address = get_host_session_bus()?;
+        let app = spawn_app(
+            &cfg,
+            compositor.wayland_display(),
+            compositor.runtime_dir(),
+            &dbus_address,
+        )?;
+        tracing::debug!(id, app_name = %cfg.app_name, "app spawned");
+
+        let a11y_connection = atspi_client::connect_a11y(&dbus_address).await?;
+        let (app_bus_name, app_path) = wait_for_app(&a11y_connection, &cfg.app_name).await?;
+        tracing::info!(id, app_name = %cfg.app_name, %app_bus_name, "session ready");
+
+        // Start a keepalive ScreenCast stream. In headless mutter the
+        // compositor only delivers Wayland frame callbacks while it is
+        // actively compositing, and it only composites when a ScreenCast
+        // consumer is pulling frames. Without this stream, GTK4 apps
+        // render their first frame but never repaint because the frame
+        // clock never ticks.
+        let keepalive_stream = Some(capture.start_stream().await?);
+
+        let session = Session {
+            id,
+            app_name: cfg.app_name,
+            app_bus_name,
+            app_path,
+            a11y_connection,
+            app,
+            keepalive_stream,
+            input,
+            capture,
+            compositor,
+        };
+
+        Ok(session)
+    }
+
+    /// Shut down the session in the required order.
+    ///
+    /// **Ordering is load-bearing:**
+    /// 1. Kill the app first. Its Wayland connection holds a reference into
+    ///    the compositor; killing the compositor first can make the app block
+    ///    on its Wayland socket during shutdown.
+    /// 2. Drop the input and capture trait objects. For backends that share
+    ///    state with the compositor via `Arc` (e.g. mutter's
+    ///    `Arc<MutterState>` holding the private D-Bus connection), the
+    ///    strong count has to reach zero before the compositor tears the
+    ///    underlying resource down.
+    /// 3. Stop the compositor.
+    pub async fn kill(mut self) -> Result<()> {
+        tracing::info!(id = self.id, "killing session");
+
+        let _ = self.app.kill().await;
+        let _ = self.app.wait().await;
+
+        // Stop the keepalive ScreenCast stream before dropping backends.
+        if let Some(stream) = self.keepalive_stream.take() {
+            let _ = self.capture.stop_stream(stream).await;
+        }
+
+        self.compositor.stop().await?;
+
+        // self drops here: Drop sees an already-dead app and already-stopped
+        // compositor, then input/capture release their Arc refs harmlessly.
+        Ok(())
+    }
+
+    pub async fn press_keysym(&self, keysym: u32) -> Result<()> {
+        self.input.press_keysym(keysym).await
+    }
+
+    /// Wayland display socket name this session is running against.
+    pub fn wayland_display(&self) -> &str {
+        self.compositor.wayland_display()
+    }
+
+    /// Capture a PNG screenshot from the keepalive stream.
+    pub async fn take_screenshot(&self) -> Result<Vec<u8>> {
+        let stream = self
+            .keepalive_stream
+            .as_ref()
+            .ok_or_else(|| Error::Screenshot("no keepalive stream".into()))?;
+        self.capture.grab_screenshot(stream).await
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Best-effort kill when dropped without calling kill().
+        // After this returns, fields drop in declaration order:
+        // app → keepalive_stream → input → capture → compositor.
+        let _ = self.app.start_kill();
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn get_host_session_bus() -> Result<String> {
+    Ok(get_host_session_bus_inner(
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(),
+    ))
+}
+
+fn get_host_session_bus_inner(env_addr: Option<&str>) -> String {
+    if let Some(addr) = env_addr {
+        return addr.to_string();
+    }
+    let uid = unsafe { libc::getuid() };
+    format!("unix:path=/run/user/{}/bus", uid)
+}
+
+fn spawn_app(
+    cfg: &SessionConfig,
+    wayland_display: &str,
+    runtime_dir: &Path,
+    dbus_address: &str,
+) -> Result<Child> {
+    // Use the keyfile GSettings backend with an isolated config dir so
+    // the app starts with default state and never reads or writes the
+    // user's dconf database. The keyfile backend bypasses the dconf
+    // daemon entirely, unlike GSETTINGS_BACKEND=memory which the host
+    // daemon ignores.
+    let config_dir = runtime_dir.join("config");
+    let _ = std::fs::create_dir_all(&config_dir);
+
+    let mut cmd = Command::new(&cfg.command);
+    cmd.args(&cfg.args)
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("GSETTINGS_BACKEND", "keyfile")
+        .env("NO_AT_BRIDGE", "0")
+        .env("GTK_A11Y", "atspi")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(dir) = &cfg.cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.spawn()
+        .map_err(|e| Error::Process(format!("app '{}': {e}", cfg.command)))
+}
+
+fn normalize_app_name(name: &str) -> String {
+    name.to_lowercase().replace('-', " ")
+}
+
+fn app_name_matches(found: &str, target: &str) -> bool {
+    if found.is_empty() || target.is_empty() {
+        return false;
+    }
+    let norm_found = normalize_app_name(found);
+    let norm_target = normalize_app_name(target);
+    norm_found.contains(&norm_target) || norm_target.contains(&norm_found)
+}
+
+async fn wait_for_app(conn: &AccessibilityConnection, app_name: &str) -> Result<(String, String)> {
+    for i in 0..100 {
+        if let Ok(root) = atspi_client::get_registry_root(conn).await {
+            if let Ok(children) = root.get_children().await {
+                let mut found_names = Vec::new();
+                for child_ref in &children {
+                    let Some(bus_name) = child_ref.name_as_str() else {
+                        continue;
+                    };
+                    let path = child_ref.path_as_str();
+
+                    if let Ok(child) =
+                        atspi_client::build_accessible(conn.connection(), bus_name, path).await
+                    {
+                        if let Ok(name) = child.name().await {
+                            if app_name_matches(&name, app_name) {
+                                tracing::info!(
+                                    "found app '{}' as '{}' at {}:{}",
+                                    app_name,
+                                    name,
+                                    bus_name,
+                                    path
+                                );
+                                return Ok((bus_name.to_string(), path.to_string()));
+                            }
+                            found_names.push(name);
+                        }
+                    }
+                }
+
+                if i % 20 == 0 {
+                    tracing::debug!(
+                        "AT-SPI registry has {} apps: {:?} (looking for '{}')",
+                        found_names.len(),
+                        found_names,
+                        app_name
+                    );
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(Error::Timeout(format!(
+        "app '{}' did not appear in AT-SPI registry within 10s",
+        app_name
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_host_session_bus_from_env() {
+        let addr = "unix:path=/run/user/1000/bus";
+        let result = get_host_session_bus_inner(Some(addr));
+        assert_eq!(result, addr);
+    }
+
+    #[test]
+    fn test_get_host_session_bus_fallback() {
+        let result = get_host_session_bus_inner(None);
+        assert!(
+            result.contains("/run/user/"),
+            "expected /run/user/ path, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_app_name_lowercase() {
+        assert_eq!(normalize_app_name("GNOME-Calculator"), "gnome calculator");
+    }
+
+    #[test]
+    fn test_normalize_app_name_hyphens_to_spaces() {
+        assert_eq!(normalize_app_name("gnome-text-editor"), "gnome text editor");
+    }
+
+    #[test]
+    fn test_normalize_app_name_already_normal() {
+        assert_eq!(normalize_app_name("calculator"), "calculator");
+    }
+
+    #[test]
+    fn test_normalize_app_name_empty() {
+        assert_eq!(normalize_app_name(""), "");
+    }
+
+    #[test]
+    fn test_app_name_matches_exact() {
+        assert!(app_name_matches("Calculator", "calculator"));
+    }
+
+    #[test]
+    fn test_app_name_matches_target_contains_found() {
+        assert!(app_name_matches("Calculator", "gnome-calculator"));
+    }
+
+    #[test]
+    fn test_app_name_matches_found_contains_target() {
+        assert!(app_name_matches(
+            "GNOME Calculator 46.1",
+            "gnome-calculator"
+        ));
+    }
+
+    #[test]
+    fn test_app_name_matches_no_match() {
+        assert!(!app_name_matches("Firefox", "gnome-calculator"));
+    }
+
+    #[test]
+    fn test_app_name_matches_hyphen_vs_space() {
+        assert!(app_name_matches("gnome calculator", "gnome-calculator"));
+    }
+
+    #[test]
+    fn test_app_name_matches_empty_target() {
+        assert!(!app_name_matches("Calculator", ""));
+    }
+
+    #[test]
+    fn test_app_name_matches_empty_found() {
+        assert!(!app_name_matches("", "calculator"));
+    }
+
+    #[test]
+    fn test_app_name_matches_both_empty() {
+        assert!(!app_name_matches("", ""));
+    }
+}

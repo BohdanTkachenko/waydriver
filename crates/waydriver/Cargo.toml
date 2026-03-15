@@ -1,0 +1,34 @@
+[package]
+name = "waydriver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Headless GUI testing for Wayland applications via AT-SPI accessibility APIs and PipeWire screen capture"
+readme = "../../README.md"
+keywords = ["wayland", "testing", "gui", "atspi", "accessibility"]
+categories = ["development-tools::testing", "gui"]
+
+[dependencies]
+async-trait.workspace = true
+atspi.workspace = true
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter" }
+waydriver-input-mutter = { path = "../waydriver-input-mutter" }
+waydriver-capture-mutter = { path = "../waydriver-capture-mutter" }
+anyhow.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+image.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "waydriver-capture-mutter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Mutter ScreenCast + PipeWire screen capture backend for waydriver"
+readme = "../../README.md"
+keywords = ["wayland", "mutter", "screencast", "pipewire", "testing"]
+categories = ["development-tools::testing", "multimedia::images"]
+
+[dependencies]
+waydriver = { path = "../waydriver", version = "0.1.0" }
+waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter", version = "0.1.0" }
+async-trait.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zbus.workspace = true

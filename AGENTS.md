@@ -1,0 +1,130 @@
+# AGENTS.md
+
+This file provides guidance to AI coding assistants working with code in this repository.
+
+## Development Environment
+
+This project uses a Nix flake with a devShell (`flake.nix`) and direnv (`.envrc`). The devShell uses the `.nix-profile` symlink pattern: `refresh` builds `packages.x86_64-linux.dev-profile` (a `buildEnv` over the `devPackages` list) and links it at `./.nix-profile`, whose `bin/` is prepended to `PATH` in the `shellHook`.
+
+To add a new tool, add it to `devPackages` in `flake.nix` and run `refresh`. Do not use `nix run` or `nix shell` for project tooling — keep everything in the devShell. Use `nix run` only for one-off commands that don't belong in the devShell permanently.
+
+The shellHook also sets `GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, and prepends `at-spi2-core/libexec` to `PATH` — these cannot come from `buildEnv` alone because GStreamer plugin discovery and the `at-spi-bus-launcher` in `libexec` need explicit env vars.
+
+## Build and test
+
+With direnv allowed, tools are on `PATH` automatically inside the project directory. Otherwise, use `nix develop --command`:
+
+```sh
+cargo build --workspace
+cargo test --workspace
+cargo test -p waydriver                # single crate
+cargo test -p waydriver keysym         # single test module within a crate
+cargo clippy --workspace
+cargo fmt --all
+```
+
+## Architecture
+
+### Workspace layout — four crates
+
+The project is a Cargo workspace under `crates/` with the naming convention `waydriver-<role>-<backend>` for concrete implementations. Trait definitions live in the umbrella library (`waydriver`); each concrete implementation of a trait is a separate sibling crate. Future backends (`waydriver-input-libei`, `waydriver-capture-wlr`, `waydriver-compositor-sway`) slot in as additive siblings.
+
+| Crate | Purpose |
+|---|---|
+| **`waydriver`** | Umbrella library. Trait definitions (`CompositorRuntime`, `InputBackend`, `CaptureBackend`), `Session` (holds three `Box<dyn Trait>` fields), AT-SPI client, keysym helpers, shared `grab_png` GStreamer helper, `Error`/`Result`. Zero mutter-specific code. |
+| **`waydriver-compositor-mutter`** | `MutterCompositor` impl of `CompositorRuntime`. Owns mutter/pipewire/wireplumber child processes + private D-Bus. Exposes `Arc<MutterState>` via `state()` after `start()`. |
+| **`waydriver-input-mutter`** | `MutterInput` impl of `InputBackend`. Wraps `Arc<MutterState>`, calls `org.gnome.Mutter.RemoteDesktop.Session.NotifyKeyboardKeysym` / `NotifyPointerMotionRelative`. |
+| **`waydriver-capture-mutter`** | `MutterCapture` impl of `CaptureBackend`. Wraps `Arc<MutterState>`, creates ScreenCast sessions, returns PipeWire node ids. |
+
+**Dependency DAG** (must hold strictly — verify via `cargo tree -e normal -p <crate>`):
+- `waydriver` has no deps on any `waydriver-*-mutter` crate.
+- `waydriver-compositor-mutter` depends on `waydriver` only.
+- `waydriver-input-mutter` and `waydriver-capture-mutter` depend on `waydriver` + `waydriver-compositor-mutter` (for `MutterState`).
+
+### Session lifecycle
+
+`Session::start` takes three pre-constructed trait objects plus a `SessionConfig`. The caller is responsible for starting the compositor first and constructing input/capture from whatever state it exposes. For mutter:
+
+```rust
+let mut compositor = MutterCompositor::new();
+compositor.start().await?;              // spawns dbus, pipewire, wireplumber, mutter
+let state = compositor.state();         // Arc<MutterState> — D-Bus conn + RD path + runtime dir
+let input = MutterInput::new(state.clone());
+let capture = MutterCapture::new(state);
+let session = Session::start(Box::new(compositor), Box::new(input), Box::new(capture), cfg).await?;
+```
+
+`Session::start` then spawns the target app (on the **host** D-Bus for AT-SPI, on mutter's Wayland display), connects to the host AT-SPI bus, and waits for the app to appear in the AT-SPI registry.
+
+### `Session::kill` drop ordering — load-bearing
+
+`Session::kill` destructures `self` and shuts down in this order:
+
+1. Kill the **app** first — its Wayland connection holds a reference into mutter.
+2. **Drop input and capture** — for mutter, this releases `Arc<MutterState>` strong refs before the D-Bus connection is torn down.
+3. Call **`compositor.stop()`** — kills mutter/pipewire/wireplumber, terminates the private dbus-daemon, removes the runtime dir.
+
+The `Session` struct's field declaration order mirrors this sequence so implicit `Drop` is also safe. **Do not reorder the fields.**
+
+### `Arc<MutterState>` sharing invariant
+
+`MutterCompositor::start()` constructs an `Arc<MutterState>` containing the private D-Bus connection, the RemoteDesktop session path, and the runtime dir. `MutterInput` and `MutterCapture` hold cloned `Arc`s. While any `Arc<MutterState>` exists, the compositor's child processes and D-Bus connection **must** remain alive. `Session::kill` enforces this; direct `MutterCompositor::stop()` callers must drop input/capture first too.
+
+### Dual D-Bus — the core constraint
+
+GTK4's built-in AT-SPI backend hard-codes to the host session bus and ignores custom `DBUS_SESSION_BUS_ADDRESS`. So the code holds two D-Bus connections per session:
+
+- `a11y_connection` (in `Session`) — host session bus → AT-SPI registry → the app's accessible tree.
+- `MutterState::conn` — private bus → mutter's ScreenCast and RemoteDesktop interfaces.
+
+When editing session setup, keep this invariant: the **app** gets the host bus; **mutter/pipewire/wireplumber** get the private bus. Mixing them will silently break either accessibility or input/screencast.
+
+### Click = AT-SPI action + input wake
+
+After AT-SPI `do_action(0)` (in `waydriver::atspi::click_element`), the caller should send a harmless Shift_L press/release through the input backend. This wakes GTK4's GLib main loop, flushing pending widget invalidations so the framebuffer reflects the click. Without this, screenshots after clicks are stale.
+
+### Text input vs. key press
+
+- `press_key` and `type_text` both go through `Session::press_keysym` → the input backend. Text input sends each `char` individually via `char_to_keysym` (Latin-1 maps directly, other Unicode uses the `0x01000000 + codepoint` keysym encoding).
+- `key_name_to_keysym` in `waydriver::keysym` handles named keys (Return, Tab, F1–F12, arrows, etc.). Modifier-only keys (`ctrl`, `shift`, `alt`, `super`) intentionally return `None` — the API currently has no modifier/chord support.
+
+### Screenshot pipeline
+
+The flow is: `MutterCapture::start_stream` → `ScreenCast.CreateSession → Session.RecordMonitor → subscribe to PipeWireStreamAdded → Session.Start → receive node_id` → `CaptureBackend::grab_screenshot` → `waydriver::capture::grab_png` (shared GStreamer helper: `pipewiresrc ! videoconvert ! pngenc snapshot=true ! appsink`) → `MutterCapture::stop_stream`.
+
+The signal subscription must happen **before** `Session.Start` — mutter emits `PipeWireStreamAdded` synchronously during `Start`, and subscribing after misses it. GStreamer uses `num-buffers=5 ... pngenc snapshot=true` to grab a recent frame rather than the first (often-blank) one.
+
+`Session::take_screenshot` uses the keepalive stream (started during `Session::start`) via `CaptureBackend::grab_screenshot`, avoiding per-screenshot stream setup/teardown overhead.
+
+### Error model
+
+`waydriver::error` defines a single `Error` enum (`thiserror`); `Result<T>` is an alias.
+
+## Testing notes
+
+Unit tests live inside `#[cfg(test)] mod tests` blocks:
+- `waydriver::error::tests` — error display and From impls.
+- `waydriver::keysym::tests` — keysym mapping tables.
+- `waydriver::session::tests` — app name normalization and matching.
+- `waydriver::capture::tests` — pipeline string building and path validation.
+- `waydriver_compositor_mutter::tests` — D-Bus output parsing, Wayland socket wait, constructor properties.
+
+These tests are pure — they don't spawn mutter or touch D-Bus — so `cargo test --workspace` runs fast and works without the full runtime stack.
+
+End-to-end tests live in `crates/waydriver/tests/e2e.rs` and exercise the full stack (mutter, pipewire, AT-SPI, gnome-calculator):
+- `calculator_screenshots_change` — keyboard input + screenshot comparison.
+- `accessibility_tree_inspection` — AT-SPI tree dump, element search, ElementNotFound error.
+- `click_element_changes_display` — AT-SPI click_element + screenshot verification.
+- `pointer_input_operations` — pointer motion and button input.
+
+## Commit messages
+
+**Always** use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages (e.g. `feat:`, `fix:`, `chore:`, `refactor:`, `docs:`, `test:`). Include a scope when it clarifies the change (e.g. `feat(capture): ...`).
+
+## Track sessions
+
+When a `.session/` symlink exists in your workspace, this workspace
+is a development track. Read `.session/Spec.md` for the objective
+and list `.session/Todos/` for the per-TODO files — each contains
+its own plan and notes. Use the `/todo` and `/track` skills to
+manage them.
