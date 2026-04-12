@@ -97,13 +97,50 @@ session.kill().await?;
 
 ## Requirements
 
-All dependencies are provided by the Nix flake. If not using Nix, you need:
+All dependencies are provided by the Nix flake (`nix develop`). If not using Nix, you need the following system packages.
 
-- Mutter (with `--headless` support)
-- PipeWire, WirePlumber
-- gstreamer, gst-plugins-base, gst-plugins-good
-- at-spi2-core
-- dbus
+### Build dependencies
+
+| Debian/Ubuntu | Fedora | Arch |
+| --- | --- | --- |
+| `pkg-config` | `pkg-config` | `pkg-config` |
+| `libglib2.0-dev` | `glib2-devel` | `glib2` |
+| `libgstreamer1.0-dev` | `gstreamer1-devel` | `gstreamer` |
+| `libgstreamer-plugins-base1.0-dev` | `gstreamer1-plugins-base-devel` | `gst-plugins-base` |
+
+### Runtime dependencies
+
+| Debian/Ubuntu | Fedora | Arch |
+| --- | --- | --- |
+| `mutter` | `mutter` | `mutter` |
+| `pipewire` | `pipewire` | `pipewire` |
+| `wireplumber` | `wireplumber` | `wireplumber` |
+| `gstreamer1.0-plugins-base` | `gstreamer1-plugins-base` | `gst-plugins-base` |
+| `gstreamer1.0-plugins-good` | `gstreamer1-plugins-good` | `gst-plugins-good` |
+| `gstreamer1.0-pipewire` | `gstreamer1-plugins-pipewire` | `gst-plugin-pipewire` |
+| `at-spi2-core` | `at-spi2-core` | `at-spi2-core` |
+| `dbus` | `dbus` | `dbus` |
+
+**Quick install:**
+
+```sh
+# Debian/Ubuntu
+sudo apt install pkg-config libglib2.0-dev libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev mutter pipewire wireplumber \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-pipewire at-spi2-core dbus
+
+# Fedora
+sudo dnf install pkg-config glib2-devel gstreamer1-devel \
+  gstreamer1-plugins-base-devel mutter pipewire wireplumber \
+  gstreamer1-plugins-base gstreamer1-plugins-good \
+  gstreamer1-plugins-pipewire at-spi2-core dbus
+
+# Arch
+sudo pacman -S pkg-config glib2 gstreamer gst-plugins-base \
+  gst-plugins-good gst-plugin-pipewire mutter pipewire \
+  wireplumber at-spi2-core dbus
+```
 
 ## Architecture notes
 
