@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// Errors that can occur during a waydriver session.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("element not found: {0}")]
@@ -24,6 +25,7 @@ pub enum Error {
     Screenshot(String),
 }
 
+/// Convenience alias for `std::result::Result<T, waydriver::Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

@@ -39,6 +39,10 @@ fn build_pipeline_str(node_id: u32) -> String {
     )
 }
 
+/// Capture a single PNG frame from a PipeWire stream via GStreamer.
+///
+/// Connects to the PipeWire node identified by `node_id` through the given
+/// `pipewire_socket`, grabs one video frame, and returns it as PNG bytes.
 pub async fn grab_png(node_id: u32, pipewire_socket: &Path) -> Result<Vec<u8>> {
     let runtime_dir = validate_pipewire_socket(pipewire_socket)?;
 

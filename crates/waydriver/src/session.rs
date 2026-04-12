@@ -129,6 +129,7 @@ impl Session {
         Ok(())
     }
 
+    /// Send a key press + release for the given X11 keysym.
     pub async fn press_keysym(&self, keysym: u32) -> Result<()> {
         self.input.press_keysym(keysym).await
     }

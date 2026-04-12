@@ -17,6 +17,7 @@ type SearchSubtreeFuture<'a> =
 
 // ── Proxy builders ──────────────────────────────────────────────────────────
 
+/// Build an [`AccessibleProxy`] for the given bus name and object path.
 pub async fn build_accessible<'a>(
     conn: &'a zbus::Connection,
     bus_name: &str,

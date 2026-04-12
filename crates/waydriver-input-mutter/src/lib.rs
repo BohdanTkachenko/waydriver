@@ -11,11 +11,13 @@ use async_trait::async_trait;
 use waydriver::{Error, InputBackend, Result};
 use waydriver_compositor_mutter::MutterState;
 
+/// Mutter RemoteDesktop input backend.
 pub struct MutterInput {
     state: Arc<MutterState>,
 }
 
 impl MutterInput {
+    /// Create a new input backend from shared compositor state.
     pub fn new(state: Arc<MutterState>) -> Self {
         Self { state }
     }

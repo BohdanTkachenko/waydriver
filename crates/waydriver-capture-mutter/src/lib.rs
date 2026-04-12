@@ -16,11 +16,13 @@ use zbus::zvariant::{OwnedObjectPath, Value};
 use waydriver::{CaptureBackend, Error, PipeWireStream, Result};
 use waydriver_compositor_mutter::MutterState;
 
+/// Mutter ScreenCast + PipeWire capture backend.
 pub struct MutterCapture {
     state: Arc<MutterState>,
 }
 
 impl MutterCapture {
+    /// Create a new capture backend from shared compositor state.
     pub fn new(state: Arc<MutterState>) -> Self {
         Self { state }
     }

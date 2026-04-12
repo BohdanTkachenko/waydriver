@@ -1,3 +1,7 @@
+/// Convert a human-readable key name (e.g. `"Return"`, `"F1"`, `"a"`) to an X11 keysym.
+///
+/// Returns `None` for unrecognized names. Single-character strings are
+/// converted via [`char_to_keysym`]. Matching is case-insensitive.
 pub fn key_name_to_keysym(key: &str) -> Option<u32> {
     match key.to_lowercase().as_str() {
         "return" | "enter" => Some(0xff0d),
@@ -31,6 +35,10 @@ pub fn key_name_to_keysym(key: &str) -> Option<u32> {
     }
 }
 
+/// Convert a Unicode character to its X11 keysym value.
+///
+/// Latin-1 characters (U+0020..U+00FF) map directly to their code point.
+/// Characters above U+00FF use the `0x01000000 + code_point` convention.
 pub fn char_to_keysym(ch: char) -> u32 {
     // For ASCII, X11 keysyms match Unicode code points for printable chars
     // For Latin-1 (0x20-0xff), keysym == Unicode code point
