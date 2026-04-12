@@ -3,6 +3,9 @@ changelog_update = true
 git_release_enable = true
 publish = true
 semver_check = true
+# CI validates builds via nix flake check; the release runner lacks
+# system C libraries (glib, gstreamer, pipewire) needed to compile.
+publish_no_verify = true
 
 [changelog]
 header = """# Changelog
