@@ -32,6 +32,10 @@
         gst_all_1.gst-plugins-base
         gst_all_1.gst-plugins-good
         gnome-calculator
+        # CI / release verification tooling
+        actionlint
+        act
+        release-plz
       ];
 
       refresh = pkgs.writeShellScriptBin "refresh" ''
