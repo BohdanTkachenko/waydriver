@@ -34,14 +34,103 @@ The `nix run` wrapper is the only way the server will function at runtime — it
 
 ### Docker
 
-`Dockerfile` (Fedora-based, multi-stage) bundles all runtime deps and launches a container-private D-Bus in `docker-entrypoint.sh`. Container isolation means each run gets its own dbus-daemon, so the gnome-calculator singleton issue doesn't happen here.
+The `Dockerfile` (Fedora 42, multi-stage) produces two publishable images from the same file:
+
+| Image | Dockerfile target | Contents |
+|-------|-------------------|----------|
+| `waydriver-mcp` | final (default) | Runtime: mutter, pipewire, gstreamer, AT-SPI, dbus + waydriver-mcp binary |
+| `waydriver-mcp-builder` | `builder-base` | Build env: Fedora 42 + Rust (rustup) + gcc + GTK4/GLib/GStreamer/PipeWire dev headers |
+
+Both are published to `ghcr.io/bohdantkachenko/` on each release and on push to main.
 
 ```sh
-nix run .#docker-build       # docker build -t waydriver-mcp .
-nix run .#docker-build-e2e   # adds gnome-calculator for e2e tests
+docker build -t waydriver-mcp .                                        # runtime image
+docker build --target builder-base -t waydriver-mcp-builder .          # builder image
+docker build --build-arg INSTALL_CALCULATOR=true -t waydriver-mcp-e2e . # runtime + gnome-calculator
 ```
 
-The Docker-based e2e test (`calculator_add_via_docker` in `crates/waydriver-mcp/tests/e2e.rs`) drives the container via JSON-RPC and runs in CI.
+Or via Nix convenience apps:
+```sh
+nix run .#docker-build       # runtime
+nix run .#docker-build-e2e   # runtime + gnome-calculator
+```
+
+#### Container isolation
+
+`docker-entrypoint.sh` launches a container-private dbus-daemon before exec-ing waydriver-mcp. Each container gets its own D-Bus session bus, so:
+- gnome-calculator's singleton D-Bus activation is scoped to that container
+- AT-SPI registry is per-container
+- No interference between concurrent test sessions
+
+This is why the Docker-based e2e test (`calculator_add_via_docker` in `crates/waydriver-mcp/tests/e2e.rs`) works reliably — unlike the host-based test which needs `--test-threads=1`.
+
+#### User dev workflow — bringing app binaries into the MCP container
+
+The MCP server is persistent (started by the MCP client, stays up for the session). Users rebuild their app independently and the MCP picks up the new binary on the next `start_session` call.
+
+**Rust apps** — volume-mount the built binary:
+```json
+{
+  "waydriver-mcp": {
+    "command": "docker",
+    "args": ["run", "--rm", "-i",
+      "-v", "/home/user/myapp/build:/workspace:ro",
+      "ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
+  }
+}
+```
+Build with the builder image for ABI compatibility:
+```sh
+docker run --rm -v "$PWD:/src:ro" -v "$PWD/build:/out" \
+  ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest \
+  sh -c "cp -r /src /tmp/build && cd /tmp/build && cargo build --release && cp target/release/myapp /out/"
+```
+Then `start_session` with `command: "/workspace/myapp"`.
+
+**C/C++ apps** — same volume-mount pattern. The builder image includes `gcc`, `g++`, `meson`, `ninja-build`, `cmake`, `pkg-config`, `gtk4-devel`, and `glib2-devel`:
+```sh
+docker run --rm -v "$PWD:/src:ro" -v "$PWD/build:/out" \
+  ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest \
+  sh -c "cp -r /src /tmp/build && cd /tmp/build && meson setup _build && meson compile -C _build && cp _build/myapp /out/"
+```
+For extra deps (e.g. `libadwaita-devel`), extend the builder:
+```dockerfile
+FROM ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest
+RUN dnf install -y libadwaita-devel
+```
+
+**NixOS users** — mount `/nix/store` so Nix-built binaries just work:
+```json
+"args": ["run", "--rm", "-i",
+  "-v", "/nix/store:/nix/store:ro",
+  "-v", "/home/user/myapp:/workspace:ro",
+  "ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
+```
+
+**Node/Python apps** — extend the runtime image to add the interpreter, use a named volume for deps:
+```dockerfile
+FROM ghcr.io/bohdantkachenko/waydriver-mcp:latest
+RUN dnf install -y nodejs && dnf clean all
+```
+Install deps into a named volume (re-run when lockfile changes):
+```sh
+docker volume create myapp-nodemods
+docker run --rm \
+  -v "$PWD/package.json:/app/package.json:ro" \
+  -v "$PWD/package-lock.json:/app/package-lock.json:ro" \
+  -v "myapp-nodemods:/app/node_modules" \
+  -w /app \
+  ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest \
+  sh -c "dnf install -y nodejs npm && npm ci --omit=dev"
+```
+Mount source + deps volume in `.mcp.json`:
+```json
+"args": ["run", "--rm", "-i",
+  "-v", "/home/user/myapp/src:/app/src:ro",
+  "-v", "myapp-nodemods:/app/node_modules:ro",
+  "myapp-mcp:latest"]
+```
+Edit source freely — MCP picks up changes on next `start_session`. No MCP restart needed.
 
 ## Architecture
 
@@ -138,14 +227,35 @@ Unit tests live inside `#[cfg(test)] mod tests` blocks:
 - `waydriver::session::tests` — app name normalization and matching.
 - `waydriver::capture::tests` — pipeline string building and path validation.
 - `waydriver_compositor_mutter::tests` — D-Bus output parsing, Wayland socket wait, constructor properties.
+- `waydriver_mcp::tests` — MCP tool error paths + success paths with mock backends.
 
 These tests are pure — they don't spawn mutter or touch D-Bus — so `cargo test --workspace` runs fast and works without the full runtime stack.
 
-End-to-end tests live in `crates/waydriver/tests/e2e.rs` and exercise the full stack (mutter, pipewire, AT-SPI, gnome-calculator):
+End-to-end tests exercise the full stack (mutter, pipewire, AT-SPI, gnome-calculator):
+
+**Library e2e** (`crates/waydriver/tests/e2e.rs`):
 - `calculator_screenshots_change` — keyboard input + screenshot comparison.
 - `accessibility_tree_inspection` — AT-SPI tree dump, element search, ElementNotFound error.
 - `click_element_changes_display` — AT-SPI click_element + screenshot verification.
 - `pointer_input_operations` — pointer motion and button input.
+- `#[ignore]` — host D-Bus singleton issue. Run with `--ignored --test-threads=1`.
+
+**MCP e2e** (`crates/waydriver-mcp/tests/e2e.rs`):
+- `calculator_add_via_mcp` — spawns local waydriver-mcp binary, exercises all 11 tools via JSON-RPC. `#[ignore]` — same host D-Bus issue.
+- `calculator_add_via_docker` — spawns `docker run -i waydriver-mcp-e2e:latest`, same test flow. `#[ignore]` — requires pre-built Docker image. **Runs in CI** via the `e2e` job in `.github/workflows/ci.yml`.
+
+### CI pipeline
+
+CI (`.github/workflows/ci.yml`) does not use Nix — it uses standard `apt-get` + `dtolnay/rust-toolchain`:
+
+| Job | What it does |
+|-----|-------------|
+| `fmt` | `cargo fmt --check` |
+| `clippy` | `cargo clippy -- -D warnings` (needs system dev headers) |
+| `test` | `cargo test --workspace` (unit tests only, no `--ignored`) |
+| `e2e` | Builds `waydriver-mcp-e2e` Docker image, runs `calculator_add_via_docker` |
+
+Docker images are published to ghcr.io via `.github/workflows/publish-docker.yml` on push to main (`:main` tag) and on release tags (`:latest`, `:<version>`, `:<minor>`, `:<major>`).
 
 ## Commit messages
 

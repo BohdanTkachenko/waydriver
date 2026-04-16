@@ -61,8 +61,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
+      - name: Extract metadata (runtime)
+        id: meta-runtime
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ steps.owner.outputs.value }}/waydriver-mcp
@@ -77,12 +77,41 @@ jobs:
             org.opencontainers.image.description=MCP server for headless Wayland UI testing
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
-      - name: Build and push
+      - name: Extract metadata (builder)
+        id: meta-builder
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.owner.outputs.value }}/waydriver-mcp-builder
+          tags: |
+            type=raw,value=latest,enable=${{ steps.version.outputs.kind == 'release' }}
+            type=raw,value=${{ steps.version.outputs.full }},enable=${{ steps.version.outputs.kind == 'release' }}
+            type=raw,value=${{ steps.version.outputs.minor }},enable=${{ steps.version.outputs.kind == 'release' }}
+            type=raw,value=${{ steps.version.outputs.major }},enable=${{ steps.version.outputs.kind == 'release' }}
+            type=raw,value=main,enable=${{ steps.version.outputs.kind == 'main' }}
+          labels: |
+            org.opencontainers.image.title=waydriver-mcp-builder
+            org.opencontainers.image.description=Build environment for apps tested with waydriver-mcp (Fedora + Rust + GTK4 dev headers)
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push builder
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder-base
+          push: true
+          tags: ${{ steps.meta-builder.outputs.tags }}
+          labels: ${{ steps.meta-builder.outputs.labels }}
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+
+      - name: Build and push runtime
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta-runtime.outputs.tags }}
+          labels: ${{ steps.meta-runtime.outputs.labels }}
+          cache-from: |
+            type=gha,scope=runtime
+            type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=runtime

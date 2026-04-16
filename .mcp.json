@@ -1,20 +1,10 @@
 {
   "mcpServers": {
     "waydriver-mcp": {
-      "command": "cargo",
+      "command": "sh",
       "args": [
-        "run",
-        "-p",
-        "waydriver-mcp"
-      ]
-    },
-    "waydriver-mcp-docker": {
-      "command": "docker",
-      "args": [
-        "run",
-        "--rm",
-        "-i",
-        "waydriver-mcp:latest"
+        "-c",
+        "docker run --rm -i --network none -v \"$PWD:/workspace:ro\" -v /tmp/waydriver:/tmp ghcr.io/bohdantkachenko/waydriver-mcp:latest"
       ]
     }
   }

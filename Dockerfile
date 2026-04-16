@@ -1,21 +1,28 @@
-# Stage 1: Build the waydriver-mcp binary
-FROM fedora:42 AS builder
+# Stage 1: Publishable builder base image
+# Fedora 42 matches the runtime image, so binaries built here are ABI-compatible
+# with the runtime. Users extend this image to build their own GTK4 apps for
+# testing against waydriver-mcp.
+FROM fedora:42 AS builder-base
 
 RUN dnf install -y \
-    gcc pkg-config \
+    gcc g++ make pkg-config meson ninja-build cmake \
     dbus-devel at-spi2-core-devel \
     gstreamer1-devel gstreamer1-plugins-base-devel \
     pipewire-devel \
+    gtk4-devel glib2-devel \
     && dnf clean all
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Stage 2: Build waydriver-mcp specifically (not published; feeds the runtime)
+FROM builder-base AS builder
 
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p waydriver-mcp
 
-# Stage 2: Runtime image
+# Stage 3: Runtime image
 FROM fedora:42
 
 RUN dnf install -y \

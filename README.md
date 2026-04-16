@@ -102,28 +102,73 @@ session.kill().await?;
 
 `waydriver-mcp` is a standalone binary that exposes the library over the [Model Context Protocol](https://modelcontextprotocol.io), letting AI assistants (Claude Desktop, Claude Code, etc.) drive GTK4 apps in isolated headless sessions. It speaks JSON-RPC over stdio and constructs the Mutter backends internally — clients only see the high-level tools below.
 
-| Tool              | Purpose                                                          |
-| ----------------- | ---------------------------------------------------------------- |
-| `start_session`   | Spawn a headless Mutter session and launch a command inside it   |
-| `list_sessions`   | List active session ids, app names, and Wayland displays         |
-| `kill_session`    | Tear down a session and clean up all child processes             |
-| `inspect_ui`      | Dump the AT-SPI accessibility tree of the running app            |
-| `click_element`   | Click a widget by its accessible name (via AT-SPI action)        |
-| `type_text`       | Type a string into a focused element through the input backend   |
-| `press_key`       | Press a named key (`Return`, `Tab`, `Escape`, letters, …)        |
-| `find_element`    | Find a widget by accessible name and return its role and path    |
-| `move_pointer`    | Move the pointer by a relative offset in logical pixels          |
-| `pointer_click`   | Press and release a pointer button (defaults to left click)      |
+| Tool              | Purpose                                                               |
+| ----------------- | --------------------------------------------------------------------- |
+| `start_session`   | Spawn a headless Mutter session and launch a command inside it        |
+| `list_sessions`   | List active session ids, app names, and Wayland displays              |
+| `kill_session`    | Tear down a session and clean up all child processes                  |
+| `inspect_ui`      | Dump the AT-SPI accessibility tree of the running app                 |
+| `click_element`   | Click a widget by its accessible name (via AT-SPI action)             |
+| `type_text`       | Type a string into a focused element through the input backend        |
+| `press_key`       | Press a named key (`Return`, `Tab`, `Escape`, letters, …)             |
+| `find_element`    | Find a widget by accessible name and return its role and path         |
+| `move_pointer`    | Move the pointer by a relative offset in logical pixels               |
+| `pointer_click`   | Press and release a pointer button (defaults to left click)           |
 | `take_screenshot` | Capture a PNG via the keepalive ScreenCast stream and return its path |
+
+### Why Docker?
+
+waydriver-mcp needs ~8 system services at runtime (mutter, pipewire, wireplumber, dbus, AT-SPI, gstreamer). Installing these manually is fragile and distro-specific. Docker solves four problems:
+
+- **Security** — the MCP server spawns arbitrary processes, interacts with them via D-Bus, and captures their screen. Running this on your host session gives it access to everything your user can do. Inside a container, it only sees what you explicitly mount — no access to your files, browser sessions, or credentials. Add `--network none` to block network access entirely
+- **Zero-setup distribution** — `docker pull` and you're running, no system packages to install
+- **D-Bus isolation** — each container gets its own dbus-daemon, so apps like gnome-calculator don't interfere across concurrent test sessions (the singleton D-Bus activation problem)
+- **ABI compatibility** — apps built inside the container are guaranteed to link against the same libraries the MCP runtime uses
 
 ### Running with Docker (recommended)
 
-The Docker image bundles all runtime dependencies (mutter, pipewire, wireplumber, dbus, AT-SPI, gstreamer) and starts a container-private D-Bus session, giving each container full isolation from the host.
-
 Prebuilt images are published to [GitHub Container Registry](https://github.com/BohdanTkachenko/waydriver/pkgs/container/waydriver-mcp) for each release:
+
+| Image                                           | Purpose                                                                        |
+| ----------------------------------------------- | ------------------------------------------------------------------------------ |
+| `ghcr.io/bohdantkachenko/waydriver-mcp`         | Runtime — MCP server with all system deps                                      |
+| `ghcr.io/bohdantkachenko/waydriver-mcp-builder` | Build env — Fedora 42 + Rust + gcc/g++ + meson + cmake + GTK4/GLib dev headers |
 
 ```sh
 docker pull ghcr.io/bohdantkachenko/waydriver-mcp:latest
+docker pull ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest
+```
+
+Use the builder image to compile your app in a Fedora environment that matches the runtime. The resulting binary is ABI-compatible with the runtime image. See [Testing your app](#testing-your-app-with-waydriver-mcp) below for language-specific build examples.
+
+MCP client config (e.g. `.mcp.json` for Claude Code):
+
+```json
+{
+  "mcpServers": {
+    "waydriver-mcp": {
+      "command": "sh",
+      "args": ["-c", "docker run --rm -i --network none -v \"$PWD:/workspace:ro\" -v /tmp/waydriver:/tmp ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
+    }
+  }
+}
+```
+
+- `$PWD:/workspace:ro` — mounts the project directory so the MCP can launch your app binaries from `/workspace/`
+- `/tmp/waydriver:/tmp` — makes screenshots accessible on the host at `/tmp/waydriver/`
+- `--network none` — the MCP server doesn't need internet access
+
+For NixOS users, also mount the Nix store so Nix-built binaries work inside the container:
+
+```json
+{
+  "mcpServers": {
+    "waydriver-mcp": {
+      "command": "sh",
+      "args": ["-c", "docker run --rm -i --network none -v /nix/store:/nix/store:ro -v \"$PWD:/workspace:ro\" -v /tmp/waydriver:/tmp ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
+    }
+  }
+}
 ```
 
 Or build from source:
@@ -132,28 +177,89 @@ Or build from source:
 docker build -t waydriver-mcp .
 ```
 
-MCP client config:
+### Testing your app with waydriver-mcp
+
+The MCP server is persistent — it stays up for the entire AI assistant session. You rebuild your app independently, and each `start_session` call picks up the latest binary from the volume. No MCP restart needed between iterations.
+
+**Rust apps** — build with the builder image, volume-mount the binary:
+
+```sh
+docker run --rm -v "$PWD:/src:ro" -v "$PWD/build:/out" \
+  ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest \
+  sh -c "cp -r /src /tmp/build && cd /tmp/build && cargo build --release && cp target/release/myapp /out/"
+```
 
 ```json
 {
   "mcpServers": {
     "waydriver-mcp": {
       "command": "docker",
-      "args": ["run", "--rm", "-i", "ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
+      "args": ["run", "--rm", "-i",
+        "-v", "/path/to/myapp/build:/workspace:ro",
+        "ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
     }
   }
 }
 ```
 
-For running the e2e test suite, build the variant that also includes `gnome-calculator`:
+Then call `start_session` with `command: "/workspace/myapp"`.
+
+**C/C++ apps** — the builder image includes gcc, g++, meson, ninja-build, cmake, and GTK4/GLib dev headers:
 
 ```sh
-docker build --build-arg INSTALL_CALCULATOR=true -t waydriver-mcp-e2e .
+docker run --rm -v "$PWD:/src:ro" -v "$PWD/build:/out" \
+  ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest \
+  sh -c "cp -r /src /tmp/build && cd /tmp/build && meson setup _build && meson compile -C _build && cp _build/myapp /out/"
+```
+
+For extra deps (e.g. `libadwaita-devel`), extend the builder:
+
+```dockerfile
+FROM ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest
+RUN dnf install -y libadwaita-devel
+```
+
+**Node/Python apps** — extend the runtime image to add the interpreter, use a named volume for deps:
+
+```dockerfile
+FROM ghcr.io/bohdantkachenko/waydriver-mcp:latest
+RUN dnf install -y nodejs && dnf clean all
+```
+
+Install deps into a named volume (re-run only when lockfile changes):
+
+```sh
+docker volume create myapp-nodemods
+docker run --rm \
+  -v "$PWD/package.json:/app/package.json:ro" \
+  -v "$PWD/package-lock.json:/app/package-lock.json:ro" \
+  -v "myapp-nodemods:/app/node_modules" \
+  -w /app \
+  ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest \
+  sh -c "dnf install -y nodejs npm && npm ci --omit=dev"
+```
+
+Mount source + deps — edit source freely, MCP picks up changes on next `start_session`:
+
+```json
+"args": ["run", "--rm", "-i",
+  "-v", "/path/to/myapp/src:/app/src:ro",
+  "-v", "myapp-nodemods:/app/node_modules:ro",
+  "myapp-mcp:latest"]
+```
+
+**NixOS users** — mount `/nix/store` so Nix-built binaries just work:
+
+```json
+"args": ["run", "--rm", "-i",
+  "-v", "/nix/store:/nix/store:ro",
+  "-v", "/path/to/myapp:/workspace:ro",
+  "ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
 ```
 
 ### Running with Nix
 
-The Nix app wraps the raw binary with the required runtime env vars (`GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, `at-spi2-core/libexec`):
+For local development without Docker, the Nix app wraps the binary with the required runtime env vars:
 
 ```sh
 nix run .#mcp
@@ -167,25 +273,25 @@ All dependencies are provided by the Nix flake (`nix develop`). If not using Nix
 
 ### Build dependencies
 
-| Debian/Ubuntu | Fedora | Arch |
-| --- | --- | --- |
-| `pkg-config` | `pkg-config` | `pkg-config` |
-| `libglib2.0-dev` | `glib2-devel` | `glib2` |
-| `libgstreamer1.0-dev` | `gstreamer1-devel` | `gstreamer` |
+| Debian/Ubuntu                      | Fedora                          | Arch               |
+| ---------------------------------- | ------------------------------- | ------------------ |
+| `pkg-config`                       | `pkg-config`                    | `pkg-config`       |
+| `libglib2.0-dev`                   | `glib2-devel`                   | `glib2`            |
+| `libgstreamer1.0-dev`              | `gstreamer1-devel`              | `gstreamer`        |
 | `libgstreamer-plugins-base1.0-dev` | `gstreamer1-plugins-base-devel` | `gst-plugins-base` |
 
 ### Runtime dependencies
 
-| Debian/Ubuntu | Fedora | Arch |
-| --- | --- | --- |
-| `mutter` | `mutter` | `mutter` |
-| `pipewire` | `pipewire` | `pipewire` |
-| `wireplumber` | `wireplumber` | `wireplumber` |
-| `gstreamer1.0-plugins-base` | `gstreamer1-plugins-base` | `gst-plugins-base` |
-| `gstreamer1.0-plugins-good` | `gstreamer1-plugins-good` | `gst-plugins-good` |
-| `gstreamer1.0-pipewire` | `gstreamer1-plugins-pipewire` | `gst-plugin-pipewire` |
-| `at-spi2-core` | `at-spi2-core` | `at-spi2-core` |
-| `dbus` | `dbus` | `dbus` |
+| Debian/Ubuntu               | Fedora                        | Arch                  |
+| --------------------------- | ----------------------------- | --------------------- |
+| `mutter`                    | `mutter`                      | `mutter`              |
+| `pipewire`                  | `pipewire`                    | `pipewire`            |
+| `wireplumber`               | `wireplumber`                 | `wireplumber`         |
+| `gstreamer1.0-plugins-base` | `gstreamer1-plugins-base`     | `gst-plugins-base`    |
+| `gstreamer1.0-plugins-good` | `gstreamer1-plugins-good`     | `gst-plugins-good`    |
+| `gstreamer1.0-pipewire`     | `gstreamer1-plugins-pipewire` | `gst-plugin-pipewire` |
+| `at-spi2-core`              | `at-spi2-core`                | `at-spi2-core`        |
+| `dbus`                      | `dbus`                        | `dbus`                |
 
 **Quick install:**
 
