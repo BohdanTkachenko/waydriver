@@ -1,0 +1,10 @@
+target/
+.git/
+.jj/
+.nix-profile/
+result
+result-*
+.direnv/
+.github/
+.claude/
+.session/

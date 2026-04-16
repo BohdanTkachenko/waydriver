@@ -32,6 +32,17 @@ nix run .#mcp       # runs the wrapper with runtime deps injected (see flake.nix
 
 The `nix run` wrapper is the only way the server will function at runtime — it injects `GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, and the `at-spi2-core/libexec` path. Running the raw binary from `target/debug` will fail to launch subprocess dependencies.
 
+### Docker
+
+`Dockerfile` (Fedora-based, multi-stage) bundles all runtime deps and launches a container-private D-Bus in `docker-entrypoint.sh`. Container isolation means each run gets its own dbus-daemon, so the gnome-calculator singleton issue doesn't happen here.
+
+```sh
+nix run .#docker-build       # docker build -t waydriver-mcp .
+nix run .#docker-build-e2e   # adds gnome-calculator for e2e tests
+```
+
+The Docker-based e2e test (`calculator_add_via_docker` in `crates/waydriver-mcp/tests/e2e.rs`) drives the container via JSON-RPC and runs in CI.
+
 ## Architecture
 
 ### Workspace layout — five crates

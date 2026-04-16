@@ -116,22 +116,47 @@ session.kill().await?;
 | `pointer_click`   | Press and release a pointer button (defaults to left click)      |
 | `take_screenshot` | Capture a PNG via the keepalive ScreenCast stream and return its path |
 
-Build and run with Nix — the wrapper injects the runtime env vars (`GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, `at-spi2-core/libexec`) that the raw binary lacks:
+### Running with Docker (recommended)
+
+The Docker image bundles all runtime dependencies (mutter, pipewire, wireplumber, dbus, AT-SPI, gstreamer) and starts a container-private D-Bus session, giving each container full isolation from the host.
+
+Prebuilt images are published to [GitHub Container Registry](https://github.com/BohdanTkachenko/waydriver/pkgs/container/waydriver-mcp) for each release:
 
 ```sh
-nix run .#mcp
+docker pull ghcr.io/bohdantkachenko/waydriver-mcp:latest
 ```
 
-Example MCP client config:
+Or build from source:
+
+```sh
+docker build -t waydriver-mcp .
+```
+
+MCP client config:
 
 ```json
 {
   "mcpServers": {
-    "waydriver": {
-      "command": "/path/to/waydriver-mcp"
+    "waydriver-mcp": {
+      "command": "docker",
+      "args": ["run", "--rm", "-i", "ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
     }
   }
 }
+```
+
+For running the e2e test suite, build the variant that also includes `gnome-calculator`:
+
+```sh
+docker build --build-arg INSTALL_CALCULATOR=true -t waydriver-mcp-e2e .
+```
+
+### Running with Nix
+
+The Nix app wraps the raw binary with the required runtime env vars (`GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, `at-spi2-core/libexec`):
+
+```sh
+nix run .#mcp
 ```
 
 Sessions are kept in an in-memory `HashMap` keyed by id, so multiple apps can run concurrently within one server process.

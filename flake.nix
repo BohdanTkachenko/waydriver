@@ -100,6 +100,30 @@
           "${script}/bin/waydriver-coverage";
       };
 
+        # nix run .#docker-build — builds the production Docker image
+        docker-build = {
+          type = "app";
+          program =
+            let
+              script = pkgs.writeShellScriptBin "waydriver-docker-build" ''
+                exec docker build -t waydriver-mcp "$@" .
+              '';
+            in
+            "${script}/bin/waydriver-docker-build";
+        };
+
+        # nix run .#docker-build-e2e — builds the e2e Docker image (adds gnome-calculator)
+        docker-build-e2e = {
+          type = "app";
+          program =
+            let
+              script = pkgs.writeShellScriptBin "waydriver-docker-build-e2e" ''
+                exec docker build --build-arg INSTALL_CALCULATOR=true -t waydriver-mcp-e2e "$@" .
+              '';
+            in
+            "${script}/bin/waydriver-docker-build-e2e";
+        };
+
         # nix run .# — launches the MCP server with runtime deps on PATH
         mcp = {
         type = "app";

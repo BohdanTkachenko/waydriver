@@ -7,6 +7,15 @@
         "-p",
         "waydriver-mcp"
       ]
+    },
+    "waydriver-mcp-docker": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "waydriver-mcp:latest"
+      ]
     }
   }
 }

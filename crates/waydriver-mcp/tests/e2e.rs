@@ -51,10 +51,8 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
-#[tokio::test]
-#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
-async fn calculator_add_via_mcp() -> anyhow::Result<()> {
-    let transport = TokioChildProcess::new(tokio::process::Command::new(mcp_binary()))?;
+async fn run_calculator_test(command: tokio::process::Command, local: bool) -> anyhow::Result<()> {
+    let transport = TokioChildProcess::new(command)?;
     let client = TestClient.serve(transport).await?;
 
     // List tools — verify the server exposes all expected tools
@@ -169,8 +167,10 @@ async fn calculator_add_via_mcp() -> anyhow::Result<()> {
         screenshot_path.ends_with(".png"),
         "expected png path, got: {screenshot_path}"
     );
-    let metadata = tokio::fs::metadata(&screenshot_path).await?;
-    assert!(metadata.len() > 1000, "screenshot file too small");
+    if local {
+        let metadata = tokio::fs::metadata(&screenshot_path).await?;
+        assert!(metadata.len() > 1000, "screenshot file too small");
+    }
 
     // List sessions — should contain our session
     let result = client
@@ -256,4 +256,18 @@ async fn calculator_add_via_mcp() -> anyhow::Result<()> {
 
     client.cancel().await?;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
+async fn calculator_add_via_mcp() -> anyhow::Result<()> {
+    run_calculator_test(tokio::process::Command::new(mcp_binary()), true).await
+}
+
+#[tokio::test]
+#[ignore = "requires pre-built waydriver-mcp-e2e docker image"]
+async fn calculator_add_via_docker() -> anyhow::Result<()> {
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.args(["run", "--rm", "-i", "waydriver-mcp-e2e:latest"]);
+    run_calculator_test(cmd, false).await
 }
