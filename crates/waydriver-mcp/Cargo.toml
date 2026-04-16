@@ -13,10 +13,10 @@ keywords = ["wayland", "testing", "mcp", "atspi", "accessibility"]
 categories = ["development-tools::testing"]
 
 [dependencies]
-waydriver = { version = "0.1.0", path = "../waydriver" }
-waydriver-capture-mutter = { version = "0.1.0", path = "../waydriver-capture-mutter" }
-waydriver-compositor-mutter = { version = "0.1.0", path = "../waydriver-compositor-mutter" }
-waydriver-input-mutter = { version = "0.1.0", path = "../waydriver-input-mutter" }
+waydriver = { version = "0.1.1", path = "../waydriver" }
+waydriver-capture-mutter = { version = "0.1.1", path = "../waydriver-capture-mutter" }
+waydriver-compositor-mutter = { version = "0.1.1", path = "../waydriver-compositor-mutter" }
+waydriver-input-mutter = { version = "0.1.1", path = "../waydriver-input-mutter" }
 anyhow.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
