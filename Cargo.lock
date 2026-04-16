@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-capture-mutter"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-compositor-mutter"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "libc",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-input-mutter"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "tokio",
@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
