@@ -104,7 +104,7 @@ session.kill().await?;
 
 | Tool              | Purpose                                                               |
 | ----------------- | --------------------------------------------------------------------- |
-| `start_session`   | Spawn a headless Mutter session and launch a command inside it        |
+| `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir` overrides the server default for this session) |
 | `list_sessions`   | List active session ids, app names, and Wayland displays              |
 | `kill_session`    | Tear down a session and clean up all child processes                  |
 | `inspect_ui`      | Dump the AT-SPI accessibility tree of the running app                 |
@@ -115,6 +115,8 @@ session.kill().await?;
 | `move_pointer`    | Move the pointer by a relative offset in logical pixels               |
 | `pointer_click`   | Press and release a pointer button (defaults to left click)           |
 | `take_screenshot` | Capture a PNG via the keepalive ScreenCast stream and return its path |
+
+Each session produces output under a configurable **report directory** — screenshots today, video recordings and HTML summaries planned. Screenshots are written as `{report_dir}/{session_id}/{session_id}-{n}.png` — each session gets its own subdirectory and `n` increments per `take_screenshot` call. The base `report_dir` defaults to `/tmp/waydriver` and can be overridden with the `--report-dir <PATH>` CLI flag or the `WAYDRIVER_REPORT_DIR` environment variable. Individual `start_session` calls may also pass a `report_dir` argument to override the server default for that session.
 
 ### Why Docker?
 
@@ -148,14 +150,14 @@ MCP client config (e.g. `.mcp.json` for Claude Code):
   "mcpServers": {
     "waydriver-mcp": {
       "command": "sh",
-      "args": ["-c", "docker run --rm -i --network none -v \"$PWD:/workspace:ro\" -v /tmp/waydriver:/tmp ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
+      "args": ["-c", "docker run --rm -i --network none -v \"$PWD:/workspace:ro\" -v /tmp/waydriver:/tmp/waydriver ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
     }
   }
 }
 ```
 
 - `$PWD:/workspace:ro` — mounts the project directory so the MCP can launch your app binaries from `/workspace/`
-- `/tmp/waydriver:/tmp` — makes screenshots accessible on the host at `/tmp/waydriver/`
+- `/tmp/waydriver:/tmp/waydriver` — makes session reports (screenshots, etc.) accessible on the host at `/tmp/waydriver/` (matches the default `--report-dir` inside the container)
 - `--network none` — the MCP server doesn't need internet access
 
 For NixOS users, also mount the Nix store so Nix-built binaries work inside the container:
@@ -165,7 +167,7 @@ For NixOS users, also mount the Nix store so Nix-built binaries work inside the 
   "mcpServers": {
     "waydriver-mcp": {
       "command": "sh",
-      "args": ["-c", "docker run --rm -i --network none -v /nix/store:/nix/store:ro -v \"$PWD:/workspace:ro\" -v /tmp/waydriver:/tmp ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
+      "args": ["-c", "docker run --rm -i --network none -v /nix/store:/nix/store:ro -v \"$PWD:/workspace:ro\" -v /tmp/waydriver:/tmp/waydriver ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
     }
   }
 }

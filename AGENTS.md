@@ -211,7 +211,8 @@ The signal subscription must happen **before** `Session.Start` — mutter emits 
 
 - `crates/waydriver-mcp/src/main.rs` wires `UiTestServer` to stdio via `rmcp`. **All logging must go to stderr** — stdout is the JSON-RPC transport. `tracing_subscriber` is configured with `with_writer(std::io::stderr)`; don't `println!` anywhere.
 - Uses `rmcp`'s `#[tool_router]` / `#[tool]` macros. Each tool method takes `Parameters<T>` where `T` derives `Deserialize + JsonSchema` — the schema is what the MCP client (Claude) sees.
-- Session state lives in `Arc<RwLock<HashMap<String, Session>>>`. Read-only tools take a `.read()` lock, `start_session`/`kill_session` take `.write()`.
+- Session state lives in `Arc<RwLock<HashMap<String, ManagedSession>>>`, where `ManagedSession` wraps the underlying `Session` plus a per-session `report_dir` and atomic screenshot counter. Read-only tools take a `.read()` lock, `start_session`/`kill_session` take `.write()`.
+- Report output path (screenshots today; video/HTML planned) is configurable via the `--report-dir` CLI flag / `WAYDRIVER_REPORT_DIR` env var (default `/tmp/waydriver`), or per-session via `start_session`'s optional `report_dir` argument. Screenshots land at `{dir}/{session_id}/{session_id}-{n}.png`.
 
 ### Error model
 

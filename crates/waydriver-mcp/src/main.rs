@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use clap::Parser;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -30,6 +33,9 @@ pub struct StartSessionParams {
     pub cwd: Option<String>,
     /// Application name for AT-SPI lookup (defaults to command name)
     pub app_name: Option<String>,
+    /// Override report output directory for this session (replaces the server default).
+    /// Reports include screenshots today; video recordings and HTML summaries planned.
+    pub report_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -90,24 +96,51 @@ pub struct FindElementParams {
 
 // ── Server ──────────────────────────────────────────────────────────────────
 
+pub struct ManagedSession {
+    pub session: Session,
+    pub report_dir: PathBuf,
+    pub screenshot_counter: AtomicU32,
+}
+
+impl ManagedSession {
+    /// Write screenshot bytes under `{report_dir}/{session_id}/{session_id}-{n}.png`,
+    /// creating the directory if needed. Increments the per-session counter.
+    pub async fn persist_screenshot(
+        &self,
+        session_id: &str,
+        png_bytes: &[u8],
+    ) -> std::io::Result<PathBuf> {
+        let count = self.screenshot_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let dir = self.report_dir.join(session_id);
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join(format!("{session_id}-{count}.png"));
+        tokio::fs::write(&path, png_bytes).await?;
+        Ok(path)
+    }
+}
+
+/// Resolve the effective report dir for a new session: per-session override
+/// if provided, else the server's base dir.
+fn resolve_report_dir(base: &std::path::Path, override_: Option<&str>) -> PathBuf {
+    override_
+        .map(PathBuf::from)
+        .unwrap_or_else(|| base.to_path_buf())
+}
+
 #[derive(Clone)]
 pub struct UiTestServer {
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    sessions: Arc<RwLock<HashMap<String, ManagedSession>>>,
+    report_dir: PathBuf,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
-impl Default for UiTestServer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[tool_router]
 impl UiTestServer {
-    pub fn new() -> Self {
+    pub fn new(report_dir: PathBuf) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            report_dir,
             tool_router: Self::tool_router(),
         }
     }
@@ -152,7 +185,16 @@ impl UiTestServer {
         let id = session.id.clone();
         let display = session.wayland_display().to_string();
 
-        self.sessions.write().await.insert(id.clone(), session);
+        let report_dir = resolve_report_dir(&self.report_dir, params.report_dir.as_deref());
+
+        self.sessions.write().await.insert(
+            id.clone(),
+            ManagedSession {
+                session,
+                report_dir,
+                screenshot_counter: AtomicU32::new(0),
+            },
+        );
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Session started: id={}, display={}, app={}",
@@ -170,12 +212,12 @@ impl UiTestServer {
         }
 
         let mut lines = Vec::new();
-        for (id, s) in sessions.iter() {
+        for (id, m) in sessions.iter() {
             lines.push(format!(
                 "- {} (app={}, display={})",
                 id,
-                s.app_name,
-                s.wayland_display()
+                m.session.app_name,
+                m.session.wayland_display()
             ));
         }
         Ok(CallToolResult::success(vec![Content::text(
@@ -188,7 +230,7 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self
+        let managed = self
             .sessions
             .write()
             .await
@@ -197,7 +239,8 @@ impl UiTestServer {
                 McpError::invalid_params(format!("session not found: {}", params.session_id), None)
             })?;
 
-        session
+        managed
+            .session
             .kill()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -214,9 +257,10 @@ impl UiTestServer {
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let sessions = self.sessions.read().await;
-        let session = sessions.get(&params.session_id).ok_or_else(|| {
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
+        let session = &managed.session;
 
         let a11y = session.a11y_connection.as_ref().ok_or_else(|| {
             McpError::internal_error("no AT-SPI connection for this session".to_string(), None)
@@ -234,9 +278,10 @@ impl UiTestServer {
         Parameters(params): Parameters<ClickElementParams>,
     ) -> Result<CallToolResult, McpError> {
         let sessions = self.sessions.read().await;
-        let session = sessions.get(&params.session_id).ok_or_else(|| {
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
+        let session = &managed.session;
 
         let a11y = session.a11y_connection.as_ref().ok_or_else(|| {
             McpError::internal_error("no AT-SPI connection for this session".to_string(), None)
@@ -259,9 +304,10 @@ impl UiTestServer {
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Result<CallToolResult, McpError> {
         let sessions = self.sessions.read().await;
-        let session = sessions.get(&params.session_id).ok_or_else(|| {
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
+        let session = &managed.session;
 
         // Type each character via the input backend (goes through the compositor)
         for ch in params.text.chars() {
@@ -284,9 +330,10 @@ impl UiTestServer {
         Parameters(params): Parameters<PressKeyParams>,
     ) -> Result<CallToolResult, McpError> {
         let sessions = self.sessions.read().await;
-        let session = sessions.get(&params.session_id).ok_or_else(|| {
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
+        let session = &managed.session;
 
         let keysym = key_name_to_keysym(&params.key).ok_or_else(|| {
             McpError::invalid_params(format!("unknown key: {}", params.key), None)
@@ -309,9 +356,10 @@ impl UiTestServer {
         Parameters(params): Parameters<MovePointerParams>,
     ) -> Result<CallToolResult, McpError> {
         let sessions = self.sessions.read().await;
-        let session = sessions.get(&params.session_id).ok_or_else(|| {
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
+        let session = &managed.session;
 
         session
             .pointer_motion_relative(params.dx, params.dy)
@@ -330,9 +378,10 @@ impl UiTestServer {
         Parameters(params): Parameters<PointerClickParams>,
     ) -> Result<CallToolResult, McpError> {
         let sessions = self.sessions.read().await;
-        let session = sessions.get(&params.session_id).ok_or_else(|| {
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
+        let session = &managed.session;
 
         let button = params.button.unwrap_or(0x110); // BTN_LEFT
         session
@@ -354,9 +403,10 @@ impl UiTestServer {
         Parameters(params): Parameters<FindElementParams>,
     ) -> Result<CallToolResult, McpError> {
         let sessions = self.sessions.read().await;
-        let session = sessions.get(&params.session_id).ok_or_else(|| {
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
+        let session = &managed.session;
 
         let a11y = session.a11y_connection.as_ref().ok_or_else(|| {
             McpError::internal_error("no AT-SPI connection for this session".to_string(), None)
@@ -382,21 +432,24 @@ impl UiTestServer {
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let sessions = self.sessions.read().await;
-        let session = sessions.get(&params.session_id).ok_or_else(|| {
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
+        let session = &managed.session;
 
         let png_bytes = session
             .take_screenshot()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let path = format!("/tmp/mcp-screenshot-{}.png", params.session_id);
-        tokio::fs::write(&path, &png_bytes)
+        let path = managed
+            .persist_screenshot(&params.session_id, &png_bytes)
             .await
-            .map_err(|e| McpError::internal_error(format!("write screenshot: {e}"), None))?;
+            .map_err(|e| McpError::internal_error(format!("persist screenshot: {e}"), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(path)]))
+        Ok(CallToolResult::success(vec![Content::text(
+            path.display().to_string(),
+        )]))
     }
 }
 
@@ -411,8 +464,20 @@ impl ServerHandler for UiTestServer {
     }
 }
 
+#[derive(Parser, Debug)]
+#[command(version, about = "Headless GTK4 UI testing MCP server")]
+struct Cli {
+    /// Base directory for per-session report output (screenshots today;
+    /// video recordings and HTML summaries planned). Each session gets a
+    /// subdirectory under this path.
+    #[arg(long, default_value = "/tmp/waydriver", env = "WAYDRIVER_REPORT_DIR")]
+    report_dir: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
     // All logging must go to stderr — stdout is the MCP JSON-RPC transport
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -423,11 +488,14 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
-    tracing::info!("waydriver-mcp starting");
+    tracing::info!(report_dir = %cli.report_dir.display(), "waydriver-mcp starting");
 
-    let service = UiTestServer::new().serve(stdio()).await.inspect_err(|e| {
-        tracing::error!("serve error: {:?}", e);
-    })?;
+    let service = UiTestServer::new(cli.report_dir)
+        .serve(stdio())
+        .await
+        .inspect_err(|e| {
+            tracing::error!("serve error: {:?}", e);
+        })?;
 
     service.waiting().await?;
     Ok(())
@@ -439,10 +507,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use async_trait::async_trait;
+    use clap::Parser;
+    use tempfile::TempDir;
     use waydriver::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
 
     fn server() -> UiTestServer {
-        UiTestServer::new()
+        UiTestServer::new(PathBuf::from("/tmp/waydriver-test"))
     }
 
     fn session_id(id: &str) -> Parameters<SessionIdParams> {
@@ -531,7 +601,15 @@ mod tests {
                 display: display.into(),
             }),
         );
-        srv.sessions.write().await.insert(id.into(), session);
+        let report_dir = srv.report_dir.clone();
+        srv.sessions.write().await.insert(
+            id.into(),
+            ManagedSession {
+                session,
+                report_dir,
+                screenshot_counter: AtomicU32::new(0),
+            },
+        );
     }
 
     // ── Error-path tests ───────────────────────────────────────────────
@@ -761,6 +839,133 @@ mod tests {
             .unwrap();
         let text = content_text(&result);
         assert!(text.contains("0x111"), "expected BTN_RIGHT, got: {text}");
+    }
+
+    // ── Report path / counter ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_report_dir_defaults_to_base() {
+        let base = PathBuf::from("/tmp/base");
+        let resolved = resolve_report_dir(&base, None);
+        assert_eq!(resolved, base);
+    }
+
+    #[test]
+    fn resolve_report_dir_uses_override_when_provided() {
+        let base = PathBuf::from("/tmp/base");
+        let resolved = resolve_report_dir(&base, Some("/tmp/override"));
+        assert_eq!(resolved, PathBuf::from("/tmp/override"));
+    }
+
+    #[test]
+    fn resolve_report_dir_override_is_absolute_replacement() {
+        // Relative override is taken as-is, not joined under the base.
+        let base = PathBuf::from("/tmp/base");
+        let resolved = resolve_report_dir(&base, Some("relative/path"));
+        assert_eq!(resolved, PathBuf::from("relative/path"));
+    }
+
+    fn make_managed(dir: PathBuf) -> ManagedSession {
+        let session = Session::new_for_test(
+            "sid".into(),
+            "app".into(),
+            Box::new(MockInput::new()),
+            Box::new(MockCapture),
+            Box::new(MockCompositor {
+                display: "wayland-x".into(),
+            }),
+        );
+        ManagedSession {
+            session,
+            report_dir: dir,
+            screenshot_counter: AtomicU32::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_screenshot_writes_first_file_with_counter_one() {
+        let tmp = TempDir::new().unwrap();
+        let managed = make_managed(tmp.path().to_path_buf());
+
+        let path = managed.persist_screenshot("sid", b"fake-png").await.unwrap();
+
+        let expected = tmp.path().join("sid").join("sid-1.png");
+        assert_eq!(path, expected);
+        assert_eq!(tokio::fs::read(&expected).await.unwrap(), b"fake-png");
+    }
+
+    #[tokio::test]
+    async fn persist_screenshot_increments_counter_across_calls() {
+        let tmp = TempDir::new().unwrap();
+        let managed = make_managed(tmp.path().to_path_buf());
+
+        let p1 = managed.persist_screenshot("sid", b"a").await.unwrap();
+        let p2 = managed.persist_screenshot("sid", b"b").await.unwrap();
+        let p3 = managed.persist_screenshot("sid", b"c").await.unwrap();
+
+        assert_eq!(p1.file_name().unwrap(), "sid-1.png");
+        assert_eq!(p2.file_name().unwrap(), "sid-2.png");
+        assert_eq!(p3.file_name().unwrap(), "sid-3.png");
+        // All three files should exist with distinct contents.
+        assert_eq!(tokio::fs::read(&p1).await.unwrap(), b"a");
+        assert_eq!(tokio::fs::read(&p2).await.unwrap(), b"b");
+        assert_eq!(tokio::fs::read(&p3).await.unwrap(), b"c");
+    }
+
+    #[tokio::test]
+    async fn persist_screenshot_creates_nested_missing_dirs() {
+        let tmp = TempDir::new().unwrap();
+        // Point at a dir that does not yet exist under the tempdir.
+        let nested = tmp.path().join("does").join("not").join("exist");
+        let managed = make_managed(nested.clone());
+
+        let path = managed.persist_screenshot("sid", b"x").await.unwrap();
+        assert!(path.starts_with(&nested));
+        assert!(tokio::fs::metadata(&path).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn persist_screenshot_honors_per_session_override_dir() {
+        let base = TempDir::new().unwrap();
+        let override_dir = TempDir::new().unwrap();
+        // A session constructed with an override dir (as start_session would do)
+        // writes there, not under the server base.
+        let managed = make_managed(override_dir.path().to_path_buf());
+
+        let path = managed.persist_screenshot("sid", b"png").await.unwrap();
+
+        assert!(path.starts_with(override_dir.path()));
+        assert!(!path.starts_with(base.path()));
+    }
+
+    // ── CLI parsing ────────────────────────────────────────────────────
+
+    #[test]
+    fn cli_defaults_to_tmp_waydriver() {
+        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
+        assert_eq!(cli.report_dir, PathBuf::from("/tmp/waydriver"));
+    }
+
+    #[test]
+    fn cli_accepts_report_dir_flag() {
+        let cli = Cli::try_parse_from(["waydriver-mcp", "--report-dir", "/custom/out"]).unwrap();
+        assert_eq!(cli.report_dir, PathBuf::from("/custom/out"));
+    }
+
+    #[tokio::test]
+    async fn server_stores_report_base_dir() {
+        let s = UiTestServer::new(PathBuf::from("/tmp/custom-out"));
+        assert_eq!(s.report_dir, PathBuf::from("/tmp/custom-out"));
+    }
+
+    #[tokio::test]
+    async fn inserted_session_inherits_base_report_dir() {
+        let s = UiTestServer::new(PathBuf::from("/tmp/base-out"));
+        insert_test_session(&s, "abc", "calc", "wayland-abc").await;
+        let sessions = s.sessions.read().await;
+        let managed = sessions.get("abc").unwrap();
+        assert_eq!(managed.report_dir, PathBuf::from("/tmp/base-out"));
+        assert_eq!(managed.screenshot_counter.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

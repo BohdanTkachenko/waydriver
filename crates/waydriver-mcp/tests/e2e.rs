@@ -164,13 +164,30 @@ async fn run_calculator_test(command: tokio::process::Command, local: bool) -> a
         .await?;
     let screenshot_path = result_text(&result);
     assert!(
-        screenshot_path.ends_with(".png"),
-        "expected png path, got: {screenshot_path}"
+        screenshot_path.ends_with(&format!("/{session_id}/{session_id}-1.png")),
+        "expected path ending in /{session_id}/{session_id}-1.png, got: {screenshot_path}"
     );
     if local {
         let metadata = tokio::fs::metadata(&screenshot_path).await?;
         assert!(metadata.len() > 1000, "screenshot file too small");
     }
+
+    // Take a second screenshot — counter should advance to 2
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("take_screenshot").with_arguments(
+                serde_json::json!({"session_id": session_id})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    let second_path = result_text(&result);
+    assert!(
+        second_path.ends_with(&format!("/{session_id}/{session_id}-2.png")),
+        "expected second screenshot to use counter 2, got: {second_path}"
+    );
 
     // List sessions — should contain our session
     let result = client
