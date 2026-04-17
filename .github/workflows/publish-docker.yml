@@ -3,13 +3,18 @@ name: Publish Docker Image
 on:
   push:
     branches: [main]
-    tags:
-      - 'waydriver-mcp-v*'
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to tag (e.g. 0.1.3)'
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       version:
         description: 'Version to tag (e.g. 0.1.1)'
         required: true
+        type: string
 
 permissions:
   contents: read
@@ -25,21 +30,13 @@ jobs:
       - name: Determine version
         id: version
         run: |
-          case "${{ github.event_name }}" in
-            workflow_dispatch)
-              kind=release
-              version="${{ github.event.inputs.version }}"
-              ;;
-            push)
-              if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-                kind=release
-                version="${GITHUB_REF_NAME#waydriver-mcp-v}"
-              else
-                kind=main
-                version=""
-              fi
-              ;;
-          esac
+          if [ -n "${{ inputs.version }}" ]; then
+            kind=release
+            version="${{ inputs.version }}"
+          else
+            kind=main
+            version=""
+          fi
           echo "kind=${kind}" >> "$GITHUB_OUTPUT"
           if [ "$kind" = "release" ]; then
             # Split "0.1.1" into "0", "0.1", "0.1.1"

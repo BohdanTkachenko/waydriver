@@ -12,6 +12,8 @@ jobs:
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
+    outputs:
+      mcp_version: ${{ steps.check-mcp.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -20,12 +22,35 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz
+        id: release-plz
         uses: MarcoIeni/release-plz-action@v0.5
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Check for waydriver-mcp release
+        id: check-mcp
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          if [ -n "$RELEASES" ]; then
+            version=$(echo "$RELEASES" | jq -r '.[]? | select(.package_name == "waydriver-mcp") | .version // empty')
+          else
+            version=""
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  publish-docker:
+    name: Publish Docker Image
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.mcp_version != ''
+    uses: ./.github/workflows/publish-docker.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      version: ${{ needs.release-plz-release.outputs.mcp_version }}
 
   release-plz-pr:
     name: Release-plz PR
