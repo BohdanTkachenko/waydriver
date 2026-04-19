@@ -12,6 +12,7 @@
 //! cargo test -p waydriver-mcp --test e2e -- --ignored --test-threads=1
 //! ```
 
+use std::path::Path;
 use std::time::Duration;
 
 use rmcp::model::{CallToolRequestParams, ClientInfo};
@@ -51,7 +52,18 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
-async fn run_calculator_test(command: tokio::process::Command, local: bool) -> anyhow::Result<()> {
+fn extract_kv(text: &str, key: &str) -> Option<String> {
+    text.split([',', '\n'])
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix(&format!("{key}=")))
+        .map(str::to_string)
+}
+
+async fn run_calculator_test(
+    command: tokio::process::Command,
+    local: bool,
+    report_dir: Option<&Path>,
+) -> anyhow::Result<()> {
     let transport = TokioChildProcess::new(command)?;
     let client = TestClient.serve(transport).await?;
 
@@ -92,14 +104,16 @@ async fn run_calculator_test(command: tokio::process::Command, local: bool) -> a
     assert!(text.contains("Session started"), "unexpected: {text}");
 
     // Extract session id from "Session started: id=XXXX, ..."
-    let session_id = text
-        .split("id=")
-        .nth(1)
-        .unwrap()
-        .split(',')
-        .next()
-        .unwrap()
-        .to_string();
+    let session_id = extract_kv(&text, "id").expect("id= in start_session response");
+    let report_url = extract_kv(&text, "report");
+    if local {
+        assert!(
+            report_url
+                .as_deref()
+                .is_some_and(|u| u.starts_with("file://")),
+            "expected file:// report URL in response, got: {text}"
+        );
+    }
 
     // Let the app render
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -271,6 +285,86 @@ async fn run_calculator_test(command: tokio::process::Command, local: bool) -> a
     let text = result_text(&result);
     assert_eq!(text, "No active sessions");
 
+    // Event log + HTML report assertions (local only — docker run doesn't
+    // expose the container's report dir or its HTTP port to the host).
+    if local {
+        let dir = report_dir.expect("local mode requires report_dir");
+        let session_dir = dir.join(&session_id);
+
+        let events_path = session_dir.join("events.jsonl");
+        let events_raw = tokio::fs::read_to_string(&events_path).await?;
+        let events: Vec<serde_json::Value> = events_raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert!(
+            !events.is_empty(),
+            "events.jsonl at {events_path:?} was empty"
+        );
+        assert_eq!(events.first().unwrap()["action"], "start_session");
+        assert_eq!(events.last().unwrap()["action"], "kill_session");
+
+        let actions: Vec<&str> = events.iter().map(|e| e["action"].as_str().unwrap()).collect();
+        for expected in [
+            "start_session",
+            "press_key",
+            "inspect_ui",
+            "click_element",
+            "take_screenshot",
+            "find_element",
+            "type_text",
+            "move_pointer",
+            "pointer_click",
+            "kill_session",
+        ] {
+            assert!(
+                actions.contains(&expected),
+                "expected action {expected} in event log, got: {actions:?}"
+            );
+        }
+
+        let screenshot_events: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["action"] == "take_screenshot" && e["status"] == "ok")
+            .collect();
+        assert_eq!(screenshot_events.len(), 2);
+        assert_eq!(
+            screenshot_events[0]["screenshot"],
+            format!("{session_id}-1.png")
+        );
+        assert_eq!(
+            screenshot_events[1]["screenshot"],
+            format!("{session_id}-2.png")
+        );
+
+        let index_html = tokio::fs::read_to_string(session_dir.join("index.html")).await?;
+        assert!(index_html.contains(&session_id));
+        assert!(index_html.contains("events.js?v="));
+        assert!(index_html.contains("window.__events_update"));
+        assert!(index_html.contains("cdn.tailwindcss.com"));
+
+        // Static viewer loads events.js (not events.jsonl) via a <script src>
+        // swap trick — so check that file exists and contains all seqs.
+        let events_js = tokio::fs::read_to_string(session_dir.join("events.js")).await?;
+        assert!(events_js.starts_with("window.__events_update("));
+        for seq in 1..=events.len() {
+            assert!(
+                events_js.contains(&format!("\"seq\":{seq}")),
+                "events.js missing seq {seq}"
+            );
+        }
+
+        // start_session should have returned a file:// URL matching the report dir.
+        let expected_url = format!("file://{}/{}/index.html", dir.display(), session_id);
+        assert_eq!(
+            report_url.as_deref(),
+            Some(expected_url.as_str()),
+            "start_session report URL should be a file:// URL"
+        );
+    }
+
     client.cancel().await?;
     Ok(())
 }
@@ -278,7 +372,10 @@ async fn run_calculator_test(command: tokio::process::Command, local: bool) -> a
 #[tokio::test]
 #[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
 async fn calculator_add_via_mcp() -> anyhow::Result<()> {
-    run_calculator_test(tokio::process::Command::new(mcp_binary()), true).await
+    let report_dir = tempfile::tempdir()?;
+    let mut cmd = tokio::process::Command::new(mcp_binary());
+    cmd.args(["--report-dir", report_dir.path().to_str().unwrap()]);
+    run_calculator_test(cmd, true, Some(report_dir.path())).await
 }
 
 #[tokio::test]
@@ -286,5 +383,5 @@ async fn calculator_add_via_mcp() -> anyhow::Result<()> {
 async fn calculator_add_via_docker() -> anyhow::Result<()> {
     let mut cmd = tokio::process::Command::new("docker");
     cmd.args(["run", "--rm", "-i", "waydriver-mcp-e2e:latest"]);
-    run_calculator_test(cmd, false).await
+    run_calculator_test(cmd, false, None).await
 }

@@ -22,6 +22,7 @@ clap.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
+serde_json = "1"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -29,5 +30,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 waydriver = { path = "../waydriver", features = ["test-support"] }
 async-trait.workspace = true
-serde_json = "1"
 tempfile.workspace = true

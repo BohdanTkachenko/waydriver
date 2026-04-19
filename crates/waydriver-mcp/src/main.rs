@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, RwLock};
 
 use clap::Parser;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -36,6 +38,16 @@ pub struct StartSessionParams {
     /// Override report output directory for this session (replaces the server default).
     /// Reports include screenshots today; video recordings and HTML summaries planned.
     pub report_dir: Option<String>,
+    /// Whether to generate the live HTML viewer and event log for this session.
+    /// Defaults to true. When false, `index.html` / `events.js` / `events.jsonl`
+    /// are not written and the `report=file://...` line is omitted from the
+    /// start_session response. Screenshots still persist under `report_dir`.
+    #[serde(default = "default_report_enabled")]
+    pub report: bool,
+}
+
+fn default_report_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -100,6 +112,14 @@ pub struct ManagedSession {
     pub session: Session,
     pub report_dir: PathBuf,
     pub screenshot_counter: AtomicU32,
+    /// In-memory event log. Guards both the on-disk `events.jsonl` (append) and
+    /// the atomically-rewritten `events.js` so concurrent calls never interleave.
+    pub events: Mutex<Vec<serde_json::Value>>,
+    pub started_at_ms: u64,
+    pub app_name: String,
+    /// When false, `log_event` is a no-op and the session skips writing
+    /// `index.html` / `events.js` / `events.jsonl`.
+    pub report_enabled: bool,
 }
 
 impl ManagedSession {
@@ -117,6 +137,288 @@ impl ManagedSession {
         tokio::fs::write(&path, png_bytes).await?;
         Ok(path)
     }
+
+    /// Record a tool call. Appends one JSON line to `{report_dir}/{session_id}/events.jsonl`
+    /// and rewrites `{report_dir}/{session_id}/events.js` atomically. Returns the
+    /// assigned sequence number.
+    pub async fn log_event(
+        &self,
+        session_id: &str,
+        action: &'static str,
+        params: serde_json::Value,
+        outcome: Result<&str, &str>,
+        screenshot: Option<&str>,
+    ) -> std::io::Result<u32> {
+        if !self.report_enabled {
+            return Ok(0);
+        }
+        append_event(
+            &self.report_dir,
+            session_id,
+            &self.events,
+            action,
+            params,
+            outcome,
+            screenshot,
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn append_event(
+    report_dir: &std::path::Path,
+    session_id: &str,
+    events: &Mutex<Vec<serde_json::Value>>,
+    action: &'static str,
+    params: serde_json::Value,
+    outcome: Result<&str, &str>,
+    screenshot: Option<&str>,
+) -> std::io::Result<u32> {
+    let mut guard = events.lock().await;
+    let seq = guard.len() as u32 + 1;
+    let ts_ms = now_ms();
+    let (status, message) = match outcome {
+        Ok(msg) => ("ok", msg),
+        Err(msg) => ("err", msg),
+    };
+    let mut event = serde_json::json!({
+        "seq": seq,
+        "ts_ms": ts_ms,
+        "action": action,
+        "params": params,
+        "status": status,
+        "message": message,
+    });
+    if let Some(name) = screenshot {
+        event["screenshot"] = serde_json::Value::String(name.to_string());
+    }
+
+    // 1. Append to events.jsonl (durable source of truth).
+    let mut line = serde_json::to_vec(&event)?;
+    line.push(b'\n');
+    let session_dir = report_dir.join(session_id);
+    let jsonl_path = session_dir.join("events.jsonl");
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&jsonl_path)
+        .await?;
+    file.write_all(&line).await?;
+    file.flush().await?;
+
+    // 2. Push into in-memory vec.
+    guard.push(event);
+
+    // 3. Rewrite events.js atomically (tempfile + rename on same filesystem).
+    // The viewer HTML swaps in a fresh <script src="events.js?v=..."> every 2s,
+    // which triggers window.__events_update with the full array.
+    let json_array = serde_json::to_string(&*guard)?;
+    let js_body = format!("window.__events_update({json_array});\n");
+    let tmp_path = session_dir.join(".events.js.tmp");
+    tokio::fs::write(&tmp_path, js_body.as_bytes()).await?;
+    tokio::fs::rename(&tmp_path, session_dir.join("events.js")).await?;
+
+    Ok(seq)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the static viewer shell written once per session. The shell fetches
+/// `events.jsonl` at load time (and on an interval) and renders each entry as
+/// a styled card.
+pub fn render_index_html(session_id: &str, app_name: &str, started_at_ms: u64) -> String {
+    let sid = html_escape(session_id);
+    let app = html_escape(app_name);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>waydriver session {sid}</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  html {{ font-family: 'Inter', system-ui, sans-serif; }}
+  code, pre, .mono {{ font-family: 'JetBrains Mono', ui-monospace, monospace; }}
+  .pill {{ display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }}
+  .thumb {{ max-width: 220px; border-radius: 6px; border: 1px solid #e5e7eb; display: block; margin-top: 8px; }}
+  details > summary {{ cursor: pointer; color: #475569; font-size: 13px; }}
+  details[open] > summary {{ margin-bottom: 4px; }}
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+<header class="sticky top-0 z-10 bg-white/95 backdrop-blur border-b border-slate-200 shadow-sm">
+  <div class="max-w-5xl mx-auto px-6 py-4 flex items-center gap-6">
+    <div class="flex-1 min-w-0">
+      <h1 class="text-lg font-semibold truncate">
+        <span class="text-slate-500 mr-2">waydriver</span>
+        <span class="mono">{sid}</span>
+      </h1>
+      <div class="text-sm text-slate-600 mt-0.5">
+        app: <span class="font-medium text-slate-800">{app}</span>
+        · started: <span id="started-at">—</span>
+        · <span id="event-count">0</span> events
+      </div>
+    </div>
+  </div>
+</header>
+<main class="max-w-5xl mx-auto px-6 py-6">
+  <div id="notice"></div>
+  <ol id="events" class="space-y-3"></ol>
+  <div id="empty" class="hidden text-center py-12 text-slate-400 text-sm">No events yet. Waiting for the first tool call…</div>
+</main>
+<script>
+const STARTED_AT_MS = {started_at_ms};
+const SESSION_ID = {sid_json};
+const PILL_CLASS = {{
+  start_session:   'bg-slate-200 text-slate-800',
+  kill_session:    'bg-slate-200 text-slate-800',
+  take_screenshot: 'bg-indigo-100 text-indigo-800',
+  click_element:   'bg-blue-100 text-blue-800',
+  type_text:       'bg-blue-100 text-blue-800',
+  press_key:       'bg-blue-100 text-blue-800',
+  move_pointer:    'bg-blue-100 text-blue-800',
+  pointer_click:   'bg-blue-100 text-blue-800',
+  inspect_ui:      'bg-gray-100 text-gray-700',
+  find_element:    'bg-gray-100 text-gray-700',
+}};
+
+function fmtTime(ms) {{
+  const d = new Date(ms);
+  return d.toLocaleTimeString(undefined, {{ hour12: false }}) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}}
+
+function el(tag, attrs, children) {{
+  const e = document.createElement(tag);
+  if (attrs) for (const k in attrs) {{
+    if (k === 'class') e.className = attrs[k];
+    else if (k === 'text') e.textContent = attrs[k];
+    else e.setAttribute(k, attrs[k]);
+  }}
+  if (children) for (const c of children) e.appendChild(c);
+  return e;
+}}
+
+function renderParams(params) {{
+  const entries = Object.entries(params || {{}}).filter(([_, v]) => v !== null && v !== undefined && v !== '');
+  if (!entries.length) return null;
+  const dl = el('dl', {{ class: 'grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm mt-1' }});
+  for (const [k, v] of entries) {{
+    dl.appendChild(el('dt', {{ class: 'text-slate-500', text: k }}));
+    const dd = el('dd', {{ class: 'mono text-slate-800 break-all' }});
+    dd.textContent = typeof v === 'string' ? v : JSON.stringify(v);
+    dl.appendChild(dd);
+  }}
+  return dl;
+}}
+
+function renderMessage(msg) {{
+  if (!msg) return null;
+  if (msg.length <= 160) return el('p', {{ class: 'mono text-sm text-slate-700 mt-2 whitespace-pre-wrap break-words', text: msg }});
+  const details = el('details', {{ class: 'mt-2' }});
+  details.appendChild(el('summary', {{ text: `Show full output (${{msg.length}} chars)` }}));
+  details.appendChild(el('pre', {{ class: 'mono text-xs text-slate-700 bg-slate-100 rounded p-3 mt-1 whitespace-pre-wrap break-words', text: msg }}));
+  return details;
+}}
+
+function renderEvent(ev) {{
+  const pillClass = PILL_CLASS[ev.action] || 'bg-slate-100 text-slate-700';
+  const statusClass = ev.status === 'ok' ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700';
+  const card = el('li', {{ class: 'bg-white rounded-lg border border-slate-200 shadow-sm p-4 flex gap-4' }});
+
+  const left = el('div', {{ class: 'w-20 shrink-0 text-right' }});
+  left.appendChild(el('div', {{ class: 'text-xs text-slate-400', text: '#' + ev.seq }}));
+  left.appendChild(el('div', {{ class: 'mono text-xs text-slate-600 mt-0.5', text: fmtTime(ev.ts_ms) }}));
+  card.appendChild(left);
+
+  const body = el('div', {{ class: 'flex-1 min-w-0' }});
+  const head = el('div', {{ class: 'flex items-center gap-2 flex-wrap' }});
+  head.appendChild(el('span', {{ class: 'pill ' + pillClass, text: ev.action }}));
+  head.appendChild(el('span', {{ class: 'pill ' + statusClass, text: ev.status }}));
+  body.appendChild(head);
+
+  const params = renderParams(ev.params);
+  if (params) body.appendChild(params);
+
+  const message = renderMessage(ev.message);
+  if (message) body.appendChild(message);
+
+  if (ev.screenshot) {{
+    const a = el('a', {{ href: ev.screenshot, target: '_blank', rel: 'noopener' }});
+    a.appendChild(el('img', {{ src: ev.screenshot, loading: 'lazy', alt: 'screenshot', class: 'thumb' }}));
+    body.appendChild(a);
+  }}
+
+  card.appendChild(body);
+  return card;
+}}
+
+// Append-only render: we only ever add new events. This preserves user UI
+// state (e.g. expanded <details> for inspect_ui output) across the 2-second
+// refreshes. events.js is reloaded via the <script src> swap trick below —
+// fetch() is blocked over file:// by Chrome, but <script src> is not.
+let rendered = 0;
+window.__events_update = function(events) {{
+  const ol = document.getElementById('events');
+  if (events.length < rendered) {{
+    ol.replaceChildren();
+    rendered = 0;
+  }}
+  for (let i = rendered; i < events.length; i++) {{
+    ol.appendChild(renderEvent(events[i]));
+  }}
+  rendered = events.length;
+  document.getElementById('event-count').textContent = rendered;
+  document.getElementById('empty').classList.toggle('hidden', rendered > 0);
+  document.getElementById('notice').innerHTML = '';
+}};
+
+function reload() {{
+  const s = document.createElement('script');
+  s.src = 'events.js?v=' + Date.now();
+  s.onload = () => s.remove();
+  s.onerror = () => {{
+    s.remove();
+    document.getElementById('notice').innerHTML = '<div class="bg-rose-50 border border-rose-300 rounded-md p-4 text-sm text-rose-900 mb-4"><div class="font-semibold mb-1">Failed to load <code class="mono">events.js</code></div><div>waydriver-mcp writes this file alongside <code class="mono">index.html</code> on every tool call. If the session directory was moved or only <code class="mono">index.html</code> was copied, reopen the full directory; otherwise the server may no longer be running.</div></div>';
+  }};
+  document.body.appendChild(s);
+}}
+
+document.getElementById('started-at').textContent = new Date(STARTED_AT_MS).toLocaleString();
+reload();
+setInterval(reload, 2000);
+</script>
+</body>
+</html>
+"#,
+        sid = sid,
+        app = app,
+        started_at_ms = started_at_ms,
+        sid_json = serde_json::Value::String(session_id.to_string()),
+    )
 }
 
 /// Resolve the effective report dir for a new session: per-session override
@@ -145,11 +447,20 @@ impl UiTestServer {
         }
     }
 
-    #[tool(description = "Start a headless Wayland session with mutter and launch an application")]
+    #[tool(
+        description = "Start a headless Wayland session with mutter and launch an application. \
+                       On success, the response includes a `report=file://...` line with the URL \
+                       of the session's live viewer HTML — surface that URL directly to the user \
+                       so they can watch the run in a browser. Pass `report: false` to skip \
+                       writing the viewer and event log; the `report=` line is then omitted."
+    )]
     async fn start_session(
         &self,
         Parameters(params): Parameters<StartSessionParams>,
     ) -> Result<CallToolResult, McpError> {
+        let command = params.command.clone();
+        let args = params.args.clone();
+        let cwd = params.cwd.clone();
         let app_name = params
             .app_name
             .clone()
@@ -186,20 +497,55 @@ impl UiTestServer {
         let display = session.wayland_display().to_string();
 
         let report_dir = resolve_report_dir(&self.report_dir, params.report_dir.as_deref());
+        let started_at_ms = now_ms();
+        let report_enabled = params.report;
 
-        self.sessions.write().await.insert(
-            id.clone(),
-            ManagedSession {
-                session,
-                report_dir,
-                screenshot_counter: AtomicU32::new(0),
-            },
-        );
+        // Seed the per-session dir + viewer shell before we insert so that the
+        // first event always lands on an existing index.html.
+        if report_enabled {
+            let session_dir = report_dir.join(&id);
+            if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
+                tracing::warn!(error = %e, "create session report dir failed");
+            }
+            let html = render_index_html(&id, &app_name, started_at_ms);
+            if let Err(e) = tokio::fs::write(session_dir.join("index.html"), html).await {
+                tracing::warn!(error = %e, "write index.html failed");
+            }
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Session started: id={}, display={}, app={}",
-            id, display, app_name
-        ))]))
+        let managed = ManagedSession {
+            session,
+            report_dir: report_dir.clone(),
+            screenshot_counter: AtomicU32::new(0),
+            events: Mutex::new(Vec::new()),
+            started_at_ms,
+            app_name: app_name.clone(),
+            report_enabled,
+        };
+
+        let start_msg = format!("Session started: id={id}, display={display}, app={app_name}");
+        let log_params = serde_json::json!({
+            "command": command,
+            "args": args,
+            "cwd": cwd,
+            "app_name": app_name,
+        });
+        if let Err(e) = managed
+            .log_event(&id, "start_session", log_params, Ok(&start_msg), None)
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(start_session) failed");
+        }
+
+        self.sessions.write().await.insert(id.clone(), managed);
+
+        let text = if report_enabled {
+            let url = format!("file://{}/{id}/index.html", report_dir.display());
+            format!("{start_msg}\nreport={url}")
+        } else {
+            start_msg
+        };
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "List all active test sessions")]
@@ -239,16 +585,40 @@ impl UiTestServer {
                 McpError::invalid_params(format!("session not found: {}", params.session_id), None)
             })?;
 
-        managed
-            .session
-            .kill()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Destructure so `session.kill()` can move out without invalidating the
+        // remaining fields we still need for the final log event.
+        let ManagedSession {
+            session,
+            report_dir,
+            events,
+            report_enabled,
+            ..
+        } = managed;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Session {} killed",
-            params.session_id
-        ))]))
+        let kill_result = session.kill().await.map_err(|e| e.to_string());
+        let success_msg = format!("Session {} killed", params.session_id);
+        let outcome = kill_result
+            .as_ref()
+            .map(|_| success_msg.as_str())
+            .map_err(|e| e.as_str());
+        if report_enabled {
+            if let Err(e) = append_event(
+                &report_dir,
+                &params.session_id,
+                &events,
+                "kill_session",
+                serde_json::json!({}),
+                outcome,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "log_event(kill_session) failed");
+            }
+        }
+
+        kill_result.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(success_msg)]))
     }
 
     #[tool(description = "Dump the accessibility tree of the application UI")]
@@ -262,13 +632,31 @@ impl UiTestServer {
         })?;
         let session = &managed.session;
 
-        let a11y = session.a11y_connection.as_ref().ok_or_else(|| {
-            McpError::internal_error("no AT-SPI connection for this session".to_string(), None)
-        })?;
-        let tree = atspi_client::dump_app_tree(a11y, &session.app_bus_name, &session.app_path)
+        let outcome: Result<String, String> = async {
+            let a11y = session
+                .a11y_connection
+                .as_ref()
+                .ok_or_else(|| "no AT-SPI connection for this session".to_string())?;
+            atspi_client::dump_app_tree(a11y, &session.app_bus_name, &session.app_path)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .await;
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "inspect_ui",
+                serde_json::json!({}),
+                log_outcome,
+                None,
+            )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        {
+            tracing::warn!(error = %e, "log_event(inspect_ui) failed");
+        }
 
+        let tree = outcome.map_err(|e| McpError::internal_error(e, None))?;
         Ok(CallToolResult::success(vec![Content::text(tree)]))
     }
 
@@ -283,18 +671,36 @@ impl UiTestServer {
         })?;
         let session = &managed.session;
 
-        let a11y = session.a11y_connection.as_ref().ok_or_else(|| {
-            McpError::internal_error("no AT-SPI connection for this session".to_string(), None)
-        })?;
-        let result = atspi_client::click_element(
-            a11y,
-            &session.app_bus_name,
-            &session.app_path,
-            &params.element_name,
-        )
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let outcome: Result<String, String> = async {
+            let a11y = session
+                .a11y_connection
+                .as_ref()
+                .ok_or_else(|| "no AT-SPI connection for this session".to_string())?;
+            atspi_client::click_element(
+                a11y,
+                &session.app_bus_name,
+                &session.app_path,
+                &params.element_name,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        }
+        .await;
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "click_element",
+                serde_json::json!({ "element_name": params.element_name }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(click_element) failed");
+        }
 
+        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
@@ -309,19 +715,33 @@ impl UiTestServer {
         })?;
         let session = &managed.session;
 
-        // Type each character via the input backend (goes through the compositor)
-        for ch in params.text.chars() {
-            let keysym = char_to_keysym(ch);
-            session
-                .press_keysym(keysym)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let outcome: Result<String, String> = async {
+            for ch in params.text.chars() {
+                let keysym = char_to_keysym(ch);
+                session
+                    .press_keysym(keysym)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(format!("Typed '{}'", params.text))
+        }
+        .await;
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "type_text",
+                serde_json::json!({ "text": params.text }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(type_text) failed");
         }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Typed '{}'",
-            params.text
-        ))]))
+        let msg = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(description = "Press a keyboard key (e.g. 'Return', 'Tab', 'a')")]
@@ -335,19 +755,42 @@ impl UiTestServer {
         })?;
         let session = &managed.session;
 
-        let keysym = key_name_to_keysym(&params.key).ok_or_else(|| {
-            McpError::invalid_params(format!("unknown key: {}", params.key), None)
-        })?;
-
-        session
-            .press_keysym(keysym)
+        enum PressErr {
+            Unknown(String),
+            Internal(String),
+        }
+        let outcome: Result<String, PressErr> = async {
+            let keysym = key_name_to_keysym(&params.key)
+                .ok_or_else(|| PressErr::Unknown(format!("unknown key: {}", params.key)))?;
+            session
+                .press_keysym(keysym)
+                .await
+                .map_err(|e| PressErr::Internal(e.to_string()))?;
+            Ok(format!("Pressed '{}'", params.key))
+        }
+        .await;
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| match e {
+            PressErr::Unknown(m) => m.as_str(),
+            PressErr::Internal(m) => m.as_str(),
+        });
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "press_key",
+                serde_json::json!({ "key": params.key }),
+                log_outcome,
+                None,
+            )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        {
+            tracing::warn!(error = %e, "log_event(press_key) failed");
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Pressed '{}'",
-            params.key
-        ))]))
+        let msg = outcome.map_err(|e| match e {
+            PressErr::Unknown(m) => McpError::invalid_params(m, None),
+            PressErr::Internal(m) => McpError::internal_error(m, None),
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(description = "Move the pointer by a relative offset in logical pixels")]
@@ -361,15 +804,27 @@ impl UiTestServer {
         })?;
         let session = &managed.session;
 
-        session
+        let outcome: Result<String, String> = session
             .pointer_motion_relative(params.dx, params.dy)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map(|_| format!("Pointer moved by ({}, {})", params.dx, params.dy))
+            .map_err(|e| e.to_string());
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "move_pointer",
+                serde_json::json!({ "dx": params.dx, "dy": params.dy }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(move_pointer) failed");
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Pointer moved by ({}, {})",
-            params.dx, params.dy
-        ))]))
+        let msg = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(description = "Press and release a pointer button (defaults to left click)")]
@@ -384,15 +839,27 @@ impl UiTestServer {
         let session = &managed.session;
 
         let button = params.button.unwrap_or(0x110); // BTN_LEFT
-        session
+        let outcome: Result<String, String> = session
             .pointer_button(button)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map(|_| format!("Pointer button {button:#x} clicked"))
+            .map_err(|e| e.to_string());
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "pointer_click",
+                serde_json::json!({ "button": button }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(pointer_click) failed");
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Pointer button {:#x} clicked",
-            button
-        ))]))
+        let msg = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(
@@ -408,22 +875,41 @@ impl UiTestServer {
         })?;
         let session = &managed.session;
 
-        let a11y = session.a11y_connection.as_ref().ok_or_else(|| {
-            McpError::internal_error("no AT-SPI connection for this session".to_string(), None)
-        })?;
-        let (bus_name, path, role) = atspi_client::find_element_by_name(
-            a11y,
-            &session.app_bus_name,
-            &session.app_path,
-            &params.element_name,
-        )
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let outcome: Result<String, String> = async {
+            let a11y = session
+                .a11y_connection
+                .as_ref()
+                .ok_or_else(|| "no AT-SPI connection for this session".to_string())?;
+            let (bus_name, path, role) = atspi_client::find_element_by_name(
+                a11y,
+                &session.app_bus_name,
+                &session.app_path,
+                &params.element_name,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "Found '{}': bus_name={}, path={}, role={}",
+                params.element_name, bus_name, path, role
+            ))
+        }
+        .await;
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "find_element",
+                serde_json::json!({ "element_name": params.element_name }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(find_element) failed");
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Found '{}': bus_name={}, path={}, role={}",
-            params.element_name, bus_name, path, role
-        ))]))
+        let msg = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(description = "Take a screenshot of the session and return the file path")]
@@ -437,16 +923,38 @@ impl UiTestServer {
         })?;
         let session = &managed.session;
 
-        let png_bytes = session
-            .take_screenshot()
+        let outcome: Result<PathBuf, String> = async {
+            let png_bytes = session.take_screenshot().await.map_err(|e| e.to_string())?;
+            managed
+                .persist_screenshot(&params.session_id, &png_bytes)
+                .await
+                .map_err(|e| format!("persist screenshot: {e}"))
+        }
+        .await;
+        let ok_display = outcome.as_ref().ok().map(|p| p.display().to_string());
+        let screenshot_name = outcome
+            .as_ref()
+            .ok()
+            .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string));
+        let log_outcome = match (&ok_display, &outcome) {
+            (Some(s), _) => Ok(s.as_str()),
+            (None, Err(e)) => Err(e.as_str()),
+            (None, Ok(_)) => unreachable!(),
+        };
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "take_screenshot",
+                serde_json::json!({}),
+                log_outcome,
+                screenshot_name.as_deref(),
+            )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        {
+            tracing::warn!(error = %e, "log_event(take_screenshot) failed");
+        }
 
-        let path = managed
-            .persist_screenshot(&params.session_id, &png_bytes)
-            .await
-            .map_err(|e| McpError::internal_error(format!("persist screenshot: {e}"), None))?;
-
+        let path = outcome.map_err(|e| McpError::internal_error(e, None))?;
         Ok(CallToolResult::success(vec![Content::text(
             path.display().to_string(),
         )]))
@@ -469,7 +977,8 @@ impl ServerHandler for UiTestServer {
 struct Cli {
     /// Base directory for per-session report output (screenshots today;
     /// video recordings and HTML summaries planned). Each session gets a
-    /// subdirectory under this path.
+    /// subdirectory under this path, each containing a self-contained
+    /// `index.html` viewer openable directly from the filesystem.
     #[arg(long, default_value = "/tmp/waydriver", env = "WAYDRIVER_REPORT_DIR")]
     report_dir: PathBuf,
 }
@@ -488,7 +997,16 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
-    tracing::info!(report_dir = %cli.report_dir.display(), "waydriver-mcp starting");
+    // Create the base report dir up front so per-session dirs land under an
+    // existing parent.
+    if let Err(e) = tokio::fs::create_dir_all(&cli.report_dir).await {
+        tracing::warn!(error = %e, "create report_dir failed");
+    }
+
+    tracing::info!(
+        report_dir = %cli.report_dir.display(),
+        "waydriver-mcp starting"
+    );
 
     let service = UiTestServer::new(cli.report_dir)
         .serve(stdio())
@@ -592,6 +1110,16 @@ mod tests {
     }
 
     async fn insert_test_session(srv: &UiTestServer, id: &str, app_name: &str, display: &str) {
+        insert_test_session_with(srv, id, app_name, display, true).await;
+    }
+
+    async fn insert_test_session_with(
+        srv: &UiTestServer,
+        id: &str,
+        app_name: &str,
+        display: &str,
+        report_enabled: bool,
+    ) {
         let session = Session::new_for_test(
             id.into(),
             app_name.into(),
@@ -608,6 +1136,10 @@ mod tests {
                 session,
                 report_dir,
                 screenshot_counter: AtomicU32::new(0),
+                events: Mutex::new(Vec::new()),
+                started_at_ms: 0,
+                app_name: app_name.into(),
+                report_enabled,
             },
         );
     }
@@ -879,6 +1411,10 @@ mod tests {
             session,
             report_dir: dir,
             screenshot_counter: AtomicU32::new(0),
+            events: Mutex::new(Vec::new()),
+            started_at_ms: 0,
+            app_name: "app".into(),
+            report_enabled: true,
         }
     }
 
@@ -938,6 +1474,61 @@ mod tests {
         assert!(!path.starts_with(base.path()));
     }
 
+    #[tokio::test]
+    async fn log_event_is_noop_when_report_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut managed = make_managed(tmp.path().to_path_buf());
+        managed.report_enabled = false;
+
+        let seq = managed
+            .log_event(
+                "sid",
+                "click_element",
+                serde_json::json!({ "element_name": "2" }),
+                Ok("Clicked"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(seq, 0);
+        assert!(tokio::fs::metadata(tmp.path().join("sid").join("events.jsonl"))
+            .await
+            .is_err());
+        assert!(tokio::fs::metadata(tmp.path().join("sid").join("events.js"))
+            .await
+            .is_err());
+        assert!(managed.events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kill_session_skips_event_write_when_report_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let s = UiTestServer::new(tmp.path().to_path_buf());
+        insert_test_session_with(&s, "test-1", "calculator", "wayland-test-1", false).await;
+
+        let result = s.kill_session(session_id("test-1")).await.unwrap();
+        assert!(content_text(&result).contains("killed"));
+        assert!(tokio::fs::metadata(tmp.path().join("test-1").join("events.jsonl"))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn start_session_params_report_defaults_to_true() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
+        assert!(params.report);
+    }
+
+    #[test]
+    fn start_session_params_report_can_be_disabled() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x", "report": false }))
+                .unwrap();
+        assert!(!params.report);
+    }
+
     // ── CLI parsing ────────────────────────────────────────────────────
 
     #[test]
@@ -956,6 +1547,122 @@ mod tests {
     async fn server_stores_report_base_dir() {
         let s = UiTestServer::new(PathBuf::from("/tmp/custom-out"));
         assert_eq!(s.report_dir, PathBuf::from("/tmp/custom-out"));
+    }
+
+    // ── Event log + HTML renderer ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn log_event_appends_jsonl_line() {
+        let tmp = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("sid")).await.unwrap();
+        let managed = make_managed(tmp.path().to_path_buf());
+
+        managed
+            .log_event(
+                "sid",
+                "click_element",
+                serde_json::json!({ "element_name": "2" }),
+                Ok("Clicked '2'"),
+                None,
+            )
+            .await
+            .unwrap();
+        managed
+            .log_event(
+                "sid",
+                "take_screenshot",
+                serde_json::json!({}),
+                Err("no keepalive stream"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let contents = tokio::fs::read_to_string(tmp.path().join("sid").join("events.jsonl"))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let e1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(e1["seq"], 1);
+        assert_eq!(e1["action"], "click_element");
+        assert_eq!(e1["status"], "ok");
+        assert_eq!(e1["params"]["element_name"], "2");
+
+        let e2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(e2["seq"], 2);
+        assert_eq!(e2["action"], "take_screenshot");
+        assert_eq!(e2["status"], "err");
+        assert_eq!(e2["message"], "no keepalive stream");
+
+        // events.js is written atomically alongside events.jsonl and should
+        // contain exactly the same events wrapped in a window.__events_update(...) call.
+        let js = tokio::fs::read_to_string(tmp.path().join("sid").join("events.js"))
+            .await
+            .unwrap();
+        assert!(js.starts_with("window.__events_update("));
+        assert!(js.trim_end().ends_with(");"));
+        assert!(js.contains("\"seq\":1"));
+        assert!(js.contains("\"seq\":2"));
+        assert!(js.contains("\"action\":\"click_element\""));
+        assert!(js.contains("\"action\":\"take_screenshot\""));
+    }
+
+    #[tokio::test]
+    async fn log_event_concurrent_writes_are_serialized() {
+        let tmp = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("sid")).await.unwrap();
+        let managed = Arc::new(make_managed(tmp.path().to_path_buf()));
+
+        let mut handles = Vec::new();
+        for i in 0..25 {
+            let m = Arc::clone(&managed);
+            handles.push(tokio::spawn(async move {
+                m.log_event(
+                    "sid",
+                    "press_key",
+                    serde_json::json!({ "key": format!("k{i}") }),
+                    Ok("ok"),
+                    None,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let contents = tokio::fs::read_to_string(tmp.path().join("sid").join("events.jsonl"))
+            .await
+            .unwrap();
+        let mut seqs: Vec<u64> = contents
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["seq"].as_u64().unwrap())
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1..=25).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn render_index_html_contains_header_fields() {
+        let html = render_index_html("my-sid", "gnome-calculator", 1_700_000_000_000);
+        assert!(html.contains("my-sid"));
+        assert!(html.contains("gnome-calculator"));
+        assert!(html.contains("cdn.tailwindcss.com"));
+        assert!(html.contains("events.js?v="));
+        assert!(html.contains("window.__events_update"));
+        assert!(html.contains(r#"id="events""#));
+        assert!(html.contains("1700000000000"));
+    }
+
+    #[test]
+    fn render_index_html_escapes_header_fields() {
+        let evil = "<script>alert(1)</script>";
+        let html = render_index_html("sid", evil, 0);
+        assert!(!html.contains(evil), "raw evil string leaked into HTML");
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 
     #[tokio::test]

@@ -118,11 +118,19 @@ session.kill().await?;
 
 Each session produces output under a configurable **report directory** — screenshots today, video recordings and HTML summaries planned. Screenshots are written as `{report_dir}/{session_id}/{session_id}-{n}.png` — each session gets its own subdirectory and `n` increments per `take_screenshot` call. The base `report_dir` defaults to `/tmp/waydriver` and can be overridden with the `--report-dir <PATH>` CLI flag or the `WAYDRIVER_REPORT_DIR` environment variable. Individual `start_session` calls may also pass a `report_dir` argument to override the server default for that session.
 
+Alongside the screenshots, each session writes:
+
+- **`events.jsonl`** — append-only audit log of every session-scoped tool call (action, params, ok/err status, timestamp) at `{report_dir}/{session_id}/events.jsonl`.
+- **`events.js`** — atomic rewrite of the same data as `window.__events_update([...])` for consumption by the viewer.
+- **`index.html`** — styled viewer (Tailwind via the Play CDN). Reloads `events.js` every 2 s via a `<script src>` swap (which works over `file://` unlike `fetch`), append-only rendering so expanded `<details>` stay expanded across refreshes. Written once at session start.
+
+`start_session`'s response includes a `file://` URL to the session viewer — open it directly from the filesystem in any browser. No HTTP server, no ports, no network access required. Multiple `waydriver-mcp` instances (different Claude Code tabs / projects) can run side by side without conflict.
+
 ### Why Docker?
 
 waydriver-mcp needs ~8 system services at runtime (mutter, pipewire, wireplumber, dbus, AT-SPI, gstreamer). Installing these manually is fragile and distro-specific. Docker solves four problems:
 
-- **Security** — the MCP server spawns arbitrary processes, interacts with them via D-Bus, and captures their screen. Running this on your host session gives it access to everything your user can do. Inside a container, it only sees what you explicitly mount — no access to your files, browser sessions, or credentials. Add `--network none` to block network access entirely
+- **Security** — the MCP server spawns arbitrary processes, interacts with them via D-Bus, and captures their screen. Running this on your host session gives it access to everything your user can do. Inside a container, it only sees what you explicitly mount — no access to your files, browser sessions, or credentials. Add `--network none` to block network access entirely (the report viewer is purely static `file://`, so it works without any network)
 - **Zero-setup distribution** — `docker pull` and you're running, no system packages to install
 - **D-Bus isolation** — each container gets its own dbus-daemon, so apps like gnome-calculator don't interfere across concurrent test sessions (the singleton D-Bus activation problem)
 - **ABI compatibility** — apps built inside the container are guaranteed to link against the same libraries the MCP runtime uses
@@ -157,8 +165,8 @@ MCP client config (e.g. `.mcp.json` for Claude Code):
 ```
 
 - `$PWD:/workspace:ro` — mounts the project directory so the MCP can launch your app binaries from `/workspace/`
-- `/tmp/waydriver:/tmp/waydriver` — makes session reports (screenshots, etc.) accessible on the host at `/tmp/waydriver/` (matches the default `--report-dir` inside the container)
-- `--network none` — the MCP server doesn't need internet access
+- `/tmp/waydriver:/tmp/waydriver` — makes session reports (screenshots, `events.jsonl`, `index.html`) accessible on the host at `/tmp/waydriver/`. **The mount uses the same path on both sides** so the `file://` URL that `start_session` returns is openable as-is on the host
+- `--network none` — safe to fully isolate: the report viewer is pure static HTML + JS loaded from your local filesystem
 
 For NixOS users, also mount the Nix store so Nix-built binaries work inside the container:
 
