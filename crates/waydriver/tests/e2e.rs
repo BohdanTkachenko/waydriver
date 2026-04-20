@@ -36,7 +36,7 @@ fn extract_png(raw: &[u8]) -> Vec<u8> {
 /// MutterState (so callers that need a second InputBackend can construct one).
 async fn start_calculator_session() -> anyhow::Result<(Session, Arc<MutterState>)> {
     let mut compositor = MutterCompositor::new();
-    compositor.start().await?;
+    compositor.start(None).await?;
     let state = compositor.state();
     let input = MutterInput::new(state.clone());
     let capture = MutterCapture::new(state.clone());

@@ -10,10 +10,11 @@ use crate::error::Result;
 /// client applications and sibling backends use.
 #[async_trait]
 pub trait CompositorRuntime: Send + Sync {
-    /// Spawn the compositor and wait for it to be ready. After this returns
-    /// successfully, `wayland_display()` and `runtime_dir()` must point at a
-    /// live Wayland socket.
-    async fn start(&mut self) -> Result<()>;
+    /// Spawn the compositor at the requested virtual-display size (or the
+    /// backend default when `None`) and wait for it to be ready. After this
+    /// returns successfully, `wayland_display()` and `runtime_dir()` must
+    /// point at a live Wayland socket.
+    async fn start(&mut self, resolution: Option<&str>) -> Result<()>;
 
     /// Stop the compositor, tearing down all child processes and cleaning up
     /// the runtime directory. Safe to call on an un-started or

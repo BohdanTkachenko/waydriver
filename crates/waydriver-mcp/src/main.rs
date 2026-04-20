@@ -44,6 +44,9 @@ pub struct StartSessionParams {
     /// start_session response. Screenshots still persist under `report_dir`.
     #[serde(default = "default_report_enabled")]
     pub report: bool,
+    /// Virtual display size as "WIDTHxHEIGHT" (e.g. "1920x1080"). When unset,
+    /// falls back to the server's --resolution flag (default "1024x768").
+    pub resolution: Option<String>,
 }
 
 fn default_report_enabled() -> bool {
@@ -429,20 +432,28 @@ fn resolve_report_dir(base: &std::path::Path, override_: Option<&str>) -> PathBu
         .unwrap_or_else(|| base.to_path_buf())
 }
 
+/// Resolve the effective virtual-display resolution for a new session:
+/// per-session override if provided, else the server's default.
+fn resolve_resolution(default: &str, override_: Option<&str>) -> String {
+    override_.unwrap_or(default).to_string()
+}
+
 #[derive(Clone)]
 pub struct UiTestServer {
     sessions: Arc<RwLock<HashMap<String, ManagedSession>>>,
     report_dir: PathBuf,
+    default_resolution: String,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl UiTestServer {
-    pub fn new(report_dir: PathBuf) -> Self {
+    pub fn new(report_dir: PathBuf, default_resolution: String) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             report_dir,
+            default_resolution,
             tool_router: Self::tool_router(),
         }
     }
@@ -466,13 +477,16 @@ impl UiTestServer {
             .clone()
             .unwrap_or_else(|| params.command.clone());
 
+        let resolution =
+            resolve_resolution(&self.default_resolution, params.resolution.as_deref());
+
         // Construct and pre-start the mutter compositor so we can pull its
         // shared Arc<MutterState> out before erasing to trait objects. Input
         // and capture are thin wrappers around that Arc, so they get cloned
         // references to the same D-Bus connection.
         let mut compositor = MutterCompositor::new();
         compositor
-            .start()
+            .start(Some(&resolution))
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let state = compositor.state();
@@ -529,6 +543,7 @@ impl UiTestServer {
             "args": args,
             "cwd": cwd,
             "app_name": app_name,
+            "resolution": resolution,
         });
         if let Err(e) = managed
             .log_event(&id, "start_session", log_params, Ok(&start_msg), None)
@@ -981,6 +996,10 @@ struct Cli {
     /// `index.html` viewer openable directly from the filesystem.
     #[arg(long, default_value = "/tmp/waydriver", env = "WAYDRIVER_REPORT_DIR")]
     report_dir: PathBuf,
+    /// Default virtual-display size ("WIDTHxHEIGHT") for sessions that don't
+    /// override it via start_session's `resolution` parameter.
+    #[arg(long, default_value = "1024x768", env = "WAYDRIVER_RESOLUTION")]
+    resolution: String,
 }
 
 #[tokio::main]
@@ -1005,10 +1024,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         report_dir = %cli.report_dir.display(),
+        resolution = %cli.resolution,
         "waydriver-mcp starting"
     );
 
-    let service = UiTestServer::new(cli.report_dir)
+    let service = UiTestServer::new(cli.report_dir, cli.resolution)
         .serve(stdio())
         .await
         .inspect_err(|e| {
@@ -1030,7 +1050,7 @@ mod tests {
     use waydriver::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
 
     fn server() -> UiTestServer {
-        UiTestServer::new(PathBuf::from("/tmp/waydriver-test"))
+        UiTestServer::new(PathBuf::from("/tmp/waydriver-test"), "1024x768".into())
     }
 
     fn session_id(id: &str) -> Parameters<SessionIdParams> {
@@ -1047,7 +1067,7 @@ mod tests {
 
     #[async_trait]
     impl CompositorRuntime for MockCompositor {
-        async fn start(&mut self) -> waydriver::error::Result<()> {
+        async fn start(&mut self, _resolution: Option<&str>) -> waydriver::error::Result<()> {
             Ok(())
         }
         async fn stop(&mut self) -> waydriver::error::Result<()> {
@@ -1397,6 +1417,26 @@ mod tests {
         assert_eq!(resolved, PathBuf::from("relative/path"));
     }
 
+    #[test]
+    fn resolve_resolution_defaults_to_server_default() {
+        assert_eq!(resolve_resolution("1024x768", None), "1024x768");
+    }
+
+    #[test]
+    fn resolve_resolution_uses_override_when_provided() {
+        assert_eq!(
+            resolve_resolution("1024x768", Some("1920x1080")),
+            "1920x1080"
+        );
+    }
+
+    #[test]
+    fn resolve_resolution_override_replaces_default_entirely() {
+        // The override is taken as-is; the server default is ignored even if
+        // the override is nonsensical (mutter validator catches that later).
+        assert_eq!(resolve_resolution("1920x1080", Some("garbage")), "garbage");
+    }
+
     fn make_managed(dir: PathBuf) -> ManagedSession {
         let session = Session::new_for_test(
             "sid".into(),
@@ -1504,7 +1544,7 @@ mod tests {
     #[tokio::test]
     async fn kill_session_skips_event_write_when_report_disabled() {
         let tmp = TempDir::new().unwrap();
-        let s = UiTestServer::new(tmp.path().to_path_buf());
+        let s = UiTestServer::new(tmp.path().to_path_buf(), "1024x768".into());
         insert_test_session_with(&s, "test-1", "calculator", "wayland-test-1", false).await;
 
         let result = s.kill_session(session_id("test-1")).await.unwrap();
@@ -1545,7 +1585,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_stores_report_base_dir() {
-        let s = UiTestServer::new(PathBuf::from("/tmp/custom-out"));
+        let s = UiTestServer::new(PathBuf::from("/tmp/custom-out"), "1024x768".into());
         assert_eq!(s.report_dir, PathBuf::from("/tmp/custom-out"));
     }
 
@@ -1667,7 +1707,7 @@ mod tests {
 
     #[tokio::test]
     async fn inserted_session_inherits_base_report_dir() {
-        let s = UiTestServer::new(PathBuf::from("/tmp/base-out"));
+        let s = UiTestServer::new(PathBuf::from("/tmp/base-out"), "1024x768".into());
         insert_test_session(&s, "abc", "calc", "wayland-abc").await;
         let sessions = s.sessions.read().await;
         let managed = sessions.get("abc").unwrap();

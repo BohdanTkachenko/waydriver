@@ -22,6 +22,10 @@ use tokio::process::{Child, Command};
 
 use waydriver::{CompositorRuntime, Error, Result};
 
+/// Default virtual-monitor geometry passed to mutter when the caller doesn't
+/// override it. Matches mutter's own implicit default.
+const DEFAULT_RESOLUTION: &str = "1024x768";
+
 /// Shared mutter-backend state consumed by `waydriver-input-mutter` and
 /// `waydriver-capture-mutter`.
 ///
@@ -96,8 +100,14 @@ impl Default for MutterCompositor {
 
 #[async_trait]
 impl CompositorRuntime for MutterCompositor {
-    async fn start(&mut self) -> Result<()> {
-        tracing::info!(id = self.id, "starting mutter compositor");
+    async fn start(&mut self, resolution: Option<&str>) -> Result<()> {
+        let resolution = resolution.unwrap_or(DEFAULT_RESOLUTION);
+        // Validate before we start spawning subprocesses — mutter silently
+        // ignores bad --virtual-monitor values and falls back to its own
+        // default, which would surprise the caller.
+        parse_resolution(resolution)?;
+
+        tracing::info!(id = self.id, resolution, "starting mutter compositor");
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
         let runtime_str = self.runtime_dir.to_str().unwrap().to_string();
@@ -151,7 +161,7 @@ impl CompositorRuntime for MutterCompositor {
                 "--wayland-display",
                 &self.wayland_display,
                 "--virtual-monitor",
-                "1024x768",
+                resolution,
             ])
             .env("DBUS_SESSION_BUS_ADDRESS", &self.mutter_dbus_address)
             .env("XDG_RUNTIME_DIR", &runtime_str)
@@ -351,6 +361,22 @@ fn parse_dbus_pid(output: &str) -> Result<u32> {
     ))
 }
 
+fn parse_resolution(s: &str) -> Result<(u32, u32)> {
+    let (w, h) = s.split_once('x').ok_or_else(|| {
+        Error::Process(format!(
+            "invalid resolution '{s}': expected WIDTHxHEIGHT"
+        ))
+    })?;
+    let parse = |part: &str| -> Result<u32> {
+        part.parse::<u32>().ok().filter(|n| *n > 0).ok_or_else(|| {
+            Error::Process(format!(
+                "invalid resolution '{s}': expected WIDTHxHEIGHT"
+            ))
+        })
+    };
+    Ok((parse(w)?, parse(h)?))
+}
+
 async fn wait_for_wayland_socket(runtime_dir: &str, display: &str) -> Result<()> {
     let socket_path = PathBuf::from(runtime_dir).join(display);
     for _ in 0..50 {
@@ -474,6 +500,23 @@ mod tests {
     fn test_state_panics_before_start() {
         let c = MutterCompositor::new();
         let _ = c.state();
+    }
+
+    #[test]
+    fn test_parse_resolution_accepts_hd() {
+        assert_eq!(parse_resolution("1920x1080").unwrap(), (1920, 1080));
+        assert_eq!(parse_resolution("1024x768").unwrap(), (1024, 768));
+    }
+
+    #[test]
+    fn test_parse_resolution_rejects_garbage() {
+        for bad in ["", "1920", "1920x", "x1080", "0x0", "1920x0", "0x1080",
+                    "1920x1080x1", "abcxdef", "-1x1080", "1920 x 1080"] {
+            assert!(
+                parse_resolution(bad).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
     }
 
     #[test]
