@@ -50,6 +50,8 @@ async fn start_calculator_session() -> anyhow::Result<(Session, Arc<MutterState>
             args: vec![],
             cwd: None,
             app_name: "gnome-calculator".into(),
+            video_output: None,
+            video_bitrate: None,
         },
     )
     .await?;

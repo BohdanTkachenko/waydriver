@@ -363,15 +363,11 @@ fn parse_dbus_pid(output: &str) -> Result<u32> {
 
 fn parse_resolution(s: &str) -> Result<(u32, u32)> {
     let (w, h) = s.split_once('x').ok_or_else(|| {
-        Error::Process(format!(
-            "invalid resolution '{s}': expected WIDTHxHEIGHT"
-        ))
+        Error::Process(format!("invalid resolution '{s}': expected WIDTHxHEIGHT"))
     })?;
     let parse = |part: &str| -> Result<u32> {
         part.parse::<u32>().ok().filter(|n| *n > 0).ok_or_else(|| {
-            Error::Process(format!(
-                "invalid resolution '{s}': expected WIDTHxHEIGHT"
-            ))
+            Error::Process(format!("invalid resolution '{s}': expected WIDTHxHEIGHT"))
         })
     };
     Ok((parse(w)?, parse(h)?))
@@ -510,12 +506,20 @@ mod tests {
 
     #[test]
     fn test_parse_resolution_rejects_garbage() {
-        for bad in ["", "1920", "1920x", "x1080", "0x0", "1920x0", "0x1080",
-                    "1920x1080x1", "abcxdef", "-1x1080", "1920 x 1080"] {
-            assert!(
-                parse_resolution(bad).is_err(),
-                "expected error for {bad:?}"
-            );
+        for bad in [
+            "",
+            "1920",
+            "1920x",
+            "x1080",
+            "0x0",
+            "1920x0",
+            "0x1080",
+            "1920x1080x1",
+            "abcxdef",
+            "-1x1080",
+            "1920 x 1080",
+        ] {
+            assert!(parse_resolution(bad).is_err(), "expected error for {bad:?}");
         }
     }
 

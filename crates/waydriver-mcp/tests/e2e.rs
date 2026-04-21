@@ -53,10 +53,16 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 }
 
 fn extract_kv(text: &str, key: &str) -> Option<String> {
-    text.split([',', '\n'])
-        .map(str::trim)
-        .find_map(|part| part.strip_prefix(&format!("{key}=")))
-        .map(str::to_string)
+    let needle = format!("{key}=");
+    let start = text.find(&needle)? + needle.len();
+    let rest = &text[start..];
+    Some(
+        rest.split([',', '\n'])
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .to_string(),
+    )
 }
 
 async fn run_calculator_test(
@@ -306,7 +312,10 @@ async fn run_calculator_test(
         assert_eq!(events.first().unwrap()["action"], "start_session");
         assert_eq!(events.last().unwrap()["action"], "kill_session");
 
-        let actions: Vec<&str> = events.iter().map(|e| e["action"].as_str().unwrap()).collect();
+        let actions: Vec<&str> = events
+            .iter()
+            .map(|e| e["action"].as_str().unwrap())
+            .collect();
         for expected in [
             "start_session",
             "press_key",
@@ -355,6 +364,29 @@ async fn run_calculator_test(
                 "events.js missing seq {seq}"
             );
         }
+
+        // WebM recording is on by default; kill_session flushes EOS + cues.
+        // We don't decode the video here — a non-empty file with a WebM magic
+        // header is enough to show the pipeline ran end to end.
+        let webm_path = session_dir.join(format!("{session_id}.webm"));
+        let webm_bytes = tokio::fs::read(&webm_path).await?;
+        assert!(
+            webm_bytes.len() > 1000,
+            "webm at {webm_path:?} too small: {} bytes",
+            webm_bytes.len()
+        );
+        // EBML header magic: 1A 45 DF A3
+        assert_eq!(
+            &webm_bytes[..4],
+            &[0x1A, 0x45, 0xDF, 0xA3],
+            "expected EBML magic at start of webm"
+        );
+
+        // Viewer HTML embeds the <video> element pointing at the webm file.
+        assert!(
+            index_html.contains(&format!("src=\"{session_id}.webm\"")),
+            "index.html should reference {session_id}.webm"
+        );
 
         // start_session should have returned a file:// URL matching the report dir.
         let expected_url = format!("file://{}/{}/index.html", dir.display(), session_id);

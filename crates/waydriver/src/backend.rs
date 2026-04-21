@@ -82,4 +82,28 @@ pub trait CaptureBackend: Send + Sync {
     async fn grab_screenshot(&self, stream: &PipeWireStream) -> Result<Vec<u8>> {
         crate::capture::grab_png(stream.node_id, &self.pipewire_socket()).await
     }
+
+    /// Start a continuous WebM recording of `stream` written to
+    /// `output_path` at the given `bitrate` (bits/sec). Returns a handle
+    /// whose `stop()` must be awaited to finalize the file cleanly.
+    async fn start_recording(
+        &self,
+        stream: &PipeWireStream,
+        output_path: &Path,
+        bitrate: u32,
+    ) -> Result<crate::capture::VideoRecorder> {
+        crate::capture::VideoRecorder::start(
+            stream.node_id,
+            &self.pipewire_socket(),
+            output_path,
+            bitrate,
+        )
+        .await
+    }
+
+    /// Stop a previously-started recording, flushing the WebM seekhead/cues
+    /// before returning.
+    async fn stop_recording(&self, recorder: crate::capture::VideoRecorder) -> Result<()> {
+        recorder.stop().await
+    }
 }

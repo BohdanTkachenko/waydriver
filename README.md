@@ -5,7 +5,7 @@
 [![docs.rs](https://docs.rs/waydriver/badge.svg)](https://docs.rs/waydriver)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A Rust library for headless GUI application testing on Wayland. Launches apps in isolated compositor sessions, interacts with them via AT-SPI accessibility APIs, and captures screenshots via PipeWire.
+A Rust library for headless GUI application testing on Wayland. Launches apps in isolated compositor sessions, interacts with them via AT-SPI accessibility APIs, and captures screenshots and WebM video via PipeWire.
 
 The repo also contains `waydriver-mcp`, a standalone MCP server binary built on top of the library that lets AI assistants drive GTK4 apps directly — see [MCP server](#mcp-server) below.
 
@@ -44,6 +44,7 @@ Concrete implementations are separate crates. The trait-based design allows back
 | Keyboard input                 | Yes (RemoteDesktop)         | —    | —    |
 | Pointer input                  | Yes (RemoteDesktop)         | —    | —    |
 | Screenshots                    | Yes (ScreenCast + PipeWire) | —    | —    |
+| Video recording (WebM/VP8)     | Yes (ScreenCast + PipeWire) | —    | —    |
 | AT-SPI (UI inspection, clicks) | Yes                         | —    | —    |
 
 Currently only Mutter is implemented (`waydriver-compositor-mutter`, `waydriver-input-mutter`, `waydriver-capture-mutter`). Each compositor has its own APIs (Mutter uses `org.gnome.Mutter.*` D-Bus interfaces, KWin has `org.kde.KWin.*`, Sway uses wlroots Wayland protocols), so each would need its own set of backend crates.
@@ -81,6 +82,9 @@ let session = Session::start(
         args: vec![],
         cwd: None,
         app_name: "gnome-calculator".into(),
+        // Record the entire session to a WebM file. Set to `None` to skip.
+        video_output: Some("/tmp/session.webm".into()),
+        video_bitrate: None, // defaults to waydriver::capture::DEFAULT_VIDEO_BITRATE (2 Mbps)
     },
 ).await?;
 
@@ -104,7 +108,7 @@ session.kill().await?;
 
 | Tool              | Purpose                                                               |
 | ----------------- | --------------------------------------------------------------------- |
-| `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir` overrides the server default for this session) |
+| `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir`, `resolution`, `record_video`, `video_bitrate` overrides per session) |
 | `list_sessions`   | List active session ids, app names, and Wayland displays              |
 | `kill_session`    | Tear down a session and clean up all child processes                  |
 | `inspect_ui`      | Dump the AT-SPI accessibility tree of the running app                 |
@@ -116,13 +120,14 @@ session.kill().await?;
 | `pointer_click`   | Press and release a pointer button (defaults to left click)           |
 | `take_screenshot` | Capture a PNG via the keepalive ScreenCast stream and return its path |
 
-Each session produces output under a configurable **report directory** — screenshots today, video recordings and HTML summaries planned. Screenshots are written as `{report_dir}/{session_id}/{session_id}-{n}.png` — each session gets its own subdirectory and `n` increments per `take_screenshot` call. The base `report_dir` defaults to `/tmp/waydriver` and can be overridden with the `--report-dir <PATH>` CLI flag or the `WAYDRIVER_REPORT_DIR` environment variable. Individual `start_session` calls may also pass a `report_dir` argument to override the server default for that session.
+Each session produces output under a configurable **report directory**. Screenshots are written as `{report_dir}/{session_id}/{session_id}-{n}.png` — each session gets its own subdirectory and `n` increments per `take_screenshot` call. The base `report_dir` defaults to `/tmp/waydriver` and can be overridden with the `--report-dir <PATH>` CLI flag or the `WAYDRIVER_REPORT_DIR` environment variable. Individual `start_session` calls may also pass a `report_dir` argument to override the server default for that session.
 
 Alongside the screenshots, each session writes:
 
+- **`{session_id}.webm`** — full-session VP8/WebM recording of the display at 15 fps, finalized with a seekhead on `kill_session`. On by default; disable per-server with `--record-video false` / `WAYDRIVER_RECORD_VIDEO=false`, or per-session with `start_session`'s `record_video: false`. Bitrate via `--video-bitrate <bits/sec>` / `WAYDRIVER_VIDEO_BITRATE` (default `2_000_000`) or per-session `video_bitrate`.
 - **`events.jsonl`** — append-only audit log of every session-scoped tool call (action, params, ok/err status, timestamp) at `{report_dir}/{session_id}/events.jsonl`.
 - **`events.js`** — atomic rewrite of the same data as `window.__events_update([...])` for consumption by the viewer.
-- **`index.html`** — styled viewer (Tailwind via the Play CDN). Reloads `events.js` every 2 s via a `<script src>` swap (which works over `file://` unlike `fetch`), append-only rendering so expanded `<details>` stay expanded across refreshes. Written once at session start.
+- **`index.html`** — styled viewer (Tailwind via the Play CDN) that embeds the recording in a `<video>` tag when present. Reloads `events.js` every 2 s via a `<script src>` swap (which works over `file://` unlike `fetch`), append-only rendering so expanded `<details>` stay expanded across refreshes. Written once at session start.
 
 `start_session`'s response includes a `file://` URL to the session viewer — open it directly from the filesystem in any browser. No HTTP server, no ports, no network access required. Multiple `waydriver-mcp` instances (different Claude Code tabs / projects) can run side by side without conflict.
 
@@ -165,7 +170,7 @@ MCP client config (e.g. `.mcp.json` for Claude Code):
 ```
 
 - `$PWD:/workspace:ro` — mounts the project directory so the MCP can launch your app binaries from `/workspace/`
-- `/tmp/waydriver:/tmp/waydriver` — makes session reports (screenshots, `events.jsonl`, `index.html`) accessible on the host at `/tmp/waydriver/`. **The mount uses the same path on both sides** so the `file://` URL that `start_session` returns is openable as-is on the host
+- `/tmp/waydriver:/tmp/waydriver` — makes session reports (screenshots, WebM recordings, `events.jsonl`, `index.html`) accessible on the host at `/tmp/waydriver/`. **The mount uses the same path on both sides** so the `file://` URL that `start_session` returns is openable as-is on the host
 - `--network none` — safe to fully isolate: the report viewer is pure static HTML + JS loaded from your local filesystem
 
 For NixOS users, also mount the Nix store so Nix-built binaries work inside the container:
@@ -370,17 +375,21 @@ graph LR
     mutter -- "org.gnome.Mutter.*" --> private_dbus
 ```
 
-### Screenshot pipeline
+### Screenshot and recording pipeline
 
 ```mermaid
 graph LR
     screencast["Mutter ScreenCast API"]
     monitor["RecordMonitor\n(virtual monitor)"]
     pipewire["PipeWire stream\n(keepalive)"]
-    gst["GStreamer pipeline\n(in-process)"]
+    gst_shot["On-demand GStreamer pipeline\n(pngenc snapshot=true)"]
+    gst_rec["Long-lived GStreamer pipeline\n(vp8enc + webmmux)"]
     png["PNG bytes"]
+    webm["WebM file"]
 
-    screencast --> monitor --> pipewire --> gst --> png
+    screencast --> monitor --> pipewire
+    pipewire --> gst_shot --> png
+    pipewire --> gst_rec --> webm
 ```
 
-The keepalive stream doubles as the capture source — `take_screenshot` reads frames directly from it via the GStreamer Rust bindings (`gstreamer` + `gstreamer-app` crates).
+The keepalive PipeWire stream doubles as the capture source for both paths. `take_screenshot` spins up a transient pngenc pipeline on each call; recording runs a single `vp8enc ! webmmux ! filesink` pipeline for the session's lifetime, flushed with EOS on `Session::kill` so the WebM is seekable. Both use the GStreamer Rust bindings (`gstreamer` + `gstreamer-app` crates) and only `gst-plugins-good` (no `-bad`/`-ugly`).

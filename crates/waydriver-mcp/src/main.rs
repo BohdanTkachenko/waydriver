@@ -47,6 +47,17 @@ pub struct StartSessionParams {
     /// Virtual display size as "WIDTHxHEIGHT" (e.g. "1920x1080"). When unset,
     /// falls back to the server's --resolution flag (default "1024x768").
     pub resolution: Option<String>,
+    /// Record a continuous WebM video of the session under
+    /// `{report_dir}/{session_id}/{session_id}.webm`. When unset, falls back
+    /// to the server's `--record-video` / `--no-record-video` flag (default
+    /// on). Requires `report: true` — recording is written alongside the
+    /// other report files.
+    pub record_video: Option<bool>,
+    /// VP8 target bitrate in bits/sec for the recording. Only used when
+    /// recording is enabled. When unset, falls back to the server's
+    /// `--video-bitrate` flag (default 2_000_000 ≈ 2 Mbps). Higher = sharper
+    /// text, bigger file.
+    pub video_bitrate: Option<u32>,
 }
 
 fn default_report_enabled() -> bool {
@@ -249,10 +260,24 @@ fn html_escape(s: &str) -> String {
 
 /// Render the static viewer shell written once per session. The shell fetches
 /// `events.jsonl` at load time (and on an interval) and renders each entry as
-/// a styled card.
-pub fn render_index_html(session_id: &str, app_name: &str, started_at_ms: u64) -> String {
+/// a styled card. If `video_file` is `Some`, a `<video>` element is embedded
+/// at the top of the page pointing at that filename (relative to the session
+/// dir).
+pub fn render_index_html(
+    session_id: &str,
+    app_name: &str,
+    started_at_ms: u64,
+    video_file: Option<&str>,
+) -> String {
     let sid = html_escape(session_id);
     let app = html_escape(app_name);
+    let video_block = match video_file {
+        Some(name) => format!(
+            r#"<video controls preload="metadata" class="w-full rounded-lg border border-slate-200 shadow-sm bg-black mb-6" src="{}"></video>"#,
+            html_escape(name)
+        ),
+        None => String::new(),
+    };
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -289,6 +314,7 @@ pub fn render_index_html(session_id: &str, app_name: &str, started_at_ms: u64) -
   </div>
 </header>
 <main class="max-w-5xl mx-auto px-6 py-6">
+  {video_block}
   <div id="notice"></div>
   <ol id="events" class="space-y-3"></ol>
   <div id="empty" class="hidden text-center py-12 text-slate-400 text-sm">No events yet. Waiting for the first tool call…</div>
@@ -421,6 +447,7 @@ setInterval(reload, 2000);
         app = app,
         started_at_ms = started_at_ms,
         sid_json = serde_json::Value::String(session_id.to_string()),
+        video_block = video_block,
     )
 }
 
@@ -443,17 +470,26 @@ pub struct UiTestServer {
     sessions: Arc<RwLock<HashMap<String, ManagedSession>>>,
     report_dir: PathBuf,
     default_resolution: String,
+    default_record_video: bool,
+    default_video_bitrate: u32,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl UiTestServer {
-    pub fn new(report_dir: PathBuf, default_resolution: String) -> Self {
+    pub fn new(
+        report_dir: PathBuf,
+        default_resolution: String,
+        default_record_video: bool,
+        default_video_bitrate: u32,
+    ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             report_dir,
             default_resolution,
+            default_record_video,
+            default_video_bitrate,
             tool_router: Self::tool_router(),
         }
     }
@@ -477,8 +513,29 @@ impl UiTestServer {
             .clone()
             .unwrap_or_else(|| params.command.clone());
 
-        let resolution =
-            resolve_resolution(&self.default_resolution, params.resolution.as_deref());
+        let resolution = resolve_resolution(&self.default_resolution, params.resolution.as_deref());
+
+        let report_dir = resolve_report_dir(&self.report_dir, params.report_dir.as_deref());
+        let report_enabled = params.report;
+        // Recording is tied to the report: the WebM lives alongside the
+        // viewer HTML and events. Explicit opt-out via `record_video: false`
+        // disables it even when reports are on.
+        let record_video =
+            report_enabled && params.record_video.unwrap_or(self.default_record_video);
+        let resolved_bitrate = params.video_bitrate.unwrap_or(self.default_video_bitrate);
+
+        // Compositor spawn already needs the per-session dir to exist for the
+        // runtime socket; we also pre-create the report dir here so the
+        // GStreamer filesink has an existing target when recording starts.
+        let video_output = if record_video {
+            let session_dir = report_dir.clone();
+            // Actual session id isn't known until after MutterCompositor::new,
+            // but MutterCompositor generates ids deterministically below — we
+            // compute the path after compositor.state() gives us an id.
+            Some(session_dir)
+        } else {
+            None
+        };
 
         // Construct and pre-start the mutter compositor so we can pull its
         // shared Arc<MutterState> out before erasing to trait objects. Input
@@ -489,9 +546,24 @@ impl UiTestServer {
             .start(Some(&resolution))
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let compositor_id = compositor.id().to_string();
         let state = compositor.state();
         let input = MutterInput::new(state.clone());
         let capture = MutterCapture::new(state);
+
+        // Resolve the final WebM path + ensure the session dir exists before
+        // GStreamer's filesink opens it. The session dir is also where
+        // screenshots and events land, so we'd create it anyway below — doing
+        // it up front means recording starts on an existing path.
+        let video_path = if let Some(base) = &video_output {
+            let session_dir = base.join(&compositor_id);
+            if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
+                tracing::warn!(error = %e, "create session report dir failed (pre-record)");
+            }
+            Some(session_dir.join(format!("{compositor_id}.webm")))
+        } else {
+            None
+        };
 
         let session = Session::start(
             Box::new(compositor),
@@ -502,6 +574,8 @@ impl UiTestServer {
                 args: params.args,
                 cwd: params.cwd,
                 app_name: app_name.clone(),
+                video_output: video_path.clone(),
+                video_bitrate: Some(resolved_bitrate),
             },
         )
         .await
@@ -510,9 +584,7 @@ impl UiTestServer {
         let id = session.id.clone();
         let display = session.wayland_display().to_string();
 
-        let report_dir = resolve_report_dir(&self.report_dir, params.report_dir.as_deref());
         let started_at_ms = now_ms();
-        let report_enabled = params.report;
 
         // Seed the per-session dir + viewer shell before we insert so that the
         // first event always lands on an existing index.html.
@@ -521,7 +593,11 @@ impl UiTestServer {
             if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
                 tracing::warn!(error = %e, "create session report dir failed");
             }
-            let html = render_index_html(&id, &app_name, started_at_ms);
+            let video_file = video_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str());
+            let html = render_index_html(&id, &app_name, started_at_ms, video_file);
             if let Err(e) = tokio::fs::write(session_dir.join("index.html"), html).await {
                 tracing::warn!(error = %e, "write index.html failed");
             }
@@ -1000,6 +1076,22 @@ struct Cli {
     /// override it via start_session's `resolution` parameter.
     #[arg(long, default_value = "1024x768", env = "WAYDRIVER_RESOLUTION")]
     resolution: String,
+    /// Record a continuous WebM video of each session by default. When on,
+    /// each session writes `{report_dir}/{session_id}/{session_id}.webm`
+    /// alongside its screenshots and events. Per-session override via
+    /// start_session's `record_video` argument. Requires reports enabled.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        env = "WAYDRIVER_RECORD_VIDEO"
+    )]
+    record_video: bool,
+    /// Default VP8 target bitrate in bits/sec for session recordings. Higher
+    /// values produce sharper UI text at the cost of file size. Per-session
+    /// override via start_session's `video_bitrate` argument.
+    #[arg(long, default_value_t = 2_000_000, env = "WAYDRIVER_VIDEO_BITRATE")]
+    video_bitrate: u32,
 }
 
 #[tokio::main]
@@ -1025,15 +1117,22 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         report_dir = %cli.report_dir.display(),
         resolution = %cli.resolution,
+        record_video = cli.record_video,
+        video_bitrate = cli.video_bitrate,
         "waydriver-mcp starting"
     );
 
-    let service = UiTestServer::new(cli.report_dir, cli.resolution)
-        .serve(stdio())
-        .await
-        .inspect_err(|e| {
-            tracing::error!("serve error: {:?}", e);
-        })?;
+    let service = UiTestServer::new(
+        cli.report_dir,
+        cli.resolution,
+        cli.record_video,
+        cli.video_bitrate,
+    )
+    .serve(stdio())
+    .await
+    .inspect_err(|e| {
+        tracing::error!("serve error: {:?}", e);
+    })?;
 
     service.waiting().await?;
     Ok(())
@@ -1050,7 +1149,12 @@ mod tests {
     use waydriver::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
 
     fn server() -> UiTestServer {
-        UiTestServer::new(PathBuf::from("/tmp/waydriver-test"), "1024x768".into())
+        UiTestServer::new(
+            PathBuf::from("/tmp/waydriver-test"),
+            "1024x768".into(),
+            false,
+            2_000_000,
+        )
     }
 
     fn session_id(id: &str) -> Parameters<SessionIdParams> {
@@ -1463,7 +1567,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let managed = make_managed(tmp.path().to_path_buf());
 
-        let path = managed.persist_screenshot("sid", b"fake-png").await.unwrap();
+        let path = managed
+            .persist_screenshot("sid", b"fake-png")
+            .await
+            .unwrap();
 
         let expected = tmp.path().join("sid").join("sid-1.png");
         assert_eq!(path, expected);
@@ -1532,26 +1639,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(seq, 0);
-        assert!(tokio::fs::metadata(tmp.path().join("sid").join("events.jsonl"))
-            .await
-            .is_err());
-        assert!(tokio::fs::metadata(tmp.path().join("sid").join("events.js"))
-            .await
-            .is_err());
+        assert!(
+            tokio::fs::metadata(tmp.path().join("sid").join("events.jsonl"))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::fs::metadata(tmp.path().join("sid").join("events.js"))
+                .await
+                .is_err()
+        );
         assert!(managed.events.lock().await.is_empty());
     }
 
     #[tokio::test]
     async fn kill_session_skips_event_write_when_report_disabled() {
         let tmp = TempDir::new().unwrap();
-        let s = UiTestServer::new(tmp.path().to_path_buf(), "1024x768".into());
+        let s = UiTestServer::new(
+            tmp.path().to_path_buf(),
+            "1024x768".into(),
+            false,
+            2_000_000,
+        );
         insert_test_session_with(&s, "test-1", "calculator", "wayland-test-1", false).await;
 
         let result = s.kill_session(session_id("test-1")).await.unwrap();
         assert!(content_text(&result).contains("killed"));
-        assert!(tokio::fs::metadata(tmp.path().join("test-1").join("events.jsonl"))
-            .await
-            .is_err());
+        assert!(
+            tokio::fs::metadata(tmp.path().join("test-1").join("events.jsonl"))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -1564,9 +1682,39 @@ mod tests {
     #[test]
     fn start_session_params_report_can_be_disabled() {
         let params: StartSessionParams =
-            serde_json::from_value(serde_json::json!({ "command": "x", "report": false }))
-                .unwrap();
+            serde_json::from_value(serde_json::json!({ "command": "x", "report": false })).unwrap();
         assert!(!params.report);
+    }
+
+    #[test]
+    fn start_session_params_record_video_defaults_to_none() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
+        assert_eq!(params.record_video, None);
+    }
+
+    #[test]
+    fn start_session_params_record_video_can_be_set() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x", "record_video": false }))
+                .unwrap();
+        assert_eq!(params.record_video, Some(false));
+    }
+
+    #[test]
+    fn start_session_params_video_bitrate_defaults_to_none() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
+        assert_eq!(params.video_bitrate, None);
+    }
+
+    #[test]
+    fn start_session_params_video_bitrate_can_be_set() {
+        let params: StartSessionParams = serde_json::from_value(
+            serde_json::json!({ "command": "x", "video_bitrate": 5_000_000 }),
+        )
+        .unwrap();
+        assert_eq!(params.video_bitrate, Some(5_000_000));
     }
 
     // ── CLI parsing ────────────────────────────────────────────────────
@@ -1583,9 +1731,38 @@ mod tests {
         assert_eq!(cli.report_dir, PathBuf::from("/custom/out"));
     }
 
+    #[test]
+    fn cli_record_video_defaults_to_true() {
+        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
+        assert!(cli.record_video);
+    }
+
+    #[test]
+    fn cli_record_video_can_be_disabled() {
+        let cli = Cli::try_parse_from(["waydriver-mcp", "--record-video", "false"]).unwrap();
+        assert!(!cli.record_video);
+    }
+
+    #[test]
+    fn cli_video_bitrate_defaults_to_two_mbps() {
+        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
+        assert_eq!(cli.video_bitrate, 2_000_000);
+    }
+
+    #[test]
+    fn cli_accepts_video_bitrate_flag() {
+        let cli = Cli::try_parse_from(["waydriver-mcp", "--video-bitrate", "5000000"]).unwrap();
+        assert_eq!(cli.video_bitrate, 5_000_000);
+    }
+
     #[tokio::test]
     async fn server_stores_report_base_dir() {
-        let s = UiTestServer::new(PathBuf::from("/tmp/custom-out"), "1024x768".into());
+        let s = UiTestServer::new(
+            PathBuf::from("/tmp/custom-out"),
+            "1024x768".into(),
+            false,
+            2_000_000,
+        );
         assert_eq!(s.report_dir, PathBuf::from("/tmp/custom-out"));
     }
 
@@ -1594,7 +1771,9 @@ mod tests {
     #[tokio::test]
     async fn log_event_appends_jsonl_line() {
         let tmp = TempDir::new().unwrap();
-        tokio::fs::create_dir_all(tmp.path().join("sid")).await.unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("sid"))
+            .await
+            .unwrap();
         let managed = make_managed(tmp.path().to_path_buf());
 
         managed
@@ -1652,7 +1831,9 @@ mod tests {
     #[tokio::test]
     async fn log_event_concurrent_writes_are_serialized() {
         let tmp = TempDir::new().unwrap();
-        tokio::fs::create_dir_all(tmp.path().join("sid")).await.unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("sid"))
+            .await
+            .unwrap();
         let managed = Arc::new(make_managed(tmp.path().to_path_buf()));
 
         let mut handles = Vec::new();
@@ -1679,7 +1860,11 @@ mod tests {
             .unwrap();
         let mut seqs: Vec<u64> = contents
             .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["seq"].as_u64().unwrap())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["seq"]
+                    .as_u64()
+                    .unwrap()
+            })
             .collect();
         seqs.sort_unstable();
         assert_eq!(seqs, (1..=25).collect::<Vec<_>>());
@@ -1687,7 +1872,7 @@ mod tests {
 
     #[test]
     fn render_index_html_contains_header_fields() {
-        let html = render_index_html("my-sid", "gnome-calculator", 1_700_000_000_000);
+        let html = render_index_html("my-sid", "gnome-calculator", 1_700_000_000_000, None);
         assert!(html.contains("my-sid"));
         assert!(html.contains("gnome-calculator"));
         assert!(html.contains("cdn.tailwindcss.com"));
@@ -1700,14 +1885,51 @@ mod tests {
     #[test]
     fn render_index_html_escapes_header_fields() {
         let evil = "<script>alert(1)</script>";
-        let html = render_index_html("sid", evil, 0);
+        let html = render_index_html("sid", evil, 0, None);
         assert!(!html.contains(evil), "raw evil string leaked into HTML");
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 
+    #[test]
+    fn render_index_html_embeds_video_when_file_given() {
+        let html = render_index_html("sid", "app", 0, Some("sid.webm"));
+        assert!(
+            html.contains("<video"),
+            "expected <video> tag, got:\n{html}"
+        );
+        assert!(html.contains("src=\"sid.webm\""));
+    }
+
+    #[test]
+    fn render_index_html_omits_video_when_none() {
+        let html = render_index_html("sid", "app", 0, None);
+        assert!(!html.contains("<video"), "unexpected <video> tag: {html}");
+    }
+
+    #[test]
+    fn render_index_html_escapes_video_filename() {
+        // An evil filename that tries to close the src attribute and inject
+        // a new script tag must be entity-escaped so it stays inside the
+        // attribute value.
+        let html = render_index_html("sid", "app", 0, Some("evil\"><x>.webm"));
+        assert!(
+            !html.contains("src=\"evil\"><x>.webm\""),
+            "raw evil filename escaped the attribute"
+        );
+        assert!(
+            html.contains("&quot;&gt;&lt;x&gt;.webm"),
+            "expected entity-escaped filename, got:\n{html}"
+        );
+    }
+
     #[tokio::test]
     async fn inserted_session_inherits_base_report_dir() {
-        let s = UiTestServer::new(PathBuf::from("/tmp/base-out"), "1024x768".into());
+        let s = UiTestServer::new(
+            PathBuf::from("/tmp/base-out"),
+            "1024x768".into(),
+            false,
+            2_000_000,
+        );
         insert_test_session(&s, "abc", "calc", "wayland-abc").await;
         let sessions = s.sessions.read().await;
         let managed = sessions.get("abc").unwrap();

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -7,6 +7,7 @@ use tokio::process::{Child, Command};
 
 use crate::atspi as atspi_client;
 use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend};
+use crate::capture::VideoRecorder;
 use crate::error::{Error, Result};
 
 /// Parameters for spawning the target application inside a session.
@@ -16,6 +17,15 @@ pub struct SessionConfig {
     pub cwd: Option<String>,
     /// Accessible name used to look the app up in the AT-SPI registry.
     pub app_name: String,
+    /// If set, the session records a continuous WebM video of the display to
+    /// this path. Recording starts right after the keepalive stream is open
+    /// and stops right before it is torn down in [`Session::kill`]. When
+    /// `None`, no recording pipeline is started.
+    pub video_output: Option<PathBuf>,
+    /// VP8 target bitrate in bits/sec for the recording pipeline. Only
+    /// consulted when `video_output` is `Some`. When `None`, falls back to
+    /// [`crate::capture::DEFAULT_VIDEO_BITRATE`].
+    pub video_bitrate: Option<u32>,
 }
 
 /// A running UI test session: a compositor, input + capture backends, the
@@ -41,6 +51,11 @@ pub struct Session {
     /// sends Wayland frame callbacks and GTK4 apps cannot repaint after
     /// their initial render.
     keepalive_stream: Option<crate::backend::PipeWireStream>,
+    /// Optional long-lived WebM recording that shares the keepalive
+    /// ScreenCast node. Declared after `keepalive_stream` so implicit drop
+    /// order matches the explicit shutdown sequence in [`Session::kill`]:
+    /// flush the recording before releasing the ScreenCast token.
+    video_recorder: Option<VideoRecorder>,
     input: Box<dyn InputBackend>,
     capture: Box<dyn CaptureBackend>,
     compositor: Box<dyn CompositorRuntime>,
@@ -81,7 +96,24 @@ impl Session {
         // consumer is pulling frames. Without this stream, GTK4 apps
         // render their first frame but never repaint because the frame
         // clock never ticks.
-        let keepalive_stream = Some(capture.start_stream().await?);
+        let keepalive_stream = capture.start_stream().await?;
+
+        // If the caller requested a recording, start a second GStreamer
+        // pipeline on the same PipeWire node. Failure here aborts session
+        // startup: the caller explicitly opted in, so silently skipping
+        // would be surprising.
+        let video_recorder = if let Some(ref path) = cfg.video_output {
+            let bitrate = cfg
+                .video_bitrate
+                .unwrap_or(crate::capture::DEFAULT_VIDEO_BITRATE);
+            Some(
+                capture
+                    .start_recording(&keepalive_stream, path, bitrate)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let session = Session {
             id,
@@ -90,7 +122,8 @@ impl Session {
             app_path,
             a11y_connection: Some(a11y_connection),
             app,
-            keepalive_stream,
+            keepalive_stream: Some(keepalive_stream),
+            video_recorder,
             input,
             capture,
             compositor,
@@ -116,6 +149,15 @@ impl Session {
 
         let _ = self.app.kill().await;
         let _ = self.app.wait().await;
+
+        // Finalize the recording before tearing down the ScreenCast stream so
+        // the muxer still has a live PipeWire node to flush through. Errors
+        // are logged but don't block session teardown.
+        if let Some(recorder) = self.video_recorder.take() {
+            if let Err(e) = self.capture.stop_recording(recorder).await {
+                tracing::warn!(error = %e, "stop_recording failed");
+            }
+        }
 
         // Stop the keepalive ScreenCast stream before dropping backends.
         if let Some(stream) = self.keepalive_stream.take() {
@@ -185,6 +227,7 @@ impl Session {
             a11y_connection: None,
             app,
             keepalive_stream: None,
+            video_recorder: None,
             input,
             capture,
             compositor,
@@ -196,7 +239,9 @@ impl Drop for Session {
     fn drop(&mut self) {
         // Best-effort kill when dropped without calling kill().
         // After this returns, fields drop in declaration order:
-        // app → keepalive_stream → input → capture → compositor.
+        // app → keepalive_stream → video_recorder → input → capture →
+        // compositor. A video_recorder dropped without explicit stop()
+        // leaves a truncated WebM (no seekhead) — see VideoRecorder::Drop.
         let _ = self.app.start_kill();
     }
 }

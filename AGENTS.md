@@ -207,12 +207,23 @@ The signal subscription must happen **before** `Session.Start` — mutter emits 
 
 `Session::take_screenshot` uses the keepalive stream (started during `Session::start`) via `CaptureBackend::grab_screenshot`, avoiding per-screenshot stream setup/teardown overhead.
 
+### Video recording pipeline
+
+When `SessionConfig::video_output` is set, `Session::start` opens a second long-lived GStreamer pipeline on the same PipeWire node as the keepalive stream: `pipewiresrc ! videoconvert ! videorate ! video/x-raw,framerate=15/1 ! vp8enc ! webmmux ! filesink`. The `VideoRecorder` handle lives on `Session` and is stopped by `Session::kill` **before** the keepalive stream is torn down, so the encoder/muxer still have a live source to flush through.
+
+Stopping sends `EOS` on the pipeline and waits on the bus for `EOS`/`Error` (10 s timeout) before `set_state(Null)`. This is load-bearing: `webmmux` only writes the cues/seekhead on EOS, so a pipeline that's just set to `Null` produces a playable-but-unseekable WebM. `VideoRecorder::Drop` logs a warning and does the best-effort `Null` fallback — callers should always go through `Session::kill`.
+
+VP8 tuning lives in `build_recording_pipeline_str`: `target-bitrate` is taken from `SessionConfig::video_bitrate` (default `capture::DEFAULT_VIDEO_BITRATE = 2_000_000`), `min-quantizer=4 max-quantizer=30` caps per-frame degradation, `keyframe-max-dist=30` (~2 s at 15 fps) keeps seeking responsive. Only `gst-plugins-good` is required — no `gst-plugins-bad`/`gst-plugins-ugly`.
+
+The screenshot and recording pipelines both read `PIPEWIRE_REMOTE` and `XDG_RUNTIME_DIR` from the environment at state-transition time, so the shared `GRAB_PNG_LOCK` guards both setup paths. The lock is released once the pipeline is in `PLAYING`; the recording pipeline runs unlocked from then until `stop`.
+
 ### MCP server scaffolding
 
 - `crates/waydriver-mcp/src/main.rs` wires `UiTestServer` to stdio via `rmcp`. **All logging must go to stderr** — stdout is the JSON-RPC transport. `tracing_subscriber` is configured with `with_writer(std::io::stderr)`; don't `println!` anywhere.
 - Uses `rmcp`'s `#[tool_router]` / `#[tool]` macros. Each tool method takes `Parameters<T>` where `T` derives `Deserialize + JsonSchema` — the schema is what the MCP client (Claude) sees.
 - Session state lives in `Arc<RwLock<HashMap<String, ManagedSession>>>`, where `ManagedSession` wraps the underlying `Session` plus a per-session `report_dir`, an atomic screenshot counter, and an `events: Mutex<Vec<serde_json::Value>>` that guards both the on-disk `events.jsonl` (append) and the atomically-rewritten `events.js` (replace). Read-only tools take a `.read()` lock, `start_session`/`kill_session` take `.write()`.
-- Report output path (screenshots today; video/HTML planned) is configurable via the `--report-dir` CLI flag / `WAYDRIVER_REPORT_DIR` env var (default `/tmp/waydriver`), or per-session via `start_session`'s optional `report_dir` argument. Screenshots land at `{dir}/{session_id}/{session_id}-{n}.png`. The virtual-monitor geometry is configurable via `--resolution` / `WAYDRIVER_RESOLUTION` (default `1024x768`), or per-session via `start_session`'s optional `resolution` argument (format `WIDTHxHEIGHT`).
+- Report output path is configurable via the `--report-dir` CLI flag / `WAYDRIVER_REPORT_DIR` env var (default `/tmp/waydriver`), or per-session via `start_session`'s optional `report_dir` argument. Each session directory holds `{session_id}-{n}.png` (screenshots), `{session_id}.webm` (recording), `events.jsonl` / `events.js` (event log), and `index.html` (viewer). The virtual-monitor geometry is configurable via `--resolution` / `WAYDRIVER_RESOLUTION` (default `1024x768`), or per-session via `start_session`'s optional `resolution` argument (format `WIDTHxHEIGHT`).
+- Session recording is on by default. `--record-video <bool>` / `WAYDRIVER_RECORD_VIDEO` (default `true`) sets the server-wide default; `start_session`'s optional `record_video: bool` overrides it per session. Recording requires `report: true` since the `.webm` lives in the session's report dir. Bitrate is tuned via `--video-bitrate` / `WAYDRIVER_VIDEO_BITRATE` (default `2_000_000` bits/sec) or `start_session`'s optional `video_bitrate: u32`.
 - Every session-scoped tool handler **must call `ManagedSession::log_event`** (or `append_event` for `kill_session`, which has to destructure first). That single call appends to `events.jsonl` and atomically rewrites `events.js` (tempfile + rename) so the static viewer sees new events on its next `<script src>` reload. Logging errors are swallowed via `tracing::warn!` and never mask the real tool result.
 - No HTTP server. The viewer is a static HTML file that reloads `events.js` every 2 s via a `<script src>` swap — which works over `file://` where `fetch()` would hit CORS. `start_session` returns a `file://` URL. Multiple MCP instances side-by-side just work (no port conflicts).
 
