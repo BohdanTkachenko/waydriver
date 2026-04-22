@@ -80,11 +80,13 @@ async fn run_calculator_test(
         "start_session",
         "list_sessions",
         "kill_session",
-        "inspect_ui",
-        "click_element",
+        "dump_tree",
+        "query",
+        "click",
+        "set_text",
+        "read_text",
         "type_text",
         "press_key",
-        "find_element",
         "move_pointer",
         "pointer_click",
         "take_screenshot",
@@ -137,10 +139,10 @@ async fn run_calculator_test(
         .await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Inspect UI — verify accessibility tree has calculator buttons
+    // Dump tree — verify the XML snapshot has calculator buttons
     let result = client
         .call_tool(
-            CallToolRequestParams::new("inspect_ui").with_arguments(
+            CallToolRequestParams::new("dump_tree").with_arguments(
                 serde_json::json!({"session_id": session_id})
                     .as_object()
                     .unwrap()
@@ -149,14 +151,19 @@ async fn run_calculator_test(
         )
         .await?;
     let tree = result_text(&result);
-    assert!(tree.contains("[button]"), "tree should contain buttons");
+    assert!(tree.contains("<?xml"), "tree should be XML, got: {tree}");
+    assert!(
+        tree.contains("<PushButton"),
+        "tree should contain PushButton elements, got: {tree}"
+    );
 
-    // Click 2 + 3 = via MCP tools
+    // Click 2 + 3 = via XPath selectors
     for name in ["2", "+", "3", "="] {
+        let xpath = format!("//PushButton[@name='{name}']");
         let result = client
             .call_tool(
-                CallToolRequestParams::new("click_element").with_arguments(
-                    serde_json::json!({"session_id": session_id, "element_name": name})
+                CallToolRequestParams::new("click").with_arguments(
+                    serde_json::json!({"session_id": session_id, "xpath": xpath})
                         .as_object()
                         .unwrap()
                         .clone(),
@@ -165,7 +172,7 @@ async fn run_calculator_test(
             .await?;
         assert!(
             !result.is_error.unwrap_or(false),
-            "click_element({name}) failed: {}",
+            "click({xpath}) failed: {}",
             result_text(&result)
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -217,19 +224,28 @@ async fn run_calculator_test(
     assert!(text.contains(&session_id), "session should be listed");
     assert!(text.contains("gnome-calculator"), "app name should appear");
 
-    // Find element — look up the "5" button
+    // Query by selector — look up the "5" button
     let result = client
         .call_tool(
-            CallToolRequestParams::new("find_element").with_arguments(
-                serde_json::json!({"session_id": session_id, "element_name": "5"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
+            CallToolRequestParams::new("query").with_arguments(
+                serde_json::json!({
+                    "session_id": session_id,
+                    "xpath": "//PushButton[@name='5']"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
             ),
         )
         .await?;
     let text = result_text(&result);
-    assert!(text.contains("Found '5'"), "should find button 5: {text}");
+    let matches: serde_json::Value = serde_json::from_str(&text)?;
+    assert!(
+        matches.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "expected at least one match for //PushButton[@name='5'], got: {text}"
+    );
+    assert_eq!(matches[0]["role"], "PushButton");
+    assert_eq!(matches[0]["name"], "5");
 
     // Type text
     let result = client
@@ -319,10 +335,10 @@ async fn run_calculator_test(
         for expected in [
             "start_session",
             "press_key",
-            "inspect_ui",
-            "click_element",
+            "dump_tree",
+            "click",
             "take_screenshot",
-            "find_element",
+            "query",
             "type_text",
             "move_pointer",
             "pointer_click",

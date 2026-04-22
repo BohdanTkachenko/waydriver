@@ -32,9 +32,10 @@ fn extract_png(raw: &[u8]) -> Vec<u8> {
     raw[png_start..].to_vec()
 }
 
-/// Start a gnome-calculator session, returning the Session and the shared
-/// MutterState (so callers that need a second InputBackend can construct one).
-async fn start_calculator_session() -> anyhow::Result<(Session, Arc<MutterState>)> {
+/// Start a gnome-calculator session, returning the Session wrapped in Arc
+/// (so callers can use the XPath Locator API that lives behind `&Arc<Session>`)
+/// and the shared MutterState for constructing extra InputBackends.
+async fn start_calculator_session() -> anyhow::Result<(Arc<Session>, Arc<MutterState>)> {
     let mut compositor = MutterCompositor::new();
     compositor.start(None).await?;
     let state = compositor.state();
@@ -63,7 +64,17 @@ async fn start_calculator_session() -> anyhow::Result<(Session, Arc<MutterState>
     session.press_keysym(0xff1b).await?; // Escape
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    Ok((session, state))
+    Ok((Arc::new(session), state))
+}
+
+/// Consume the Arc wrapper and call Session::kill. Any Locator clone from
+/// earlier in the test must have been dropped before reaching here.
+async fn kill(session: Arc<Session>) -> anyhow::Result<()> {
+    let inner = Arc::try_unwrap(session).map_err(|_| {
+        anyhow::anyhow!("session arc still referenced when killing — a Locator outlived the test")
+    })?;
+    inner.kill().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -99,7 +110,7 @@ async fn calculator_screenshots_change() -> anyhow::Result<()> {
         .count();
     eprintln!("pixel diff: {diff_pixels} / {} pixels", img1.pixels().len());
 
-    session.kill().await?;
+    kill(session).await?;
 
     assert!(
         diff_pixels > 100,
@@ -119,48 +130,31 @@ async fn accessibility_tree_inspection() -> anyhow::Result<()> {
 
     let (session, _state) = start_calculator_session().await?;
 
-    // Dump the accessibility tree and verify it has content.
-    let tree = waydriver::atspi::dump_app_tree(
-        session.a11y_connection.as_ref().unwrap(),
-        &session.app_bus_name,
-        &session.app_path,
-    )
-    .await?;
-
+    // Dump the accessibility tree as XML and verify shape.
+    let tree = session.dump_tree().await?;
     assert!(!tree.is_empty(), "accessibility tree should not be empty");
-    // gnome-calculator exposes buttons for digits.
     assert!(
-        tree.contains("[button]"),
-        "tree should contain buttons, got:\n{tree}"
+        tree.contains("<?xml"),
+        "tree should start with an XML declaration, got:\n{tree}"
+    );
+    assert!(
+        tree.contains("<PushButton"),
+        "tree should contain PushButton elements, got:\n{tree}"
     );
 
-    // Find a known element — the "1" button.
-    let (bus, path, role) = waydriver::atspi::find_element_by_name(
-        session.a11y_connection.as_ref().unwrap(),
-        &session.app_bus_name,
-        &session.app_path,
-        "1",
-    )
-    .await?;
-    assert!(!bus.is_empty());
-    assert!(!path.is_empty());
-    eprintln!("found '1' button: {bus}:{path} [{role}]");
+    // Find a known element — the "1" button — with a scoped XPath.
+    let button_one = session.locate("//PushButton[@name='1']");
+    assert!(button_one.count().await? >= 1, "should find button '1'");
 
-    // Search for a non-existent element — should return ElementNotFound.
-    let err = waydriver::atspi::find_element_by_name(
-        session.a11y_connection.as_ref().unwrap(),
-        &session.app_bus_name,
-        &session.app_path,
-        "nonexistent_element_xyz_12345",
-    )
-    .await
-    .unwrap_err();
+    // A non-existent selector yields ElementNotFound when resolved as single.
+    let missing = session.locate("//PushButton[@name='nonexistent_xyz_12345']");
+    let err = missing.click().await.unwrap_err();
     assert!(
-        matches!(err, Error::ElementNotFound(_)),
+        matches!(err, Error::ElementNotFound { .. }),
         "expected ElementNotFound, got: {err}"
     );
 
-    session.kill().await?;
+    kill(session).await?;
     Ok(())
 }
 
@@ -177,15 +171,8 @@ async fn click_element_changes_display() -> anyhow::Result<()> {
     // Baseline screenshot.
     let baseline = extract_png(&session.take_screenshot().await?);
 
-    // Click "5" via AT-SPI, then wake GTK's event loop.
-    let result = waydriver::atspi::click_element(
-        session.a11y_connection.as_ref().unwrap(),
-        &session.app_bus_name,
-        &session.app_path,
-        "5",
-    )
-    .await?;
-    eprintln!("click result: {result}");
+    // Click "5" via the XPath locator, then wake GTK's event loop.
+    session.locate("//PushButton[@name='5']").click().await?;
     session.press_keysym(0xffe1).await?; // Shift_L wake
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -193,14 +180,8 @@ async fn click_element_changes_display() -> anyhow::Result<()> {
     session.press_keysym(0x2b).await?; // '+'
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Click "3" via AT-SPI + wake.
-    waydriver::atspi::click_element(
-        session.a11y_connection.as_ref().unwrap(),
-        &session.app_bus_name,
-        &session.app_path,
-        "3",
-    )
-    .await?;
+    // Click "3" via locator + wake.
+    session.locate("//PushButton[@name='3']").click().await?;
     session.press_keysym(0xffe1).await?; // Shift_L wake
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -220,7 +201,7 @@ async fn click_element_changes_display() -> anyhow::Result<()> {
         .count();
     eprintln!("pixel diff after click: {diff_pixels}");
 
-    session.kill().await?;
+    kill(session).await?;
 
     assert!(
         diff_pixels > 100,
@@ -267,6 +248,6 @@ async fn pointer_input_operations() -> anyhow::Result<()> {
     let png = extract_png(&screenshot);
     assert!(png.len() > 1000, "screenshot after pointer ops too small");
 
-    session.kill().await?;
+    kill(session).await?;
     Ok(())
 }

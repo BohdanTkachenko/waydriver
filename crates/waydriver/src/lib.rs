@@ -17,9 +17,12 @@ pub mod capture;
 pub mod error;
 /// X11 keysym utilities for keyboard input.
 pub mod keysym;
+/// XPath-based lazy locators over the AT-SPI tree.
+pub mod locator;
 /// Test session lifecycle management.
 pub mod session;
 
 pub use backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
 pub use error::{Error, Result};
+pub use locator::Locator;
 pub use session::{Session, SessionConfig};

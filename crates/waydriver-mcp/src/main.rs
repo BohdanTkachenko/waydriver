@@ -15,7 +15,7 @@ use rmcp::transport::stdio;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
 use serde::Deserialize;
 
-use waydriver::atspi as atspi_client;
+use waydriver::atspi::ElementInfo;
 use waydriver::keysym::{char_to_keysym, key_name_to_keysym};
 use waydriver::{CompositorRuntime, Session, SessionConfig};
 use waydriver_capture_mutter::MutterCapture;
@@ -71,11 +71,38 @@ pub struct SessionIdParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ClickElementParams {
+pub struct QueryParams {
     /// Session ID
     pub session_id: String,
-    /// Accessible name of the element to click
-    pub element_name: String,
+    /// XPath selector evaluated against the accessibility tree snapshot
+    /// (e.g. `//PushButton[@name='OK']`, `//Dialog[@name='Confirm']//PushButton`).
+    pub xpath: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClickParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one element at click time.
+    pub xpath: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetTextParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one editable-text element.
+    pub xpath: String,
+    /// Text to write to the element (replaces existing contents).
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadTextParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one element supporting the Text interface.
+    pub xpath: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -112,18 +139,10 @@ pub struct PointerClickParams {
     pub button: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct FindElementParams {
-    /// Session ID
-    pub session_id: String,
-    /// Accessible name of the element to find
-    pub element_name: String,
-}
-
 // ── Server ──────────────────────────────────────────────────────────────────
 
 pub struct ManagedSession {
-    pub session: Session,
+    pub session: Arc<Session>,
     pub report_dir: PathBuf,
     pub screenshot_counter: AtomicU32,
     /// In-memory event log. Guards both the on-disk `events.jsonl` (append) and
@@ -326,13 +345,15 @@ const PILL_CLASS = {{
   start_session:   'bg-slate-200 text-slate-800',
   kill_session:    'bg-slate-200 text-slate-800',
   take_screenshot: 'bg-indigo-100 text-indigo-800',
-  click_element:   'bg-blue-100 text-blue-800',
+  click:           'bg-blue-100 text-blue-800',
+  set_text:        'bg-blue-100 text-blue-800',
+  read_text:       'bg-blue-100 text-blue-800',
   type_text:       'bg-blue-100 text-blue-800',
   press_key:       'bg-blue-100 text-blue-800',
   move_pointer:    'bg-blue-100 text-blue-800',
   pointer_click:   'bg-blue-100 text-blue-800',
-  inspect_ui:      'bg-gray-100 text-gray-700',
-  find_element:    'bg-gray-100 text-gray-700',
+  dump_tree:       'bg-gray-100 text-gray-700',
+  query:           'bg-gray-100 text-gray-700',
 }};
 
 function fmtTime(ms) {{
@@ -449,6 +470,31 @@ setInterval(reload, 2000);
         sid_json = serde_json::Value::String(session_id.to_string()),
         video_block = video_block,
     )
+}
+
+/// Serialize the matches from `Locator::inspect_all` into the JSON array
+/// returned by the `query` tool. Each entry carries a pinned XPath that
+/// targets that specific ordinal match on future tool calls.
+fn render_matches(xpath: &str, matches: &[ElementInfo]) -> serde_json::Value {
+    let arr: Vec<serde_json::Value> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let pinned = format!("({xpath})[{}]", i + 1);
+            let mut obj = serde_json::json!({
+                "xpath": pinned,
+                "role": m.role,
+                "name": m.name,
+                "attributes": m.attributes,
+                "states": m.states,
+            });
+            if let Some(raw) = &m.role_raw {
+                obj["role_raw"] = serde_json::Value::String(raw.clone());
+            }
+            obj
+        })
+        .collect();
+    serde_json::Value::Array(arr)
 }
 
 /// Resolve the effective report dir for a new session: per-session override
@@ -604,7 +650,7 @@ impl UiTestServer {
         }
 
         let managed = ManagedSession {
-            session,
+            session: Arc::new(session),
             report_dir: report_dir.clone(),
             screenshot_counter: AtomicU32::new(0),
             events: Mutex::new(Vec::new()),
@@ -686,7 +732,14 @@ impl UiTestServer {
             ..
         } = managed;
 
-        let kill_result = session.kill().await.map_err(|e| e.to_string());
+        // Unwrap Arc<Session> into owned Session. Any Locator cloned inside
+        // earlier tool calls is long dropped (they don't outlive their tool
+        // handler), and the write lock we held while removing the session
+        // prevents new tool calls from cloning the Arc.
+        let kill_result = match Arc::try_unwrap(session) {
+            Ok(owned) => owned.kill().await.map_err(|e| e.to_string()),
+            Err(_) => Err("session is still referenced — cannot kill".to_string()),
+        };
         let success_msg = format!("Session {} killed", params.session_id);
         let outcome = kill_result
             .as_ref()
@@ -712,8 +765,12 @@ impl UiTestServer {
         Ok(CallToolResult::success(vec![Content::text(success_msg)]))
     }
 
-    #[tool(description = "Dump the accessibility tree of the application UI")]
-    async fn inspect_ui(
+    #[tool(
+        description = "Dump the accessibility tree of the application UI as XML. Use this to \
+                       discover selector-ready role names, attributes, and element hierarchy \
+                       before writing XPath queries for `query` or `click`."
+    )]
+    async fn dump_tree(
         &self,
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -721,78 +778,185 @@ impl UiTestServer {
         let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
-        let session = &managed.session;
 
-        let outcome: Result<String, String> = async {
-            let a11y = session
-                .a11y_connection
-                .as_ref()
-                .ok_or_else(|| "no AT-SPI connection for this session".to_string())?;
-            atspi_client::dump_app_tree(a11y, &session.app_bus_name, &session.app_path)
-                .await
-                .map_err(|e| e.to_string())
-        }
-        .await;
+        let outcome: Result<String, String> =
+            managed.session.dump_tree().await.map_err(|e| e.to_string());
         let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
         if let Err(e) = managed
             .log_event(
                 &params.session_id,
-                "inspect_ui",
+                "dump_tree",
                 serde_json::json!({}),
                 log_outcome,
                 None,
             )
             .await
         {
-            tracing::warn!(error = %e, "log_event(inspect_ui) failed");
+            tracing::warn!(error = %e, "log_event(dump_tree) failed");
         }
 
         let tree = outcome.map_err(|e| McpError::internal_error(e, None))?;
         Ok(CallToolResult::success(vec![Content::text(tree)]))
     }
 
-    #[tool(description = "Click a UI element by its accessible name")]
-    async fn click_element(
+    #[tool(
+        description = "Query the accessibility tree with an XPath selector. Returns a JSON \
+                       array of matches; each element carries a pinned `xpath` that can be \
+                       passed back to `click` / `set_text` / `read_text` to target that \
+                       specific ordinal match. Names are not unique, so prefer more specific \
+                       selectors (role + attribute) over pure name matches."
+    )]
+    async fn query(
         &self,
-        Parameters(params): Parameters<ClickElementParams>,
+        Parameters(params): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
         let sessions = self.sessions.read().await;
         let managed = sessions.get(&params.session_id).ok_or_else(|| {
             McpError::invalid_params(format!("session not found: {}", params.session_id), None)
         })?;
-        let session = &managed.session;
 
+        let xpath = params.xpath.clone();
         let outcome: Result<String, String> = async {
-            let a11y = session
-                .a11y_connection
-                .as_ref()
-                .ok_or_else(|| "no AT-SPI connection for this session".to_string())?;
-            atspi_client::click_element(
-                a11y,
-                &session.app_bus_name,
-                &session.app_path,
-                &params.element_name,
-            )
-            .await
-            .map_err(|e| e.to_string())
+            let matches = managed
+                .session
+                .locate(&xpath)
+                .inspect_all()
+                .await
+                .map_err(|e| e.to_string())?;
+            let json = serde_json::to_string_pretty(&render_matches(&xpath, &matches))
+                .map_err(|e| e.to_string())?;
+            Ok(json)
         }
         .await;
         let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
         if let Err(e) = managed
             .log_event(
                 &params.session_id,
-                "click_element",
-                serde_json::json!({ "element_name": params.element_name }),
+                "query",
+                serde_json::json!({ "xpath": params.xpath }),
                 log_outcome,
                 None,
             )
             .await
         {
-            tracing::warn!(error = %e, "log_event(click_element) failed");
+            tracing::warn!(error = %e, "log_event(query) failed");
+        }
+
+        let body = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
+        description = "Click a UI element selected by XPath. The selector must resolve to \
+                       exactly one element; if it matches multiple, use `query` first and \
+                       pass the pinned `xpath` back, or refine the selector."
+    )]
+    async fn click(
+        &self,
+        Parameters(params): Parameters<ClickParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let xpath = params.xpath.clone();
+        let outcome: Result<String, String> = match managed.session.locate(&xpath).click().await {
+            Ok(()) => Ok(format!("Clicked {xpath}")),
+            Err(e) => Err(e.to_string()),
+        };
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "click",
+                serde_json::json!({ "xpath": params.xpath }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(click) failed");
         }
 
         let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
         Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
+        description = "Replace the editable-text contents of an element selected by XPath. \
+                       Target must implement the EditableText AT-SPI interface."
+    )]
+    async fn set_text(
+        &self,
+        Parameters(params): Parameters<SetTextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let xpath = params.xpath.clone();
+        let text = params.text.clone();
+        let outcome: Result<String, String> =
+            match managed.session.locate(&xpath).set_text(&text).await {
+                Ok(()) => Ok(format!("Set text on {xpath}")),
+                Err(e) => Err(e.to_string()),
+            };
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "set_text",
+                serde_json::json!({ "xpath": params.xpath, "text": params.text }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(set_text) failed");
+        }
+
+        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
+        description = "Read the text contents of an element selected by XPath. Target must \
+                       implement the Text AT-SPI interface."
+    )]
+    async fn read_text(
+        &self,
+        Parameters(params): Parameters<ReadTextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let xpath = params.xpath.clone();
+        let outcome: Result<String, String> = managed
+            .session
+            .locate(&xpath)
+            .text()
+            .await
+            .map_err(|e| e.to_string());
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "read_text",
+                serde_json::json!({ "xpath": params.xpath }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(read_text) failed");
+        }
+
+        let text = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "Type text into the currently focused element via keyboard input")]
@@ -947,56 +1111,6 @@ impl UiTestServer {
             .await
         {
             tracing::warn!(error = %e, "log_event(pointer_click) failed");
-        }
-
-        let msg = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
-    }
-
-    #[tool(
-        description = "Find a UI element by its accessible name and return its details (bus_name, path, role)"
-    )]
-    async fn find_element(
-        &self,
-        Parameters(params): Parameters<FindElementParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-        let session = &managed.session;
-
-        let outcome: Result<String, String> = async {
-            let a11y = session
-                .a11y_connection
-                .as_ref()
-                .ok_or_else(|| "no AT-SPI connection for this session".to_string())?;
-            let (bus_name, path, role) = atspi_client::find_element_by_name(
-                a11y,
-                &session.app_bus_name,
-                &session.app_path,
-                &params.element_name,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            Ok(format!(
-                "Found '{}': bus_name={}, path={}, role={}",
-                params.element_name, bus_name, path, role
-            ))
-        }
-        .await;
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "find_element",
-                serde_json::json!({ "element_name": params.element_name }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(find_element) failed");
         }
 
         let msg = outcome.map_err(|e| McpError::internal_error(e, None))?;
@@ -1257,7 +1371,7 @@ mod tests {
         srv.sessions.write().await.insert(
             id.into(),
             ManagedSession {
-                session,
+                session: Arc::new(session),
                 report_dir,
                 screenshot_counter: AtomicU32::new(0),
                 events: Mutex::new(Vec::new()),
@@ -1286,19 +1400,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspect_ui_not_found() {
+    async fn dump_tree_not_found() {
         let s = server();
-        let err = s.inspect_ui(session_id("bogus")).await.unwrap_err();
+        let err = s.dump_tree(session_id("bogus")).await.unwrap_err();
         assert!(err.message.contains("session not found"));
     }
 
     #[tokio::test]
-    async fn click_element_not_found() {
+    async fn click_not_found() {
         let s = server();
         let err = s
-            .click_element(Parameters(ClickElementParams {
+            .click(Parameters(ClickParams {
                 session_id: "bogus".into(),
-                element_name: "x".into(),
+                xpath: "//PushButton".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn query_not_found() {
+        let s = server();
+        let err = s
+            .query(Parameters(QueryParams {
+                session_id: "bogus".into(),
+                xpath: "//PushButton".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn set_text_not_found() {
+        let s = server();
+        let err = s
+            .set_text(Parameters(SetTextParams {
+                session_id: "bogus".into(),
+                xpath: "//Text".into(),
+                text: "hi".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn read_text_not_found() {
+        let s = server();
+        let err = s
+            .read_text(Parameters(ReadTextParams {
+                session_id: "bogus".into(),
+                xpath: "//Label".into(),
             }))
             .await
             .unwrap_err();
@@ -1352,19 +1506,6 @@ mod tests {
             .pointer_click(Parameters(PointerClickParams {
                 session_id: "bogus".into(),
                 button: None,
-            }))
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("session not found"));
-    }
-
-    #[tokio::test]
-    async fn find_element_not_found() {
-        let s = server();
-        let err = s
-            .find_element(Parameters(FindElementParams {
-                session_id: "bogus".into(),
-                element_name: "x".into(),
             }))
             .await
             .unwrap_err();
@@ -1552,7 +1693,7 @@ mod tests {
             }),
         );
         ManagedSession {
-            session,
+            session: Arc::new(session),
             report_dir: dir,
             screenshot_counter: AtomicU32::new(0),
             events: Mutex::new(Vec::new()),
@@ -1868,6 +2009,91 @@ mod tests {
             .collect();
         seqs.sort_unstable();
         assert_eq!(seqs, (1..=25).collect::<Vec<_>>());
+    }
+
+    // ── render_matches ────────────────────────────────────────────────────
+
+    fn info(role: &str, name: Option<&str>) -> ElementInfo {
+        ElementInfo {
+            ref_: ("bus".to_string(), "/p".to_string()),
+            role: role.to_string(),
+            role_raw: None,
+            name: name.map(str::to_string),
+            attributes: std::collections::HashMap::new(),
+            states: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn render_matches_pins_each_entry_by_one_indexed_ordinal() {
+        let base = "//PushButton";
+        let ms = vec![
+            info("PushButton", Some("A")),
+            info("PushButton", Some("B")),
+            info("PushButton", Some("C")),
+        ];
+        let arr = render_matches(base, &ms);
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["xpath"], "(//PushButton)[1]");
+        assert_eq!(arr[1]["xpath"], "(//PushButton)[2]");
+        assert_eq!(arr[2]["xpath"], "(//PushButton)[3]");
+        assert_eq!(arr[0]["role"], "PushButton");
+        assert_eq!(arr[0]["name"], "A");
+    }
+
+    #[test]
+    fn render_matches_empty_returns_empty_array() {
+        let arr = render_matches("//Missing", &[]);
+        assert_eq!(arr.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn render_matches_serializes_attributes_and_states() {
+        let mut m = info("PushButton", Some("OK"));
+        m.attributes.insert("id".to_string(), "btn-ok".to_string());
+        m.states.push("showing".to_string());
+        m.states.push("enabled".to_string());
+        let arr = render_matches("//PushButton", &[m]);
+        let entry = &arr.as_array().unwrap()[0];
+        assert_eq!(entry["attributes"]["id"], "btn-ok");
+        let states = entry["states"].as_array().unwrap();
+        let state_names: Vec<&str> = states.iter().filter_map(|v| v.as_str()).collect();
+        assert!(state_names.contains(&"showing"));
+        assert!(state_names.contains(&"enabled"));
+    }
+
+    #[test]
+    fn render_matches_includes_role_raw_when_present() {
+        // Node-fallback case: role="Node" but role_raw preserves the original.
+        let mut m = info("Node", Some("weird"));
+        m.role_raw = Some("0weird-role".to_string());
+        let arr = render_matches("//Node", &[m]);
+        let entry = &arr.as_array().unwrap()[0];
+        assert_eq!(entry["role"], "Node");
+        assert_eq!(entry["role_raw"], "0weird-role");
+    }
+
+    #[test]
+    fn render_matches_omits_role_raw_when_absent() {
+        let m = info("PushButton", Some("OK"));
+        let arr = render_matches("//PushButton", &[m]);
+        let entry = &arr.as_array().unwrap()[0];
+        assert!(
+            entry.get("role_raw").is_none(),
+            "role_raw should not be present on normal roles: {entry}"
+        );
+    }
+
+    #[test]
+    fn render_matches_preserves_complex_base_xpath_in_pin() {
+        // Composed selectors like (//Dialog//PushButton)[2] must wrap correctly.
+        let base = "//Dialog[@name='Confirm']//PushButton";
+        let arr = render_matches(base, &[info("PushButton", Some("OK"))]);
+        assert_eq!(
+            arr.as_array().unwrap()[0]["xpath"],
+            "(//Dialog[@name='Confirm']//PushButton)[1]"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use atspi::connection::AccessibilityConnection;
@@ -9,6 +10,7 @@ use crate::atspi as atspi_client;
 use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend};
 use crate::capture::VideoRecorder;
 use crate::error::{Error, Result};
+use crate::locator::Locator;
 
 /// Parameters for spawning the target application inside a session.
 pub struct SessionConfig {
@@ -199,9 +201,83 @@ impl Session {
             .ok_or_else(|| Error::Screenshot("no keepalive stream".into()))?;
         self.capture.grab_screenshot(stream).await
     }
+
+    /// Serialize the live AT-SPI accessibility tree rooted at this session's
+    /// application to XML. The same snapshot format XPath locators resolve
+    /// against — useful for debugging selectors.
+    pub async fn dump_tree(&self) -> Result<String> {
+        let a11y = self
+            .a11y_connection
+            .as_ref()
+            .ok_or_else(|| Error::Atspi("session has no AT-SPI connection".into()))?;
+        atspi_client::snapshot_tree(a11y, &self.app_bus_name, &self.app_path).await
+    }
 }
 
-#[cfg(feature = "test-support")]
+/// XPath-based element targeting entry points. Implemented on `Arc<Session>`
+/// so the returned [`Locator`] can carry a shared reference back to the
+/// session for lazy resolution.
+impl Session {
+    /// Build a locator for the given XPath expression. Resolution is lazy —
+    /// the tree is snapshotted and the selector evaluated fresh on each
+    /// action or metadata read.
+    pub fn locate(self: &Arc<Self>, xpath: &str) -> Locator {
+        Locator::new(self.clone(), xpath.to_string())
+    }
+
+    /// Locator for the root element of the application's accessibility tree.
+    pub fn root(self: &Arc<Self>) -> Locator {
+        self.locate("/*")
+    }
+
+    /// Locator matching any element whose toolkit `id` attribute equals `id`.
+    /// Convenience shorthand for `session.locate("//*[@id='<id>']")`.
+    pub fn find_by_id(self: &Arc<Self>, id: &str) -> Locator {
+        self.locate(&find_by_id_xpath(id))
+    }
+
+    /// Locator matching any element whose accessible name equals `name`.
+    pub fn find_by_name(self: &Arc<Self>, name: &str) -> Locator {
+        self.locate(&find_by_name_xpath(name))
+    }
+
+    /// Locator matching an element by PascalCase role and accessible name.
+    /// For example, `find_by_role_name("PushButton", "OK")` compiles to
+    /// `//PushButton[@name='OK']`.
+    pub fn find_by_role_name(self: &Arc<Self>, role: &str, name: &str) -> Locator {
+        self.locate(&find_by_role_name_xpath(role, name))
+    }
+}
+
+fn find_by_id_xpath(id: &str) -> String {
+    format!("//*[@id={}]", xpath_literal(id))
+}
+
+fn find_by_name_xpath(name: &str) -> String {
+    format!("//*[@name={}]", xpath_literal(name))
+}
+
+fn find_by_role_name_xpath(role: &str, name: &str) -> String {
+    format!("//{}[@name={}]", role, xpath_literal(name))
+}
+
+/// Render a string as an XPath 1.0 string literal, choosing quote style so
+/// the literal doesn't collide with the string's contents. Falls back to
+/// `concat(...)` when the value contains both `'` and `"`.
+fn xpath_literal(s: &str) -> String {
+    let has_single = s.contains('\'');
+    let has_double = s.contains('"');
+    match (has_single, has_double) {
+        (false, _) => format!("'{s}'"),
+        (true, false) => format!("\"{s}\""),
+        (true, true) => {
+            let parts: Vec<String> = s.split('\'').map(|p| format!("'{p}'")).collect::<Vec<_>>();
+            format!("concat({})", parts.join(", \"'\", "))
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl Session {
     /// Create a Session for testing without starting a real compositor or
     /// connecting to D-Bus. AT-SPI tools will not work on test sessions.
@@ -437,5 +513,75 @@ mod tests {
     #[test]
     fn test_app_name_matches_both_empty() {
         assert!(!app_name_matches("", ""));
+    }
+
+    #[test]
+    fn xpath_literal_plain() {
+        assert_eq!(xpath_literal("OK"), "'OK'");
+    }
+
+    #[test]
+    fn xpath_literal_with_apostrophe() {
+        assert_eq!(xpath_literal("John's"), "\"John's\"");
+    }
+
+    #[test]
+    fn xpath_literal_with_double_quote() {
+        assert_eq!(xpath_literal("a\"b"), "'a\"b'");
+    }
+
+    #[test]
+    fn xpath_literal_with_both_quotes() {
+        // "a'b\"c" → concat('a', "'", 'b"c')
+        let out = xpath_literal("a'b\"c");
+        assert_eq!(out, "concat('a', \"'\", 'b\"c')");
+    }
+
+    #[test]
+    fn find_by_id_xpath_simple() {
+        assert_eq!(find_by_id_xpath("submit-btn"), "//*[@id='submit-btn']");
+    }
+
+    #[test]
+    fn find_by_id_xpath_escapes_apostrophe() {
+        // An id with a single quote must use double-quoted literal.
+        assert_eq!(find_by_id_xpath("a'b"), "//*[@id=\"a'b\"]");
+    }
+
+    #[test]
+    fn find_by_name_xpath_simple() {
+        assert_eq!(find_by_name_xpath("OK"), "//*[@name='OK']");
+    }
+
+    #[test]
+    fn find_by_name_xpath_with_space() {
+        // Spaces are fine in XPath string literals — no special handling needed.
+        assert_eq!(find_by_name_xpath("Save As"), "//*[@name='Save As']");
+    }
+
+    #[test]
+    fn find_by_name_xpath_with_both_quotes_uses_concat() {
+        assert_eq!(
+            find_by_name_xpath("John's \"file\""),
+            "//*[@name=concat('John', \"'\", 's \"file\"')]"
+        );
+    }
+
+    #[test]
+    fn find_by_role_name_xpath_composes_role_and_name() {
+        assert_eq!(
+            find_by_role_name_xpath("PushButton", "OK"),
+            "//PushButton[@name='OK']"
+        );
+    }
+
+    #[test]
+    fn find_by_role_name_xpath_preserves_role_as_element_name() {
+        // Role string is NOT escaped — it's used as the XPath node-test, so
+        // callers pass PascalCase role names directly.
+        assert_eq!(
+            find_by_role_name_xpath("MenuItem", "File"),
+            "//MenuItem[@name='File']"
+        );
     }
 }

@@ -3,8 +3,21 @@ use thiserror::Error;
 /// Errors that can occur during a waydriver session.
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("element not found: {0}")]
-    ElementNotFound(String),
+    #[error("element not found for selector: {xpath}")]
+    ElementNotFound { xpath: String },
+
+    #[error("selector matched {count} elements (expected exactly one): {xpath}")]
+    AmbiguousSelector { xpath: String, count: usize },
+
+    #[error("invalid selector '{xpath}': {reason}")]
+    InvalidSelector { xpath: String, reason: String },
+
+    #[error("element went stale during action (selector: {xpath}, bus: {bus}, path: {path})")]
+    ElementStale {
+        xpath: String,
+        bus: String,
+        path: String,
+    },
 
     #[error("AT-SPI: {0}")]
     Atspi(String),
@@ -35,8 +48,27 @@ mod tests {
     #[test]
     fn test_error_display() {
         assert_eq!(
-            Error::ElementNotFound("button".to_string()).to_string(),
-            "element not found: button"
+            Error::ElementNotFound {
+                xpath: "//PushButton[@name='OK']".into()
+            }
+            .to_string(),
+            "element not found for selector: //PushButton[@name='OK']"
+        );
+        assert_eq!(
+            Error::AmbiguousSelector {
+                xpath: "//PushButton".into(),
+                count: 12,
+            }
+            .to_string(),
+            "selector matched 12 elements (expected exactly one): //PushButton"
+        );
+        assert_eq!(
+            Error::InvalidSelector {
+                xpath: "//[".into(),
+                reason: "unexpected token".into(),
+            }
+            .to_string(),
+            "invalid selector '//[': unexpected token"
         );
         assert_eq!(
             Error::Atspi("registry unavailable".to_string()).to_string(),
