@@ -153,13 +153,13 @@ async fn run_calculator_test(
     let tree = result_text(&result);
     assert!(tree.contains("<?xml"), "tree should be XML, got: {tree}");
     assert!(
-        tree.contains("<PushButton"),
-        "tree should contain PushButton elements, got: {tree}"
+        tree.contains("<Button"),
+        "tree should contain Button elements, got: {tree}"
     );
 
     // Click 2 + 3 = via XPath selectors
     for name in ["2", "+", "3", "="] {
-        let xpath = format!("//PushButton[@name='{name}']");
+        let xpath = format!("//Button[@name='{name}']");
         let result = client
             .call_tool(
                 CallToolRequestParams::new("click").with_arguments(
@@ -230,7 +230,7 @@ async fn run_calculator_test(
             CallToolRequestParams::new("query").with_arguments(
                 serde_json::json!({
                     "session_id": session_id,
-                    "xpath": "//PushButton[@name='5']"
+                    "xpath": "//Button[@name='5']"
                 })
                 .as_object()
                 .unwrap()
@@ -242,9 +242,9 @@ async fn run_calculator_test(
     let matches: serde_json::Value = serde_json::from_str(&text)?;
     assert!(
         matches.as_array().map(|a| !a.is_empty()).unwrap_or(false),
-        "expected at least one match for //PushButton[@name='5'], got: {text}"
+        "expected at least one match for //Button[@name='5'], got: {text}"
     );
-    assert_eq!(matches[0]["role"], "PushButton");
+    assert_eq!(matches[0]["role"], "Button");
     assert_eq!(matches[0]["name"], "5");
 
     // Type text

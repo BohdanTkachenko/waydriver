@@ -138,20 +138,128 @@ async fn accessibility_tree_inspection() -> anyhow::Result<()> {
         "tree should start with an XML declaration, got:\n{tree}"
     );
     assert!(
-        tree.contains("<PushButton"),
-        "tree should contain PushButton elements, got:\n{tree}"
+        tree.contains("<Button"),
+        "tree should contain Button elements, got:\n{tree}"
     );
 
     // Find a known element — the "1" button — with a scoped XPath.
-    let button_one = session.locate("//PushButton[@name='1']");
+    let button_one = session.locate("//Button[@name='1']");
     assert!(button_one.count().await? >= 1, "should find button '1'");
 
     // A non-existent selector yields ElementNotFound when resolved as single.
-    let missing = session.locate("//PushButton[@name='nonexistent_xyz_12345']");
+    // Use a short timeout so the auto-wait doesn't stretch the test by 5s
+    // while it polls for an element we know won't appear.
+    let missing = session
+        .locate("//Button[@name='nonexistent_xyz_12345']")
+        .with_timeout(std::time::Duration::from_millis(250));
     let err = missing.click().await.unwrap_err();
     assert!(
         matches!(err, Error::ElementNotFound { .. }),
         "expected ElementNotFound, got: {err}"
+    );
+
+    // wait_for_visible on an already-visible button returns quickly (the
+    // auto-wait path), exercising the positive branch of poll_with_retry.
+    session
+        .locate("//Button[@name='1']")
+        .wait_for_visible()
+        .await?;
+
+    // wait_for_count: the calculator keypad has a known number of digit
+    // buttons. We don't hard-code the exact count (it varies across GNOME
+    // Calculator versions) — just verify the selector resolves non-zero
+    // and wait_for_count accepts the current count as a no-op.
+    let digit_count = session.locate("//Button").count().await?;
+    assert!(digit_count > 0, "expected some buttons, got 0");
+    session
+        .locate("//Button")
+        .wait_for_count(digit_count)
+        .await?;
+
+    kill(session).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
+async fn menu_interaction_auto_waits() -> anyhow::Result<()> {
+    // Exercises the auto-wait machinery end-to-end against gnome-calculator:
+    //
+    //   1. type 2+3= via keyboard → populates the history list
+    //   2. wait_for_text on the last history label → polls until "5" appears
+    //   3. click the Main Menu toggle → opens the hamburger popover
+    //   4. wait_for state change on the menu button (expanded=true) →
+    //      demonstrates auto-wait picking up async state transitions
+    //
+    // Known limitation (documented here so the test's scope is clear):
+    // gnome-calculator 49's GtkPopoverMenu children aren't exposed in the
+    // AT-SPI tree — the Menu element appears but its MenuItem children
+    // remain an empty Generic/TabPanel. Clicking a specific menu item like
+    // "Clear History" by accessible name isn't possible today in this
+    // particular app. Other GTK4 apps with properly-annotated popovers
+    // (text editor, system settings) expose their menu items and would
+    // work through this same auto-wait path.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init()
+        .ok();
+
+    let (session, _state) = start_calculator_session().await?;
+
+    // Compute 2+3= via keyboard. GTK4 calculator's digit buttons don't
+    // expose the AT-SPI Action interface (activation comes from GtkShortcut,
+    // not a registered action), so `locator.click()` on them returns
+    // "no action with index 0". Keyboard input is the idiomatic path for
+    // number entry anyway.
+    for keysym in [0x32, 0x2b, 0x33, 0x3d] {
+        session.press_keysym(keysym).await?;
+    }
+
+    // The calculation result shows up as the final Label in the history
+    // ListItem. wait_for_text polls until the label's text is "5" — the
+    // auto-wait case of "element exists but content not yet ready." Without
+    // it, the test would need a manual sleep here.
+    let result = session
+        .locate("//ListItem//Label[last()]")
+        .wait_for_text(|t| t == "5")
+        .await?;
+    assert_eq!(result, "5", "expected history result '5', got {result:?}");
+
+    // Open the primary ("hamburger") menu via its ToggleButton. The outer
+    // <Button> wrapper doesn't carry an Action interface in GTK4; the inner
+    // ToggleButton does. Name "Main Menu" matches GNOME Calculator 49 —
+    // older versions may differ and this selector would need updating.
+    session
+        .locate("//ToggleButton[@name='Main Menu']")
+        .click()
+        .await?;
+    // Wake GTK's event loop so the popover actually renders. AT-SPI actions
+    // mutate GTK's model but don't tick the frame clock; in headless mutter
+    // the popover won't appear in the tree until a compositor event forces
+    // a repaint.
+    session.press_keysym(0xffe1).await?; // Shift_L
+
+    // Auto-wait: the Menu element only appears in the tree once the popover
+    // is actually open. No manual sleep — `wait_for_visible` polls until
+    // it shows up.
+    session
+        .locate("//Menu[@name='Main Menu']")
+        .wait_for_visible()
+        .await?;
+
+    // And the wrapping Button now reports expanded=true. Once WAY-8 lands
+    // we'd use `is_expanded()`; today we assert via an XPath predicate that
+    // requires the state attribute.
+    session
+        .locate("//Button[@name='Main Menu' and @expanded='true']")
+        .wait_for_visible()
+        .await?;
+
+    // Dump the tree so the limitation noted at the top is visible in CI logs.
+    let tree = session.dump_tree().await?;
+    eprintln!(
+        "── tree after opening menu ─────────────────────────────────\n{tree}\n\
+         ────────────────────────────────────────────────────────────"
     );
 
     kill(session).await?;
@@ -172,7 +280,7 @@ async fn click_element_changes_display() -> anyhow::Result<()> {
     let baseline = extract_png(&session.take_screenshot().await?);
 
     // Click "5" via the XPath locator, then wake GTK's event loop.
-    session.locate("//PushButton[@name='5']").click().await?;
+    session.locate("//Button[@name='5']").click().await?;
     session.press_keysym(0xffe1).await?; // Shift_L wake
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -181,7 +289,7 @@ async fn click_element_changes_display() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Click "3" via locator + wake.
-    session.locate("//PushButton[@name='3']").click().await?;
+    session.locate("//Button[@name='3']").click().await?;
     session.press_keysym(0xffe1).await?; // Shift_L wake
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
