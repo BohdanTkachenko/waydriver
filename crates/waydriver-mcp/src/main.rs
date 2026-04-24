@@ -706,6 +706,7 @@ impl UiTestServer {
                 app_name: app_name.clone(),
                 video_output: video_path.clone(),
                 video_bitrate: Some(resolved_bitrate),
+                video_fps: None,
             },
         )
         .await
@@ -1232,7 +1233,12 @@ impl UiTestServer {
         let xpath = params.xpath.clone();
         let text = params.text.clone();
         let outcome: Result<String, String> =
-            match managed.session.locate(&xpath).fill(&text, mode).await {
+            match managed
+                .session
+                .locate(&xpath)
+                .fill_with_opts(&text, mode)
+                .await
+            {
                 Ok(()) => Ok(format!("Filled {xpath}")),
                 Err(e) => Err(e.to_string()),
             };

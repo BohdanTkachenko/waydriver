@@ -212,9 +212,9 @@ Keep this README's inventory tables in sync with the source.
 
 ## Stale-build gotcha
 
-`cargo test -p waydriver --test e2e` does *not* rebuild the fixture
-binary — the fixture isn't a dep of waydriver. If you've edited the
-fixture since its last build, run:
+`cargo test -p waydriver-e2e` does *not* rebuild the fixture
+binary — the fixture isn't a dep of `waydriver-e2e`. If you've edited
+the fixture since its last build, run:
 
 ```sh
 cargo build -p waydriver-fixture-gtk

@@ -58,11 +58,6 @@ pub fn parse_chord(input: &str) -> Option<Chord> {
 
 /// Map a modifier name (case-insensitive) to the X11 keysym for its
 /// left-hand variant. Returns `None` for non-modifiers.
-///
-/// Aliases follow Playwright/web convention: `Control` == `Ctrl`;
-/// `Meta` == `Super` == `Win` == `Windows` == `Cmd` == `Command` (on Linux
-/// these are all the Super key, but the aliases make cross-platform test
-/// specs portable).
 pub fn modifier_name_to_keysym(name: &str) -> Option<u32> {
     match name.to_lowercase().as_str() {
         "ctrl" | "control" => Some(0xffe3),

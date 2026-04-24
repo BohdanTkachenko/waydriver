@@ -15,7 +15,7 @@
 //!
 //! ```sh
 //! cargo build -p waydriver-fixture-gtk  # tests don't rebuild the fixture
-//! cargo test -p waydriver --test e2e -- --ignored --test-threads=1
+//! cargo test -p waydriver-e2e -- --ignored --test-threads=1
 //! ```
 //!
 //! The MCP-level e2e test in `crates/waydriver-mcp/tests/e2e.rs` drives
@@ -111,6 +111,7 @@ async fn start_fixture_session(section: &str) -> anyhow::Result<(Arc<Session>, A
             app_name: "waydriver-fixture-gtk".into(),
             video_output: None,
             video_bitrate: None,
+            video_fps: None,
         },
     )
     .await?;
@@ -711,7 +712,7 @@ async fn fixture_locator_fill_on_entry() -> anyhow::Result<()> {
     // caret nav is unreliable — the two modes exist to let callers
     // pick the one their target app honors.
     let cursor = session.stdout_cursor();
-    entry().fill("hello world", FillMode::CaretNav).await?;
+    entry().fill_with_opts("hello world", FillMode::CaretNav).await?;
     session
         .wait_for_stdout_line(
             cursor,
@@ -723,7 +724,7 @@ async fn fixture_locator_fill_on_entry() -> anyhow::Result<()> {
     // Second fill proves that caret-nav clear actually clears the
     // prior content — otherwise we'd get "hello worldreplaced".
     let cursor = session.stdout_cursor();
-    entry().fill("replaced", FillMode::CaretNav).await?;
+    entry().fill_with_opts("replaced", FillMode::CaretNav).await?;
     session
         .wait_for_stdout_line(
             cursor,

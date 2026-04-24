@@ -4,7 +4,7 @@
 //! the project's own `waydriver-fixture-gtk` binary through the full
 //! stack (headless mutter, AT-SPI, PipeWire). Docker runs it in CI.
 //! Library-level coverage for the equivalent flows — click, dump_tree,
-//! waits, keyboard input, etc. — lives in `crates/waydriver/tests/e2e.rs`
+//! waits, keyboard input, etc. — lives in `crates/waydriver-e2e/tests/e2e.rs`
 //! against the same fixture.
 //!
 //! Run explicitly with:

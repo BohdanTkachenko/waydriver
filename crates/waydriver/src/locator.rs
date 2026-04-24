@@ -394,8 +394,17 @@ impl Locator {
     /// unreliable to trust (GTK4's AT-SPI bridge often returns
     /// widget-local bounds where screen coords are expected).
     ///
-    /// See [`FillMode`] for the tradeoffs between select-all strategies.
-    pub async fn fill(&self, text: &str, mode: FillMode) -> Result<()> {
+    /// Fills with [`FillMode::default()`]. Use
+    /// [`fill_with_opts`](Self::fill_with_opts) when the default select-all
+    /// strategy doesn't work on the target widget — see [`FillMode`] for
+    /// the tradeoffs.
+    pub async fn fill(&self, text: &str) -> Result<()> {
+        self.fill_with_opts(text, FillMode::default()).await
+    }
+
+    /// Same as [`fill`](Self::fill) but lets the caller pick the select-all
+    /// strategy. See [`FillMode`] for the tradeoffs between strategies.
+    pub async fn fill_with_opts(&self, text: &str, mode: FillMode) -> Result<()> {
         // 1. Focus best-effort. Propagate any error other than
         // NotSupported — NotSupported is the known GTK4 case where the
         // caller is expected to manage focus themselves.
@@ -428,11 +437,6 @@ impl Locator {
         // 3. Type new content.
         self.session.type_text(text).await?;
         Ok(())
-    }
-
-    /// Shorthand for `fill(text, FillMode::default())`.
-    pub async fn fill_default(&self, text: &str) -> Result<()> {
-        self.fill(text, FillMode::default()).await
     }
 
     /// Pick an option in a combobox, dropdown, or other AT-SPI Selection

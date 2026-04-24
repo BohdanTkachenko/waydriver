@@ -2980,22 +2980,16 @@ dependencies = [
 name = "waydriver"
 version = "0.2.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "atspi",
  "gstreamer",
  "gstreamer-app",
- "image",
  "libc",
  "sxd-document",
  "sxd-xpath",
  "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
- "waydriver-capture-mutter",
- "waydriver-compositor-mutter",
- "waydriver-input-mutter",
  "zbus",
 ]
 
@@ -3024,6 +3018,21 @@ dependencies = [
  "uuid",
  "waydriver",
  "zbus",
+]
+
+[[package]]
+name = "waydriver-e2e"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "waydriver",
+ "waydriver-capture-mutter",
+ "waydriver-compositor-mutter",
+ "waydriver-input-mutter",
 ]
 
 [[package]]

@@ -1,0 +1,24 @@
+[package]
+name = "waydriver-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "End-to-end integration tests for waydriver against headless mutter"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+waydriver = { path = "../waydriver" }
+waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter" }
+waydriver-input-mutter = { path = "../waydriver-input-mutter" }
+waydriver-capture-mutter = { path = "../waydriver-capture-mutter" }
+anyhow.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+image.workspace = true

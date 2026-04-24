@@ -247,7 +247,7 @@ These tests are pure — they don't spawn mutter or touch D-Bus — so `cargo te
 
 End-to-end tests exercise the full stack (mutter, pipewire, AT-SPI, target app):
 
-**Library e2e** (`crates/waydriver/tests/e2e.rs`) — all against the project's own `waydriver-fixture-gtk` binary:
+**Library e2e** (`crates/waydriver-e2e/tests/e2e.rs`) — all against the project's own `waydriver-fixture-gtk` binary:
 - `fixture_exposes_{gtk4,adw,dnd}_widgets` — per-section tree diagnostic assertions.
 - `fixture_click_emits_stdout_event` — click via Locator, verify signal handler fired via fixture stdout.
 - `fixture_toggle_changes_screenshot` — locator action → pixel diff.

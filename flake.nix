@@ -232,6 +232,9 @@
           # under the dev-profile (GTK4's `.dev` output is pulled in via
           # devPackages but buildEnv concatenates pkgconfig dirs here):
           export PKG_CONFIG_PATH="$PWD/.nix-profile/lib/pkgconfig:$PWD/.nix-profile/share/pkgconfig:''${PKG_CONFIG_PATH:-}"
+          # nixpkgs' rustc doesn't ship the stdlib source tree, so rust-analyzer
+          # can't resolve `std`/`core` without this pointer.
+          export RUST_SRC_PATH="${pkgs.rustPlatform.rustLibSrc}"
         '';
       };
     };

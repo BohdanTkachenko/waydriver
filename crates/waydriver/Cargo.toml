@@ -28,13 +28,3 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zbus.workspace = true
-
-[dev-dependencies]
-waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter" }
-waydriver-input-mutter = { path = "../waydriver-input-mutter" }
-waydriver-capture-mutter = { path = "../waydriver-capture-mutter" }
-anyhow.workspace = true
-tokio = { workspace = true }
-tracing.workspace = true
-tracing-subscriber.workspace = true
-image.workspace = true

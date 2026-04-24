@@ -86,6 +86,7 @@ let session = Arc::new(Session::start(
         // Record the entire session to a WebM file. Set to `None` to skip.
         video_output: Some("/tmp/session.webm".into()),
         video_bitrate: None, // defaults to waydriver::capture::DEFAULT_VIDEO_BITRATE (2 Mbps)
+        video_fps: None,     // defaults to waydriver::capture::DEFAULT_VIDEO_FPS (15)
     },
 ).await?);
 

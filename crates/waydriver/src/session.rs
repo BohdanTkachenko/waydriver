@@ -24,6 +24,15 @@ const FALLBACK_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// and per-call via [`Locator::with_timeout`](crate::Locator::with_timeout).
 pub const DEFAULT_TIMEOUT_ENV_VAR: &str = "WAYDRIVER_DEFAULT_TIMEOUT_MS";
 
+/// How long [`wait_for_app`] polls the AT-SPI registry for the target app
+/// before failing. GTK4 + mutter's AT-SPI bridge typically publishes within a
+/// second; the generous budget covers heavy-at-startup targets and loaded CI.
+const APP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll interval for the AT-SPI registry walk in [`wait_for_app`] — short
+/// enough to catch the app promptly without hammering D-Bus.
+const APP_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Parameters for spawning the target application inside a session.
 pub struct SessionConfig {
     pub command: String,
@@ -40,6 +49,10 @@ pub struct SessionConfig {
     /// consulted when `video_output` is `Some`. When `None`, falls back to
     /// [`crate::capture::DEFAULT_VIDEO_BITRATE`].
     pub video_bitrate: Option<u32>,
+    /// Recording framerate in frames-per-second. Only consulted when
+    /// `video_output` is `Some`. When `None`, falls back to
+    /// [`crate::capture::DEFAULT_VIDEO_FPS`].
+    pub video_fps: Option<u32>,
 }
 
 /// Buffer of lines emitted on the target app's stdout, with a Notify the
@@ -165,9 +178,10 @@ impl Session {
             let bitrate = cfg
                 .video_bitrate
                 .unwrap_or(crate::capture::DEFAULT_VIDEO_BITRATE);
+            let fps = cfg.video_fps.unwrap_or(crate::capture::DEFAULT_VIDEO_FPS);
             Some(
                 capture
-                    .start_recording(&keepalive_stream, path, bitrate)
+                    .start_recording(&keepalive_stream, path, bitrate, fps)
                     .await?,
             )
         } else {
@@ -633,7 +647,13 @@ fn app_name_matches(found: &str, target: &str) -> bool {
 }
 
 async fn wait_for_app(conn: &AccessibilityConnection, app_name: &str) -> Result<(String, String)> {
-    for i in 0..100 {
+    let total_polls =
+        (APP_DISCOVERY_TIMEOUT.as_millis() / APP_DISCOVERY_POLL_INTERVAL.as_millis()) as usize;
+    // Log the registry snapshot ~5 times over the wait so a stuck
+    // discovery is visible in logs without spamming on every poll.
+    let log_every = (total_polls / 5).max(1);
+
+    for i in 0..total_polls {
         if let Ok(root) = atspi_client::get_registry_root(conn).await {
             if let Ok(children) = root.get_children().await {
                 let mut found_names = Vec::new();
@@ -662,7 +682,7 @@ async fn wait_for_app(conn: &AccessibilityConnection, app_name: &str) -> Result<
                     }
                 }
 
-                if i % 20 == 0 {
+                if i % log_every == 0 {
                     tracing::debug!(
                         "AT-SPI registry has {} apps: {:?} (looking for '{}')",
                         found_names.len(),
@@ -673,11 +693,12 @@ async fn wait_for_app(conn: &AccessibilityConnection, app_name: &str) -> Result<
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(APP_DISCOVERY_POLL_INTERVAL).await;
     }
     Err(Error::Timeout(format!(
-        "app '{}' did not appear in AT-SPI registry within 10s",
-        app_name
+        "app '{}' did not appear in AT-SPI registry within {}s",
+        app_name,
+        APP_DISCOVERY_TIMEOUT.as_secs()
     )))
 }
 

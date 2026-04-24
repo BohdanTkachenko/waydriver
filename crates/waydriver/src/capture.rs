@@ -116,25 +116,42 @@ fn grab_png_sync(node_id: u32, pipewire_socket: &Path, runtime_dir: &Path) -> Re
 
 /// Default VP8 target bitrate for session recordings, in bits per second.
 ///
-/// 2 Mbps at 1024×768/15 fps keeps UI text crisp while staying well under the
-/// CPU budget of a headless run. VP8's default of 256 kbps was visibly soft.
+/// 2 Mbps is a sensible budget for screen content at typical UI-test display
+/// sizes (SVGA through FHD) at [`DEFAULT_VIDEO_FPS`]: enough bits to keep text
+/// edges crisp during redraw spikes, while staying well under the CPU budget
+/// of a headless run. VP8's own default of 256 kbps was visibly soft on UI
+/// text. Callers recording at 4K+ should raise this, since the same bit
+/// budget has to cover ~8× as many pixels.
 pub const DEFAULT_VIDEO_BITRATE: u32 = 2_000_000;
+
+/// Default recording framerate in frames-per-second.
+///
+/// 15 fps is plenty for UI testing artifacts (you're looking at state
+/// transitions, not smooth animation) and keeps the encode budget low on
+/// mutter's bursty headless frame delivery. Callers wanting smoother playback
+/// of animated UI can raise this via [`SessionConfig::video_fps`].
+pub const DEFAULT_VIDEO_FPS: u32 = 15;
 
 /// Build the GStreamer pipeline string for a long-lived WebM recording.
 ///
 /// `pipewiresrc` feeds raw frames through `videoconvert` + `videorate` (capped
-/// at 15 fps — mutter's headless frame delivery is bursty, so videorate
-/// smooths timestamps), VP8-encodes them, muxes into WebM, and writes directly
-/// to `output_path`.
+/// at `fps` — mutter's headless frame delivery is bursty, so videorate smooths
+/// timestamps), VP8-encodes them, muxes into WebM, and writes directly to
+/// `output_path`.
 ///
 /// `bitrate` is passed to `vp8enc` as `target-bitrate` in bits/sec. The
 /// encoder is also configured with `min-quantizer=4 max-quantizer=30` so
 /// individual frames can't be starved — screen content has long static
 /// stretches punctuated by sudden changes, and VP8's default max-quantizer
 /// of 56 produces visibly smeared text during those changes.
-/// `keyframe-max-dist=30` (roughly every 2 s at 15 fps) keeps random-access
+/// `keyframe-max-dist = fps * 2` (a keyframe every ~2 s) keeps random-access
 /// seeking responsive without inflating the file much.
-fn build_recording_pipeline_str(node_id: u32, output_path: &Path, bitrate: u32) -> String {
+fn build_recording_pipeline_str(
+    node_id: u32,
+    output_path: &Path,
+    bitrate: u32,
+    fps: u32,
+) -> String {
     // GStreamer's gst_parse_launch tolerates paths with forward slashes but
     // would choke on unescaped spaces or quotes. Session IDs are hex-only so
     // in practice the path is safe; we still guard by debug-asserting no
@@ -145,15 +162,16 @@ fn build_recording_pipeline_str(node_id: u32, output_path: &Path, bitrate: u32) 
         "recording output path must not contain whitespace: {}",
         output_path.display()
     );
+    let keyframe_max_dist = fps * 2;
     format!(
         "pipewiresrc path={node_id} always-copy=true do-timestamp=true \
          ! videoconvert \
          ! videorate \
-         ! video/x-raw,framerate=15/1 \
+         ! video/x-raw,framerate={fps}/1 \
          ! vp8enc deadline=1 cpu-used=4 \
            target-bitrate={bitrate} \
            min-quantizer=4 max-quantizer=30 \
-           keyframe-max-dist=30 \
+           keyframe-max-dist={keyframe_max_dist} \
          ! webmmux \
          ! filesink location={path}",
         path = output_path.display()
@@ -174,20 +192,21 @@ pub struct VideoRecorder {
 
 impl VideoRecorder {
     /// Start a WebM recording that reads from the given PipeWire node and
-    /// writes to `output_path` at the given `bitrate` (bits/sec). Returns
-    /// once the pipeline is in PLAYING state.
+    /// writes to `output_path` at the given `bitrate` (bits/sec) and `fps`.
+    /// Returns once the pipeline is in PLAYING state.
     pub async fn start(
         node_id: u32,
         pipewire_socket: &Path,
         output_path: &Path,
         bitrate: u32,
+        fps: u32,
     ) -> Result<VideoRecorder> {
         let socket = pipewire_socket.to_path_buf();
         let runtime = validate_pipewire_socket(pipewire_socket)?.to_path_buf();
         let output = output_path.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
-            start_recording_sync(node_id, &socket, &runtime, output, bitrate)
+            start_recording_sync(node_id, &socket, &runtime, output, bitrate, fps)
         })
         .await
         .map_err(|e| Error::Screenshot(format!("spawn_blocking failed: {e}")))?
@@ -230,6 +249,7 @@ fn start_recording_sync(
     runtime_dir: &Path,
     output_path: PathBuf,
     bitrate: u32,
+    fps: u32,
 ) -> Result<VideoRecorder> {
     let _guard = GRAB_PNG_LOCK
         .lock()
@@ -244,7 +264,7 @@ fn start_recording_sync(
         std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
     }
 
-    let pipeline_str = build_recording_pipeline_str(node_id, &output_path, bitrate);
+    let pipeline_str = build_recording_pipeline_str(node_id, &output_path, bitrate, fps);
 
     let pipeline = gst::parse::launch(&pipeline_str)
         .map_err(|e| Error::Screenshot(format!("recording pipeline parse failed: {e}")))?;
@@ -329,14 +349,23 @@ mod tests {
 
     #[test]
     fn test_build_recording_pipeline_str_contains_node_id() {
-        let s = build_recording_pipeline_str(42, Path::new("/tmp/out.webm"), DEFAULT_VIDEO_BITRATE);
+        let s = build_recording_pipeline_str(
+            42,
+            Path::new("/tmp/out.webm"),
+            DEFAULT_VIDEO_BITRATE,
+            DEFAULT_VIDEO_FPS,
+        );
         assert!(s.contains("path=42"));
     }
 
     #[test]
     fn test_build_recording_pipeline_str_contains_output_path() {
-        let s =
-            build_recording_pipeline_str(1, Path::new("/tmp/abc/abc.webm"), DEFAULT_VIDEO_BITRATE);
+        let s = build_recording_pipeline_str(
+            1,
+            Path::new("/tmp/abc/abc.webm"),
+            DEFAULT_VIDEO_BITRATE,
+            DEFAULT_VIDEO_FPS,
+        );
         assert!(
             s.contains("location=/tmp/abc/abc.webm"),
             "expected filesink location=..., got: {s}"
@@ -345,20 +374,51 @@ mod tests {
 
     #[test]
     fn test_build_recording_pipeline_str_uses_vp8_webm() {
-        let s = build_recording_pipeline_str(0, Path::new("/tmp/x.webm"), DEFAULT_VIDEO_BITRATE);
+        let s = build_recording_pipeline_str(
+            0,
+            Path::new("/tmp/x.webm"),
+            DEFAULT_VIDEO_BITRATE,
+            DEFAULT_VIDEO_FPS,
+        );
         assert!(s.contains("vp8enc"), "expected vp8enc: {s}");
         assert!(s.contains("webmmux"), "expected webmmux: {s}");
     }
 
     #[test]
-    fn test_build_recording_pipeline_str_caps_framerate() {
-        let s = build_recording_pipeline_str(0, Path::new("/tmp/x.webm"), DEFAULT_VIDEO_BITRATE);
-        assert!(s.contains("framerate=15/1"), "expected 15fps cap: {s}");
+    fn test_build_recording_pipeline_str_uses_default_fps() {
+        let s = build_recording_pipeline_str(
+            0,
+            Path::new("/tmp/x.webm"),
+            DEFAULT_VIDEO_BITRATE,
+            DEFAULT_VIDEO_FPS,
+        );
+        assert!(
+            s.contains(&format!("framerate={DEFAULT_VIDEO_FPS}/1")),
+            "expected framerate={DEFAULT_VIDEO_FPS}/1: {s}"
+        );
+    }
+
+    #[test]
+    fn test_build_recording_pipeline_str_honors_custom_fps() {
+        let s =
+            build_recording_pipeline_str(0, Path::new("/tmp/x.webm"), DEFAULT_VIDEO_BITRATE, 30);
+        assert!(s.contains("framerate=30/1"), "expected framerate=30/1: {s}");
+    }
+
+    #[test]
+    fn test_build_recording_pipeline_str_keyframe_max_dist_scales_with_fps() {
+        let s =
+            build_recording_pipeline_str(0, Path::new("/tmp/x.webm"), DEFAULT_VIDEO_BITRATE, 30);
+        assert!(
+            s.contains("keyframe-max-dist=60"),
+            "expected keyframe-max-dist=60 at 30 fps: {s}"
+        );
     }
 
     #[test]
     fn test_build_recording_pipeline_str_embeds_bitrate() {
-        let s = build_recording_pipeline_str(0, Path::new("/tmp/x.webm"), 1_500_000);
+        let s =
+            build_recording_pipeline_str(0, Path::new("/tmp/x.webm"), 1_500_000, DEFAULT_VIDEO_FPS);
         assert!(
             s.contains("target-bitrate=1500000"),
             "expected target-bitrate=1500000, got: {s}"
@@ -367,7 +427,12 @@ mod tests {
 
     #[test]
     fn test_build_recording_pipeline_str_caps_quantizer() {
-        let s = build_recording_pipeline_str(0, Path::new("/tmp/x.webm"), DEFAULT_VIDEO_BITRATE);
+        let s = build_recording_pipeline_str(
+            0,
+            Path::new("/tmp/x.webm"),
+            DEFAULT_VIDEO_BITRATE,
+            DEFAULT_VIDEO_FPS,
+        );
         assert!(s.contains("max-quantizer=30"));
         assert!(s.contains("min-quantizer=4"));
     }
@@ -375,6 +440,11 @@ mod tests {
     #[test]
     fn default_video_bitrate_is_two_mbps() {
         assert_eq!(DEFAULT_VIDEO_BITRATE, 2_000_000);
+    }
+
+    #[test]
+    fn default_video_fps_is_fifteen() {
+        assert_eq!(DEFAULT_VIDEO_FPS, 15);
     }
 
     #[test]
