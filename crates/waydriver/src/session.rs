@@ -293,6 +293,13 @@ impl Session {
         Ok(())
     }
 
+    /// Emit a discrete pointer-axis (wheel) event. `axis` is 0 for
+    /// vertical, 1 for horizontal. `steps` is the number of wheel
+    /// detents — positive scrolls down/right, negative scrolls up/left.
+    pub async fn pointer_axis_discrete(&self, axis: u32, steps: i32) -> Result<()> {
+        self.input.pointer_axis_discrete(axis, steps).await
+    }
+
     /// Wayland display socket name this session is running against.
     pub fn wayland_display(&self) -> &str {
         self.compositor.wayland_display()
@@ -888,6 +895,9 @@ mod tests {
             async fn pointer_button(&self, _: u32) -> Result<()> {
                 Ok(())
             }
+            async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
+                Ok(())
+            }
         }
         struct StubCapture;
         #[async_trait]
@@ -954,6 +964,9 @@ mod tests {
                 Ok(())
             }
             async fn pointer_button(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
                 Ok(())
             }
         }
@@ -1067,6 +1080,9 @@ mod tests {
             async fn pointer_button(&self, _: u32) -> Result<()> {
                 Ok(())
             }
+            async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
+                Ok(())
+            }
         }
         struct StubCapture;
         #[async_trait]
@@ -1143,6 +1159,9 @@ mod tests {
                 Ok(())
             }
             async fn pointer_button(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
                 Ok(())
             }
         }

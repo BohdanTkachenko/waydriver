@@ -66,6 +66,18 @@ pub trait InputBackend: Send + Sync {
     /// Press and release a pointer button. `button` uses Linux evdev codes
     /// (e.g. `BTN_LEFT` = 0x110).
     async fn pointer_button(&self, button: u32) -> Result<()>;
+
+    /// Emit a discrete pointer-axis (wheel) event. `axis` selects the
+    /// direction — `0` is vertical, `1` is horizontal — matching the
+    /// `org.gnome.Mutter.RemoteDesktop.Session.NotifyPointerAxisDiscrete`
+    /// convention. `steps` is the number of wheel detents; positive
+    /// scrolls down / right, negative scrolls up / left.
+    ///
+    /// Backends that don't support discrete wheel events may emulate
+    /// via continuous axis deltas; callers shouldn't rely on step being
+    /// exactly one wheel click's worth of travel, just on sign + rough
+    /// magnitude.
+    async fn pointer_axis_discrete(&self, axis: u32, steps: i32) -> Result<()>;
 }
 
 /// A live PipeWire stream the backend is keeping open on behalf of a caller.

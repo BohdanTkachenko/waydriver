@@ -330,14 +330,32 @@ fn build_scroll_area() -> ScrolledWindow {
     let scroll = ScrolledWindow::new();
     scroll.set_min_content_height(100);
     name(&scroll, "scroll-area");
-    let inner = GtkBox::new(Orientation::Vertical, 4);
+    // `ListBox` + `ListBoxRow` rather than a `Box` of Labels: rows are
+    // (a) always present in the AT-SPI tree regardless of scroll
+    // position (unlike off-screen `Button`s, which GTK4 filters out),
+    // and (b) genuinely focusable at the AT-SPI level (unlike Labels
+    // with `set_focusable(true)`, which don't surface `State::Focusable`
+    // through the a11y bridge). Both are needed so `Locator::scroll_into_view`
+    // tests can (1) find the target row before scrolling and (2) use
+    // the focus-grab fallback when AT-SPI `scroll_to` is unimplemented.
+    let list = ListBox::new();
+    list.set_selection_mode(gtk4::SelectionMode::None);
     for i in 0..40 {
-        let row = Label::new(Some(&format!("Row {i}")));
-        row.set_halign(gtk4::Align::Start);
+        let row = ListBoxRow::new();
+        let lbl = Label::new(Some(&format!("Row {i}")));
+        lbl.set_halign(gtk4::Align::Start);
+        row.set_child(Some(&lbl));
         name(&row, &format!("scroll-row-{i}"));
-        inner.append(&row);
+        list.append(&row);
     }
-    scroll.set_child(Some(&inner));
+    scroll.set_child(Some(&list));
+    // Emit a `scrolled` event whenever the vertical adjustment changes
+    // value. Tests for `Locator::scroll_into_view` use this as ground
+    // truth that scrolling actually happened — distinguishing between
+    // "AT-SPI claims success but nothing moved" and a real layout change.
+    scroll.vadjustment().connect_value_changed(|adj| {
+        emit(&format!("scrolled scroll-area value={:.1}", adj.value()));
+    });
     scroll
 }
 

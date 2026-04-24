@@ -1471,6 +1471,13 @@ mod tests {
             *self.last_button.lock().unwrap() = Some(button);
             Ok(())
         }
+        async fn pointer_axis_discrete(
+            &self,
+            _axis: u32,
+            _steps: i32,
+        ) -> waydriver::error::Result<()> {
+            Ok(())
+        }
     }
 
     struct MockCapture;

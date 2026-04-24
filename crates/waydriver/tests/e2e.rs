@@ -288,6 +288,50 @@ async fn fixture_element_bounds_are_sane() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Note: a positive e2e test for `scroll_into_view` bringing an off-screen
+// row into view would belong here, but doesn't exist yet. In headless
+// Mutter, GTK4 rejects AT-SPI's `Component::scroll_to` /
+// `scroll_to_point` on scroll children, rejects `grab_focus`, *and*
+// Mutter's `NotifyPointerAxisDiscrete` doesn't route wheel events to
+// widgets without a real compositor's pointer focus machinery — so
+// every path inside `scroll_into_view` dead-ends. The library logic is
+// covered by unit tests (`wheel_direction`, `Rect::is_inside`,
+// `find_scrollable_ancestor` via `evaluate_xpath_detailed`). Ship
+// `scroll_into_view` as-is and validate it when we add a headed-test
+// mode or pick up a toolkit that implements `scroll_to` more
+// completely.
+
+/// Calling `scroll_into_view()` on an element that's already inside the
+/// viewport is a no-op — no `scrolled` event should fire.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_scroll_into_view_noop_when_already_visible() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//ListItem[@name='scroll-row-0']")
+        .scroll_into_view()
+        .await?;
+
+    // Short wait — if scroll happened it would have fired by now.
+    let res = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("scrolled scroll-area"),
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "scroll_into_view on already-visible row shouldn't fire scroll event, but got: {res:?}"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
 /// Screenshot before/after toggling a ToggleButton — proves that locator
 /// actions produce real pixel changes in the compositor, not just AT-SPI
 /// state updates.

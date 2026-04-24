@@ -405,6 +405,234 @@ impl Locator {
         atspi_client::grab_focus_on(a11y, &self.xpath, &bus, &path).await
     }
 
+    /// Bring the matched element into its scrollable ancestor's viewport.
+    ///
+    /// Tries AT-SPI `Component::scroll_to(ScrollType::Anywhere)` first — a
+    /// single round-trip that lets the toolkit do the right thing for the
+    /// specific widget (virtualized list, scroll pane, etc.). If the
+    /// widget doesn't honor that call, falls back to moving the pointer
+    /// over the nearest scrollable ancestor and sending discrete
+    /// mouse-wheel events until the target's bounds lie fully inside the
+    /// ancestor's bounds.
+    ///
+    /// Returns cleanly when the element is already in view (no-op).
+    ///
+    /// # Errors
+    ///
+    /// - `Error::Atspi` when no scrollable ancestor exists (the element
+    ///   isn't inside a `ScrollPane` / `Viewport` — nothing to scroll).
+    /// - `Error::Atspi` when the fallback loop exhausts its retry budget
+    ///   (the wheel events didn't bring the element into view; likely a
+    ///   toolkit that ignores synthesized axis events).
+    /// - Auto-wait timeout if the element never resolves.
+    pub async fn scroll_into_view(&self) -> Result<()> {
+        const MAX_WHEEL_TICKS: i32 = 20;
+        const POST_SCROLL_SETTLE: Duration = Duration::from_millis(80);
+
+        let info = self.wait_for_existing().await?;
+        let Some(elem_bounds) = info.bounds else {
+            return Err(Error::Atspi(format!(
+                "no bounds available for {} — can't scroll without Component extents",
+                self.xpath
+            )));
+        };
+
+        let Some(scrollable) = self.find_scrollable_ancestor().await? else {
+            return Err(Error::Atspi(format!(
+                "no scrollable ancestor for {} — element isn't inside a ScrollPane/Viewport",
+                self.xpath
+            )));
+        };
+        let Some(scroll_bounds) = scrollable.bounds else {
+            return Err(Error::Atspi(format!(
+                "scrollable ancestor for {} has no bounds — toolkit doesn't expose Component on it",
+                self.xpath
+            )));
+        };
+
+        tracing::debug!(
+            xpath = %self.xpath,
+            ?elem_bounds,
+            ?scroll_bounds,
+            scrollable_role = %scrollable.role,
+            "scroll_into_view: resolved target and scrollable ancestor",
+        );
+
+        if elem_bounds.is_inside(&scroll_bounds) {
+            tracing::debug!(xpath = %self.xpath, "scroll_into_view: already in viewport");
+            return Ok(());
+        }
+
+        // Primary path: ask the toolkit to scroll this widget into view.
+        //
+        // Two variants are tried in sequence because toolkits differ on
+        // which they implement for which widgets. GTK4's Labels, for
+        // example, don't implement `scroll_to` but their containing
+        // `ScrolledWindow` honors `scroll_to_point` on descendants. The
+        // target is the scrollable ancestor's current top-left, which
+        // asks "scroll me so my position is at the top of the viewport".
+        let a11y = self.a11y()?;
+        let (bus, path) = info.ref_.clone();
+        for st in [
+            atspi::ScrollType::Anywhere,
+            atspi::ScrollType::TopLeft,
+            atspi::ScrollType::TopEdge,
+        ] {
+            if atspi_client::scroll_to_on(a11y.connection(), &bus, &path, st)
+                .await
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        // Some toolkits (GTK4) don't implement scroll_to on leaf widgets
+        // but do handle scroll_to_point with Window coords that lie
+        // inside the scrollable ancestor — the toolkit infers the
+        // ancestor and adjusts its adjustment accordingly.
+        let _ = atspi_client::scroll_to_point_on(
+            a11y.connection(),
+            &bus,
+            &path,
+            atspi::CoordType::Window,
+            scroll_bounds.x,
+            scroll_bounds.y,
+        )
+        .await;
+        tokio::time::sleep(POST_SCROLL_SETTLE).await;
+        if self.is_in_viewport(&scrollable).await? {
+            return Ok(());
+        }
+
+        // Focus-based fallback. GTK (and most toolkits) scroll a newly-
+        // focused widget into its `ScrolledWindow`'s viewport as part of
+        // normal focus handling — regardless of whether the widget
+        // implements `Component::scroll_to` explicitly. Requires the
+        // target to be focusable, so it's skipped when the a11y state
+        // set doesn't advertise `Focusable`.
+        if info.states.iter().any(|s| s == "focusable") {
+            match atspi_client::grab_focus_on(a11y, &self.xpath, &bus, &path).await {
+                Ok(()) => {
+                    tokio::time::sleep(POST_SCROLL_SETTLE).await;
+                    if self.is_in_viewport(&scrollable).await? {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "scroll_into_view: grab_focus fallback failed")
+                }
+            }
+        }
+
+        // Fallback path: park the pointer over the scrollable's center and
+        // emit discrete wheel ticks, re-checking bounds after each one.
+        // Mutter's RemoteDesktop only supports relative pointer motion, so
+        // "clamp to top-left, then offset to center" is the simplest way
+        // to reach a known absolute coordinate. The clamp amount is just
+        // a large value that any realistic viewport fits inside.
+        self.session
+            .pointer_motion_relative(-10_000.0, -10_000.0)
+            .await?;
+        self.session
+            .pointer_motion_relative(
+                scroll_bounds.center_x() as f64,
+                scroll_bounds.center_y() as f64,
+            )
+            .await?;
+
+        for _ in 0..MAX_WHEEL_TICKS {
+            let direction = wheel_direction(&elem_bounds, &scroll_bounds);
+            if direction == 0 {
+                break;
+            }
+            self.session.pointer_axis_discrete(0, direction).await?;
+            tokio::time::sleep(POST_SCROLL_SETTLE).await;
+
+            // Re-snapshot. If the element vanished (virtualized list
+            // recycled the row) that still counts as progress — the
+            // caller's next Locator action will re-resolve it.
+            match self.resolve_once_info().await {
+                Ok(fresh) => {
+                    if let Some(b) = fresh.bounds {
+                        if b.is_inside(&scroll_bounds) {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(Error::ElementNotFound { .. }) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(Error::Atspi(format!(
+            "scroll_into_view exhausted {MAX_WHEEL_TICKS} wheel ticks for {} — toolkit \
+             likely ignored synthesized axis events",
+            self.xpath
+        )))
+    }
+
+    /// Find the closest scrollable ancestor of the element this locator
+    /// resolves to.
+    ///
+    /// We can't rely on roles: GTK4 reports `ScrolledWindow` as
+    /// `role="generic"`, AT-SPI 0.13 doesn't expose `State::Scrollable`,
+    /// and toolkits disagree on whether to use `scroll pane`, `viewport`,
+    /// or something else entirely. Instead we use a structural signal:
+    /// a scrollable viewport is, by definition, a container whose
+    /// children overflow it. Walk the ancestor chain from innermost
+    /// outward; the first ancestor whose bbox is strictly smaller (in
+    /// either axis) than the ancestor one step closer to the target is
+    /// the viewport clipping that content.
+    ///
+    /// Works for any toolkit that correctly reports bounds via
+    /// `Component::get_extents`, not just GTK4.
+    async fn find_scrollable_ancestor(&self) -> Result<Option<ElementInfo>> {
+        let xml = self.snapshot().await?;
+
+        // Innermost-first walk along the ancestor axis. The `reverse`
+        // model item of the XPath spec orders ancestors last-to-first,
+        // but `evaluate_xpath_detailed` returns document order
+        // (outermost-first), so we reverse in Rust.
+        let ancestors_xpath = format!("({xp})/ancestor::*", xp = self.xpath);
+        let mut ancestors = atspi_client::evaluate_xpath_detailed(&xml, &ancestors_xpath)?;
+        ancestors.reverse();
+
+        // Seed the overflow test with the target's own bounds. Then for
+        // each ancestor, compare the PREVIOUS chain node's bounds to
+        // this ancestor's — if the previous is strictly larger in any
+        // axis, this ancestor is clipping it and is the viewport.
+        let target = atspi_client::evaluate_xpath_detailed(&xml, &self.xpath)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::ElementNotFound {
+                xpath: self.xpath.clone(),
+            })?;
+        let mut prev_bounds = target.bounds;
+
+        for ancestor in ancestors {
+            if let (Some(prev), Some(this)) = (prev_bounds, ancestor.bounds) {
+                if prev.width > this.width || prev.height > this.height {
+                    return Ok(Some(ancestor));
+                }
+            }
+            prev_bounds = ancestor.bounds;
+        }
+        Ok(None)
+    }
+
+    /// Whether this locator's element currently lies inside the given
+    /// scrollable's bounds. Used as the exit condition for the wheel
+    /// fallback loop and as the post-`scroll_to` verification step.
+    async fn is_in_viewport(&self, scrollable: &ElementInfo) -> Result<bool> {
+        let Some(scroll_bounds) = scrollable.bounds else {
+            return Ok(false);
+        };
+        match self.resolve_once_info().await {
+            Ok(fresh) => Ok(fresh.bounds.is_some_and(|b| b.is_inside(&scroll_bounds))),
+            Err(Error::ElementNotFound { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     // ── Explicit waits ─────────────────────────────────────────────────────
 
     /// Poll until the element exists and has the `Showing` state. Returns
@@ -640,6 +868,25 @@ impl Locator {
     }
 }
 
+/// Compute the sign + magnitude of a wheel tick needed to bring `elem`
+/// closer to being inside `scrollable`. Returns -1 when we should scroll
+/// up (element is above the viewport), +1 when we should scroll down,
+/// and 0 when the element is already vertically inside (which the caller
+/// treats as "stop, even if horizontally off — we don't yet synthesize
+/// horizontal scrolls").
+///
+/// Used only by the fallback path of [`Locator::scroll_into_view`]; kept
+/// free-standing so it can be unit-tested without spinning up a session.
+fn wheel_direction(elem: &crate::atspi::Rect, scrollable: &crate::atspi::Rect) -> i32 {
+    if elem.y < scrollable.y {
+        -1
+    } else if elem.bottom() > scrollable.bottom() {
+        1
+    } else {
+        0
+    }
+}
+
 /// Whether the given snapshot state-set represents an "interactable"
 /// element. AT-SPI has two closely-related states here: `Enabled` (the
 /// newer, more generic name) and `Sensitive` (GTK's legacy name for the
@@ -870,6 +1117,9 @@ mod tests {
             Ok(())
         }
         async fn pointer_button(&self, _button: u32) -> WdResult<()> {
+            Ok(())
+        }
+        async fn pointer_axis_discrete(&self, _axis: u32, _steps: i32) -> WdResult<()> {
             Ok(())
         }
     }
@@ -1269,5 +1519,87 @@ mod tests {
         }));
         assert!(!is_retriable(&Error::Atspi("boom".into())));
         assert!(!is_retriable(&Error::Timeout("nope".into())));
+    }
+
+    // ── wheel_direction ────────────────────────────────────────────────────
+    //
+    // Drives the fallback path of scroll_into_view. A bug here would mean
+    // either scrolling the wrong way (infinite loop that hits the retry
+    // cap) or never scrolling at all, so worth covering in unit tests even
+    // though the math is simple.
+
+    use crate::atspi::Rect;
+
+    #[test]
+    fn wheel_direction_above_returns_negative() {
+        // Element is above the viewport — scroll up (toward the element).
+        let elem = Rect {
+            x: 0,
+            y: -100,
+            width: 50,
+            height: 20,
+        };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        assert_eq!(super::wheel_direction(&elem, &viewport), -1);
+    }
+
+    #[test]
+    fn wheel_direction_below_returns_positive() {
+        // Element is below the viewport — scroll down (toward the element).
+        let elem = Rect {
+            x: 0,
+            y: 200,
+            width: 50,
+            height: 20,
+        };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        assert_eq!(super::wheel_direction(&elem, &viewport), 1);
+    }
+
+    #[test]
+    fn wheel_direction_already_inside_returns_zero() {
+        // In-view element — no further scrolling needed.
+        let elem = Rect {
+            x: 10,
+            y: 30,
+            width: 20,
+            height: 10,
+        };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        assert_eq!(super::wheel_direction(&elem, &viewport), 0);
+    }
+
+    #[test]
+    fn wheel_direction_partially_below_returns_positive() {
+        // Element top is inside, bottom peeks below — still needs a tick
+        // down so the whole element fits.
+        let elem = Rect {
+            x: 0,
+            y: 90,
+            width: 20,
+            height: 30, // bottom = 120, viewport.bottom = 100
+        };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        assert_eq!(super::wheel_direction(&elem, &viewport), 1);
     }
 }

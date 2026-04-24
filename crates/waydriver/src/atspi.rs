@@ -6,7 +6,7 @@ use atspi::proxy::collection::CollectionProxy;
 use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::text::TextProxy;
-use atspi::{CoordType, State, StateSet};
+use atspi::{CoordType, ScrollType, State, StateSet};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
@@ -38,6 +38,36 @@ impl Rect {
     /// snapshot's `bbox` attribute.
     pub fn to_bbox_string(&self) -> String {
         format!("{},{},{},{}", self.x, self.y, self.width, self.height)
+    }
+
+    /// X coordinate of the right edge (exclusive).
+    pub fn right(&self) -> i32 {
+        self.x.saturating_add(self.width)
+    }
+
+    /// Y coordinate of the bottom edge (exclusive).
+    pub fn bottom(&self) -> i32 {
+        self.y.saturating_add(self.height)
+    }
+
+    /// X coordinate of the center (horizontal midpoint).
+    pub fn center_x(&self) -> i32 {
+        self.x.saturating_add(self.width / 2)
+    }
+
+    /// Y coordinate of the center (vertical midpoint).
+    pub fn center_y(&self) -> i32 {
+        self.y.saturating_add(self.height / 2)
+    }
+
+    /// Whether `self` lies entirely within `outer`. Used by
+    /// `scroll_into_view` to decide whether an element is already visible
+    /// in its scrollable ancestor — if so, scrolling is a no-op.
+    pub fn is_inside(&self, outer: &Rect) -> bool {
+        self.x >= outer.x
+            && self.y >= outer.y
+            && self.right() <= outer.right()
+            && self.bottom() <= outer.bottom()
     }
 
     /// Parse a `"x,y,width,height"` string. Returns `None` on any parse
@@ -327,12 +357,20 @@ fn snapshot_node<'a>(
         let name = proxy.name().await.unwrap_or_default();
         let states: StateSet = proxy.get_state().await.unwrap_or_default();
         let attrs: HashMap<String, String> = proxy.get_attributes().await.unwrap_or_default();
-        // Fetch screen-relative bounds via the Component interface. Any
+        // Fetch window-relative bounds via the Component interface. Any
         // error — element doesn't implement Component, toolkit refused,
         // D-Bus NoReply — maps to "no bounds available" rather than
         // aborting the snapshot. This preserves the invariant that a
         // snapshot always succeeds even when individual nodes misbehave.
-        let bounds = extents_on(conn, bus_name, path, CoordType::Screen)
+        //
+        // `Window` over `Screen`: under headless mutter the toolkit
+        // routinely reports `(0, 0)` for screen-relative positions (no
+        // actual screen to anchor to), which defeats the bounds-based
+        // overflow check in `Locator::scroll_into_view` and makes every
+        // widget look like it's at the origin. Window-relative coords
+        // are stable across headless/headed and give enough signal for
+        // layout math.
+        let bounds = extents_on(conn, bus_name, path, CoordType::Window)
             .await
             .ok()
             .flatten();
@@ -654,6 +692,52 @@ pub async fn extents_on(
             }
         }
         Err(zbus::Error::MethodError(_, _, _)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Ask the toolkit to scroll the element identified by `(bus, path)` into
+/// view via the AT-SPI `Component::scroll_to` method.
+///
+/// Returns `Ok(true)` when the widget honored the request, `Ok(false)`
+/// when it declined (returned false — usually meaning the widget's
+/// toolkit hasn't implemented scroll_to for this role), and
+/// `Ok(false)` also when the D-Bus call fails with a MethodError
+/// (typically "interface not supported"). Only propagates `Err` for
+/// transport-level failures that signal a broken session.
+pub async fn scroll_to_on(
+    conn: &zbus::Connection,
+    bus: &str,
+    path: &str,
+    scroll_type: ScrollType,
+) -> zbus::Result<bool> {
+    let component = build_component(conn, bus, path).await?;
+    match component.scroll_to(scroll_type).await {
+        Ok(ok) => Ok(ok),
+        Err(zbus::Error::MethodError(_, _, _)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Ask the toolkit to scroll the element identified by `(bus, path)` so
+/// its position lands at `(x, y)` in the given coordinate frame — the
+/// AT-SPI `Component::scroll_to_point` method.
+///
+/// Same error-mapping contract as [`scroll_to_on`]: any MethodError
+/// (the widget doesn't implement it, or rejected the request) becomes
+/// `Ok(false)`.
+pub async fn scroll_to_point_on(
+    conn: &zbus::Connection,
+    bus: &str,
+    path: &str,
+    coord_type: CoordType,
+    x: i32,
+    y: i32,
+) -> zbus::Result<bool> {
+    let component = build_component(conn, bus, path).await?;
+    match component.scroll_to_point(coord_type, x, y).await {
+        Ok(ok) => Ok(ok),
+        Err(zbus::Error::MethodError(_, _, _)) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -1029,6 +1113,103 @@ mod tests {
         // bbox attribute should not leak into the generic attributes map
         // (it's in SNAPSHOT_BUILTINS).
         assert!(!ok.attributes.contains_key("bbox"));
+    }
+
+    #[test]
+    fn rect_is_inside_fully_contained() {
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 768,
+        };
+        let inner = Rect {
+            x: 100,
+            y: 200,
+            width: 50,
+            height: 20,
+        };
+        assert!(inner.is_inside(&outer));
+    }
+
+    #[test]
+    fn rect_is_inside_partial_overlap_left() {
+        let outer = Rect {
+            x: 10,
+            y: 10,
+            width: 100,
+            height: 100,
+        };
+        // Starts before outer.x — partially off to the left.
+        let straddles = Rect {
+            x: 0,
+            y: 20,
+            width: 30,
+            height: 20,
+        };
+        assert!(!straddles.is_inside(&outer));
+    }
+
+    #[test]
+    fn rect_is_inside_partial_overlap_bottom() {
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        // Bottom edge (y=110) extends past outer's bottom (100).
+        let straddles = Rect {
+            x: 10,
+            y: 90,
+            width: 50,
+            height: 20,
+        };
+        assert!(!straddles.is_inside(&outer));
+    }
+
+    #[test]
+    fn rect_is_inside_exact_match() {
+        // Edge-touching counts as inside — a widget flush with its
+        // viewport's edges is "in view," not partially clipped.
+        let r = Rect {
+            x: 5,
+            y: 5,
+            width: 20,
+            height: 20,
+        };
+        assert!(r.is_inside(&r));
+    }
+
+    #[test]
+    fn rect_is_inside_disjoint() {
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let far = Rect {
+            x: 500,
+            y: 500,
+            width: 10,
+            height: 10,
+        };
+        assert!(!far.is_inside(&outer));
+    }
+
+    #[test]
+    fn rect_geometry_accessors() {
+        let r = Rect {
+            x: 10,
+            y: 20,
+            width: 40,
+            height: 80,
+        };
+        assert_eq!(r.right(), 50);
+        assert_eq!(r.bottom(), 100);
+        assert_eq!(r.center_x(), 30);
+        assert_eq!(r.center_y(), 60);
     }
 
     #[test]

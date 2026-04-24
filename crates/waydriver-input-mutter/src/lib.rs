@@ -138,4 +138,24 @@ impl InputBackend for MutterInput {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         Ok(())
     }
+
+    async fn pointer_axis_discrete(&self, axis: u32, steps: i32) -> Result<()> {
+        self.state
+            .conn
+            .call_method(
+                Some("org.gnome.Mutter.RemoteDesktop"),
+                self.state.rd_session_path.as_str(),
+                Some("org.gnome.Mutter.RemoteDesktop.Session"),
+                "NotifyPointerAxisDiscrete",
+                &(axis, steps),
+            )
+            .await
+            .map_err(|e| Error::Process(format!("NotifyPointerAxisDiscrete: {e}")))?;
+        // Give GTK a beat to process the wheel event before the next call.
+        // Same rationale as the tail sleep in pointer_button — back-to-back
+        // axis events from a scroll loop can otherwise stack up faster than
+        // the compositor delivers them.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        Ok(())
+    }
 }
