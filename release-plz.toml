@@ -16,3 +16,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 """
+
+# ── Single consolidated CHANGELOG.md at the workspace root ────────────────
+#
+# All crates share `[workspace.package] version`, so releases bump them
+# together and per-crate changelogs ended up as five near-duplicate files.
+# The `waydriver` package owns the shared `CHANGELOG.md` at the repo root
+# and pulls in commits from every other crate via `changelog_include`.
+# The other packages disable their own changelog generation.
+
+[[package]]
+name = "waydriver"
+changelog_path = "../../CHANGELOG.md"
+changelog_include = [
+    "waydriver-mcp",
+    "waydriver-capture-mutter",
+    "waydriver-compositor-mutter",
+    "waydriver-input-mutter",
+    "waydriver-fixture-gtk",
+]
+# Owns the single consolidated GitHub Release per version. Per-crate git
+# tags still exist (cargo-semver-checks and compare URLs need them) but
+# only this package creates a Release page.
+git_release_enable = true
+
+[[package]]
+name = "waydriver-mcp"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "waydriver-capture-mutter"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "waydriver-compositor-mutter"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "waydriver-input-mutter"
+changelog_update = false
+git_release_enable = false
+
+# Internal e2e fixture — never released, never tracked in the changelog.
+[[package]]
+name = "waydriver-fixture-gtk"
+release = false
