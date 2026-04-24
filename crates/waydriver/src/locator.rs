@@ -190,19 +190,67 @@ impl Locator {
         Ok(self.wait_for_existing().await?.attributes)
     }
 
-    /// Whether the matched element currently has the `Showing` state.
+    /// Whether the matched element currently has the AT-SPI `State::Showing`
+    /// state.
     pub async fn is_showing(&self) -> Result<bool> {
         self.has_state("showing").await
     }
 
     /// Whether the matched element is currently interactable.
     ///
-    /// Returns true when the element has either the AT-SPI `Enabled` state
-    /// or the `Sensitive` state — GTK reports the latter, Qt/others the
-    /// former. Both mean "user can interact with this widget right now."
+    /// Returns true when the element has either the AT-SPI `State::Enabled`
+    /// state or the `State::Sensitive` state — GTK reports the latter,
+    /// Qt/others the former. Both mean "user can interact with this widget
+    /// right now."
     pub async fn is_enabled(&self) -> Result<bool> {
         let info = self.wait_for_existing().await?;
         Ok(is_enabled_in(&info.states))
+    }
+
+    /// Whether the matched element currently has the AT-SPI `State::Checked`
+    /// state. Use for checkboxes, toggle buttons, and checkable menu items.
+    pub async fn is_checked(&self) -> Result<bool> {
+        self.has_state("checked").await
+    }
+
+    /// Whether the matched element currently has the AT-SPI `State::Focused`
+    /// state — i.e. it holds keyboard focus right now.
+    pub async fn is_focused(&self) -> Result<bool> {
+        self.has_state("focused").await
+    }
+
+    /// Whether the matched element currently has the AT-SPI `State::Expanded`
+    /// state. Use for tree rows, expanders, and disclosure triangles.
+    ///
+    /// An element that is collapsible but not currently expanded has
+    /// `State::Expandable` (and possibly `State::Collapsed`) but not
+    /// `State::Expanded`.
+    pub async fn is_expanded(&self) -> Result<bool> {
+        self.has_state("expanded").await
+    }
+
+    /// Whether the matched element currently has the AT-SPI `State::Editable`
+    /// state — i.e. the user can type into it.
+    pub async fn is_editable(&self) -> Result<bool> {
+        self.has_state("editable").await
+    }
+
+    /// Whether the matched element currently has the AT-SPI `State::Selected`
+    /// state. Use for list and table rows, selectable menu items, and tabs.
+    pub async fn is_selected(&self) -> Result<bool> {
+        self.has_state("selected").await
+    }
+
+    /// Whether the matched element currently has the AT-SPI `State::Pressed`
+    /// state — i.e. a toggle button is in its pressed position.
+    pub async fn is_pressed(&self) -> Result<bool> {
+        self.has_state("pressed").await
+    }
+
+    /// Whether the matched element currently has the AT-SPI `State::Modal`
+    /// state — i.e. a dialog that blocks interaction with its parent window.
+    pub async fn is_modal(&self) -> Result<bool> {
+        self.has_state("modal").await
     }
 
     /// Text contents of the matched element via the AT-SPI Text interface.
@@ -332,6 +380,41 @@ impl Locator {
         .await
     }
 
+    /// Poll until the element has the AT-SPI `State::Checked` state.
+    pub async fn wait_for_checked(&self) -> Result<()> {
+        self.wait_for_state("checked").await
+    }
+
+    /// Poll until the element has the AT-SPI `State::Focused` state.
+    pub async fn wait_for_focused(&self) -> Result<()> {
+        self.wait_for_state("focused").await
+    }
+
+    /// Poll until the element has the AT-SPI `State::Expanded` state.
+    pub async fn wait_for_expanded(&self) -> Result<()> {
+        self.wait_for_state("expanded").await
+    }
+
+    /// Poll until the element has the AT-SPI `State::Editable` state.
+    pub async fn wait_for_editable(&self) -> Result<()> {
+        self.wait_for_state("editable").await
+    }
+
+    /// Poll until the element has the AT-SPI `State::Selected` state.
+    pub async fn wait_for_selected(&self) -> Result<()> {
+        self.wait_for_state("selected").await
+    }
+
+    /// Poll until the element has the AT-SPI `State::Pressed` state.
+    pub async fn wait_for_pressed(&self) -> Result<()> {
+        self.wait_for_state("pressed").await
+    }
+
+    /// Poll until the element has the AT-SPI `State::Modal` state.
+    pub async fn wait_for_modal(&self) -> Result<()> {
+        self.wait_for_state("modal").await
+    }
+
     /// Poll until the element's text contents satisfy `pred`. Returns the
     /// matching text on success so the caller can inspect it further.
     pub async fn wait_for_text<F>(&self, pred: F) -> Result<String>
@@ -362,6 +445,22 @@ impl Locator {
             .states
             .iter()
             .any(|s| s == state))
+    }
+
+    /// Poll until the element exists and has the named AT-SPI state.
+    /// Shared backbone for the `wait_for_checked` / `wait_for_focused` /
+    /// etc. predicates — keeps their bodies one-liners.
+    async fn wait_for_state(&self, state: &str) -> Result<()> {
+        let xpath = self.xpath.clone();
+        poll_with_retry(self.effective_timeout(), &xpath, || async {
+            let info = self.resolve_once_info().await?;
+            if info.states.iter().any(|s| s == state) {
+                Ok(Some(()))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
     }
 
     fn a11y(&self) -> Result<&AccessibilityConnection> {
@@ -968,6 +1067,91 @@ mod tests {
             "zero-timeout poll should not sleep, took {:?}",
             start.elapsed()
         );
+    }
+
+    // ── State-predicate snapshot assertions ────────────────────────────────
+    //
+    // `is_checked` / `is_focused` / etc. all bottom out in
+    // `info.states.iter().any(|s| s == "<name>")` on the ElementInfo produced
+    // by `evaluate_xpath_detailed`. We can't exercise the full async path
+    // without a live AT-SPI connection, but we can verify that each
+    // state-name string shows up in the detailed snapshot where we expect —
+    // which is what the predicates actually check against. If the snapshot
+    // side of the contract ever changes (e.g. renames an attr), these tests
+    // catch it.
+
+    use crate::atspi::evaluate_xpath_detailed;
+
+    fn states_for(xml: &str, xpath: &str) -> Vec<String> {
+        let mut hits = evaluate_xpath_detailed(xml, xpath).unwrap();
+        assert_eq!(hits.len(), 1, "fixture should match exactly one element");
+        hits.pop().unwrap().states
+    }
+
+    #[test]
+    fn snapshot_exposes_checked_state() {
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r"><CheckBox name="Accept" checked="true" _ref="b|/c"/></Application>"#;
+        let states = states_for(xml, "//CheckBox");
+        assert!(states.iter().any(|s| s == "checked"));
+    }
+
+    #[test]
+    fn snapshot_exposes_focused_state() {
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r"><Entry focused="true" _ref="b|/e"/></Application>"#;
+        let states = states_for(xml, "//Entry");
+        assert!(states.iter().any(|s| s == "focused"));
+    }
+
+    #[test]
+    fn snapshot_exposes_expanded_state() {
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r"><TreeItem expanded="true" _ref="b|/t"/></Application>"#;
+        let states = states_for(xml, "//TreeItem");
+        assert!(states.iter().any(|s| s == "expanded"));
+    }
+
+    #[test]
+    fn snapshot_exposes_editable_state() {
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r"><Entry editable="true" _ref="b|/e"/></Application>"#;
+        let states = states_for(xml, "//Entry");
+        assert!(states.iter().any(|s| s == "editable"));
+    }
+
+    #[test]
+    fn snapshot_exposes_selected_state() {
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r"><ListItem selected="true" _ref="b|/l"/></Application>"#;
+        let states = states_for(xml, "//ListItem");
+        assert!(states.iter().any(|s| s == "selected"));
+    }
+
+    #[test]
+    fn snapshot_exposes_pressed_state() {
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r"><ToggleButton pressed="true" _ref="b|/t"/></Application>"#;
+        let states = states_for(xml, "//ToggleButton");
+        assert!(states.iter().any(|s| s == "pressed"));
+    }
+
+    #[test]
+    fn snapshot_exposes_modal_state() {
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r"><Dialog modal="true" _ref="b|/d"/></Application>"#;
+        let states = states_for(xml, "//Dialog");
+        assert!(states.iter().any(|s| s == "modal"));
+    }
+
+    #[test]
+    fn snapshot_state_absence_is_also_detectable() {
+        // If the state attr is absent, the snapshot omits it from `states`,
+        // which is exactly what `is_checked()` etc. rely on returning false.
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r"><CheckBox _ref="b|/c"/></Application>"#;
+        let states = states_for(xml, "//CheckBox");
+        assert!(!states.iter().any(|s| s == "checked"));
     }
 
     #[test]
