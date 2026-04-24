@@ -60,7 +60,11 @@ name = "waydriver-input-mutter"
 changelog_update = false
 git_release_enable = false
 
-# Internal e2e fixture — never released, never tracked in the changelog.
+# Internal e2e fixture — never published, released, or tagged.
+# `publish = false` here matches the fixture's own Cargo.toml (its
+# `publish = false` there blocks crates.io upload); release-plz needs
+# its config to agree with the crate metadata or it errors at load time.
 [[package]]
 name = "waydriver-fixture-gtk"
 release = false
+publish = false
