@@ -192,7 +192,7 @@ When editing session setup, keep this invariant: the **app** gets the host bus; 
 
 ### Click = AT-SPI action + input wake
 
-After AT-SPI `do_action(0)` (in `waydriver::atspi::click_element`), the caller should send a harmless Shift_L press/release through the input backend. This wakes GTK4's GLib main loop, flushing pending widget invalidations so the framebuffer reflects the click. Without this, screenshots after clicks are stale.
+After AT-SPI `do_action(0)` (invoked by `Locator::click`), the caller should send a harmless Shift_L press/release through the input backend. This wakes GTK4's GLib main loop, flushing pending widget invalidations so the framebuffer reflects the click. Without this, screenshots after clicks are stale.
 
 ### Text input vs. key press
 

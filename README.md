@@ -62,18 +62,19 @@ Currently only Mutter is implemented (`waydriver-compositor-mutter`, `waydriver-
 ## Usage
 
 ```rust
+use std::sync::Arc;
 use waydriver::{Session, SessionConfig, CompositorRuntime};
 use waydriver_compositor_mutter::MutterCompositor;
 use waydriver_input_mutter::MutterInput;
 use waydriver_capture_mutter::MutterCapture;
 
 let mut compositor = MutterCompositor::new();
-compositor.start().await?;
+compositor.start(None).await?;
 let state = compositor.state();
 let input = MutterInput::new(state.clone());
 let capture = MutterCapture::new(state);
 
-let session = Session::start(
+let session = Arc::new(Session::start(
     Box::new(compositor),
     Box::new(input),
     Box::new(capture),
@@ -86,21 +87,55 @@ let session = Session::start(
         video_output: Some("/tmp/session.webm".into()),
         video_bitrate: None, // defaults to waydriver::capture::DEFAULT_VIDEO_BITRATE (2 Mbps)
     },
-).await?;
+).await?);
 
-// Take a screenshot (returns PNG bytes)
+// Take a screenshot (returns PNG bytes).
 let png = session.take_screenshot().await?;
 
-// Interact via AT-SPI
-waydriver::atspi::click_element(
-    &session.a11y_connection,
-    &session.app_bus_name,
-    &session.app_path,
-    "5",
-).await?;
+// Target widgets with XPath selectors over the AT-SPI tree. Actions
+// auto-wait for the element to be visible + enabled before firing.
+session.locate("//Button[@name='primary-button']").click().await?;
+session.locate("//Text[@name='search']").set_text("hello").await?;
 
-session.kill().await?;
+// Keyboard input with modifier chords.
+session.press_chord("Ctrl+Shift+S").await?;
+
+// Explicit waits when auto-wait isn't enough — e.g. an item appearing
+// after some async work.
+session.locate("//Label[@name='status']")
+    .wait_for_text(|t| t == "ready")
+    .await?;
+
+// Inspect the tree while debugging selectors.
+let xml = session.dump_tree().await?;
+println!("{xml}");
+
+Arc::try_unwrap(session).unwrap().kill().await?;
 ```
+
+### Locator API
+
+`Session::locate(xpath)` returns a lazy `Locator` — each action re-snapshots
+the AT-SPI tree and re-resolves the selector, so you don't have to worry
+about stale element handles. Common methods:
+
+| Method                                     | What it does                                     |
+| ------------------------------------------ | ------------------------------------------------ |
+| `click()`                                  | Invoke the AT-SPI `Action` interface             |
+| `focus()`                                  | Call `Component::grab_focus` if supported        |
+| `set_text(s)` / `text()`                   | Read/write via `EditableText` / `Text` interfaces |
+| `count()` / `all()`                        | Multi-match: element count, list of locators     |
+| `attribute(k)` / `attributes()`            | Read AT-SPI attributes                           |
+| `is_showing()` / `is_enabled()`            | State predicates                                 |
+| `name()` / `role()`                        | Accessible name + role                           |
+| `wait_for_visible()` / `_hidden()` / `_enabled()` | Block until the state holds                      |
+| `wait_for_count(n)` / `wait_for_text(pred)` | Block until a predicate matches                  |
+| `with_timeout(d)`                          | Per-call override of the auto-wait timeout        |
+| `nth(i)` / `first()` / `last()` / `parent()` / `locate(sub_xpath)` | Compose sub-locators |
+
+Single-target actions (`click`, `focus`, `set_text`, `text`, ...) error with
+`AmbiguousSelector` if the selector matches more than one element. Narrow
+with `.nth(i)` or a more specific XPath.
 
 ## MCP server
 
@@ -111,14 +146,19 @@ session.kill().await?;
 | `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir`, `resolution`, `record_video`, `video_bitrate` overrides per session) |
 | `list_sessions`   | List active session ids, app names, and Wayland displays              |
 | `kill_session`    | Tear down a session and clean up all child processes                  |
-| `inspect_ui`      | Dump the AT-SPI accessibility tree of the running app                 |
-| `click_element`   | Click a widget by its accessible name (via AT-SPI action)             |
-| `type_text`       | Type a string into a focused element through the input backend        |
-| `press_key`       | Press a named key (`Return`, `Tab`, `Escape`, letters, …)             |
-| `find_element`    | Find a widget by accessible name and return its role and path         |
+| `dump_tree`       | Dump the AT-SPI accessibility tree as XML — each node carries a `_ref` you can target with `query`/`click`/etc. |
+| `query`           | Evaluate an XPath over the tree; returns every match's role, name, attributes, and states |
+| `click`           | Click an element selected by XPath (via AT-SPI `Action` interface). Auto-waits for visibility + enablement. |
+| `focus`           | Give keyboard focus to an element via AT-SPI `Component::grab_focus`  |
+| `set_text`        | Replace an editable element's contents via `EditableText`             |
+| `read_text`       | Read an element's text via the `Text` interface                       |
+| `type_text`       | Type a string into the currently focused element through the input backend |
+| `press_key`       | Press a named key or chord (`Return`, `Ctrl+A`, `Shift+Tab`, `Escape`, …) |
 | `move_pointer`    | Move the pointer by a relative offset in logical pixels               |
 | `pointer_click`   | Press and release a pointer button (defaults to left click)           |
 | `take_screenshot` | Capture a PNG via the keepalive ScreenCast stream and return its path |
+
+Selectors use XPath 1.0 against a snapshot of the AT-SPI tree serialized to XML, with role names normalized to PascalCase (e.g. `push button` → `Button`). Example XPaths: `//Button[@name='OK']`, `//Text[@name='search']`, `//MenuItem[contains(@name, 'Mode')]`, `(//Button)[last()]`.
 
 Each session produces output under a configurable **report directory**. Screenshots are written as `{report_dir}/{session_id}/{session_id}-{n}.png` — each session gets its own subdirectory and `n` increments per `take_screenshot` call. The base `report_dir` defaults to `/tmp/waydriver` and can be overridden with the `--report-dir <PATH>` CLI flag or the `WAYDRIVER_REPORT_DIR` environment variable. Individual `start_session` calls may also pass a `report_dir` argument to override the server default for that session.
 
@@ -343,7 +383,7 @@ Two input paths are available, with different trade-offs:
 
 - **RemoteDesktop keyboard/pointer** (`press_keysym`, `pointer_button`) — events go through the full Wayland input pipeline (Mutter -> Wayland protocol -> GDK -> GTK event loop). GTK4 processes them normally and repaints. Use this for interactions that need to produce visible changes.
 
-- **AT-SPI actions** (`click_element`) — directly invoke widget signal handlers by accessible name. Accurate and name-based, but they update GTK4's internal model without triggering compositor redraws. Useful for reading the accessibility tree and programmatic activation, but screenshots taken after AT-SPI-only interactions may show stale frames.
+- **AT-SPI actions** (`Locator::click()` / `focus()` / `set_text()`) — directly invoke widget signal handlers through the accessibility tree, targeted by XPath. Accurate and precise, but they update GTK4's internal model without triggering compositor redraws. Useful for reading the accessibility tree and programmatic activation, but screenshots taken after AT-SPI-only interactions may show stale frames.
 
 ### App isolation
 
