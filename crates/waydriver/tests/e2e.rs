@@ -239,6 +239,55 @@ async fn fixture_click_emits_stdout_event() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Element bounds round-trip: snapshot → XML → parse → `Locator::bounds`.
+/// Proves that AT-SPI's `Component::get_extents` reaches the test
+/// through the whole pipeline and that the numbers look sane for a
+/// 1024×768 virtual display.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_element_bounds_are_sane() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let bounds = session
+        .locate("//Button[@name='primary-button']")
+        .bounds()
+        .await?;
+    eprintln!("primary-button bounds: {bounds:?}");
+
+    // Positive, non-zero dimensions.
+    assert!(
+        bounds.width > 0 && bounds.height > 0,
+        "width/height should be positive, got {bounds:?}"
+    );
+    // Small-ish widget — primary-button is a short-labeled GtkButton,
+    // should fit easily within the virtual display.
+    assert!(
+        bounds.width < 1024 && bounds.height < 768,
+        "button shouldn't fill the whole viewport: {bounds:?}"
+    );
+    // Screen-relative coords fall inside the virtual monitor (with some
+    // slack for header bars / decorations).
+    assert!(
+        bounds.x >= 0 && bounds.x < 1024,
+        "x outside viewport: {bounds:?}"
+    );
+    assert!(
+        bounds.y >= 0 && bounds.y < 768,
+        "y outside viewport: {bounds:?}"
+    );
+
+    // Bounds should also land in the dump_tree XML as a `bbox` attribute.
+    let xml = session.dump_tree().await?;
+    assert!(
+        xml.contains("bbox=\""),
+        "tree should contain bbox attributes, got:\n{xml}"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
 /// Screenshot before/after toggling a ToggleButton — proves that locator
 /// actions produce real pixel changes in the compositor, not just AT-SPI
 /// state updates.

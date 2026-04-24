@@ -253,6 +253,24 @@ impl Locator {
         self.has_state("modal").await
     }
 
+    /// Screen-relative bounding rectangle (x, y, width, height) in logical
+    /// pixels, as captured at snapshot time from the AT-SPI Component
+    /// interface.
+    ///
+    /// Returns [`Error::Atspi`] if the element doesn't implement Component
+    /// or hasn't been laid out yet (`get_extents` returned a zero-area
+    /// rect). Callers that want to tolerate missing bounds should use
+    /// [`Locator::inspect_all`] and read `ElementInfo::bounds` directly.
+    pub async fn bounds(&self) -> Result<crate::atspi::Rect> {
+        let info = self.wait_for_existing().await?;
+        info.bounds.ok_or_else(|| {
+            Error::Atspi(format!(
+                "no bounds available for {} — element doesn't implement Component or isn't laid out",
+                self.xpath
+            ))
+        })
+    }
+
     /// Text contents of the matched element via the AT-SPI Text interface.
     /// Unlike other metadata, text isn't captured in the snapshot — each
     /// call makes a live read through the Text proxy after auto-waiting for

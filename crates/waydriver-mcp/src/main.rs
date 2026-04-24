@@ -500,6 +500,14 @@ fn render_matches(xpath: &str, matches: &[ElementInfo]) -> serde_json::Value {
             if let Some(raw) = &m.role_raw {
                 obj["role_raw"] = serde_json::Value::String(raw.clone());
             }
+            if let Some(b) = m.bounds {
+                obj["bounds"] = serde_json::json!({
+                    "x": b.x,
+                    "y": b.y,
+                    "width": b.width,
+                    "height": b.height,
+                });
+            }
             obj
         })
         .collect();
@@ -2095,6 +2103,7 @@ mod tests {
             name: name.map(str::to_string),
             attributes: std::collections::HashMap::new(),
             states: Vec::new(),
+            bounds: None,
         }
     }
 
@@ -2156,6 +2165,36 @@ mod tests {
         assert!(
             entry.get("role_raw").is_none(),
             "role_raw should not be present on normal roles: {entry}"
+        );
+    }
+
+    #[test]
+    fn render_matches_includes_bounds_when_present() {
+        let mut m = info("PushButton", Some("OK"));
+        m.bounds = Some(waydriver::Rect {
+            x: 12,
+            y: 34,
+            width: 100,
+            height: 28,
+        });
+        let arr = render_matches("//PushButton", &[m]);
+        let entry = &arr.as_array().unwrap()[0];
+        assert_eq!(entry["bounds"]["x"], 12);
+        assert_eq!(entry["bounds"]["y"], 34);
+        assert_eq!(entry["bounds"]["width"], 100);
+        assert_eq!(entry["bounds"]["height"], 28);
+    }
+
+    #[test]
+    fn render_matches_omits_bounds_when_absent() {
+        // Elements without Component (or not laid out) shouldn't surface
+        // a misleading "bounds": null — just omit the key entirely.
+        let m = info("PushButton", Some("OK"));
+        let arr = render_matches("//PushButton", &[m]);
+        let entry = &arr.as_array().unwrap()[0];
+        assert!(
+            entry.get("bounds").is_none(),
+            "bounds should be absent when element has none: {entry}"
         );
     }
 

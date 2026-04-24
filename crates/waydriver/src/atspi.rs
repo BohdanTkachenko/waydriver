@@ -6,7 +6,7 @@ use atspi::proxy::collection::CollectionProxy;
 use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::text::TextProxy;
-use atspi::{State, StateSet};
+use atspi::{CoordType, State, StateSet};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
@@ -16,6 +16,50 @@ use sxd_xpath::{Context, Factory, Value};
 use zbus::proxy::CacheProperties;
 
 use crate::error::{Error, Result};
+
+/// Screen-relative rectangle for an accessibility element, in logical
+/// pixels. All four fields are i32 to match AT-SPI's native types (which
+/// permit negative coordinates, e.g. when an element is scrolled off the
+/// top of the viewport).
+///
+/// Produced by [`extents_on`], serialized into the snapshot XML as a
+/// `bbox="x,y,width,height"` attribute, and re-parsed into
+/// [`ElementInfo::bounds`] by [`evaluate_xpath_detailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Rect {
+    /// Format as `"x,y,width,height"` — the exact shape stored in the
+    /// snapshot's `bbox` attribute.
+    pub fn to_bbox_string(&self) -> String {
+        format!("{},{},{},{}", self.x, self.y, self.width, self.height)
+    }
+
+    /// Parse a `"x,y,width,height"` string. Returns `None` on any parse
+    /// error so callers can treat malformed bounds as "no bounds here"
+    /// rather than failing the whole XPath evaluation.
+    pub fn parse_bbox(s: &str) -> Option<Self> {
+        let mut parts = s.split(',');
+        let x = parts.next()?.parse().ok()?;
+        let y = parts.next()?.parse().ok()?;
+        let width = parts.next()?.parse().ok()?;
+        let height = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Rect {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+}
 
 // ── Proxy builders ──────────────────────────────────────────────────────────
 
@@ -283,6 +327,15 @@ fn snapshot_node<'a>(
         let name = proxy.name().await.unwrap_or_default();
         let states: StateSet = proxy.get_state().await.unwrap_or_default();
         let attrs: HashMap<String, String> = proxy.get_attributes().await.unwrap_or_default();
+        // Fetch screen-relative bounds via the Component interface. Any
+        // error — element doesn't implement Component, toolkit refused,
+        // D-Bus NoReply — maps to "no bounds available" rather than
+        // aborting the snapshot. This preserves the invariant that a
+        // snapshot always succeeds even when individual nodes misbehave.
+        let bounds = extents_on(conn, bus_name, path, CoordType::Screen)
+            .await
+            .ok()
+            .flatten();
 
         let element_name = role_to_element_name(&raw_role).unwrap_or_else(|| "Node".to_string());
 
@@ -302,6 +355,9 @@ fn snapshot_node<'a>(
             if states.contains(*state) {
                 let _ = write!(output, " {attr}=\"true\"");
             }
+        }
+        if let Some(bb) = bounds {
+            let _ = write!(output, " bbox=\"{}\"", bb.to_bbox_string());
         }
         for (key, value) in &attrs {
             if let Some(safe) = sanitize_attr_key(key) {
@@ -366,9 +422,13 @@ pub struct ElementInfo {
     pub attributes: HashMap<String, String>,
     /// Lowercase names of the AT-SPI states currently set on the element.
     pub states: Vec<String>,
+    /// Screen-relative bounds (x, y, width, height) in logical pixels,
+    /// as read from `Component::get_extents` at snapshot time. `None` when
+    /// the element doesn't implement Component or isn't laid out yet.
+    pub bounds: Option<Rect>,
 }
 
-const SNAPSHOT_BUILTINS: &[&str] = &["_ref", "name", "role"];
+const SNAPSHOT_BUILTINS: &[&str] = &["_ref", "name", "role", "bbox"];
 
 fn is_state_attr(key: &str) -> bool {
     EMITTED_STATES.iter().any(|(_, attr)| *attr == key)
@@ -475,6 +535,7 @@ pub fn evaluate_xpath_detailed(xml: &str, xpath: &str) -> Result<Vec<ElementInfo
         let role = elem.name().local_part().to_string();
         let role_raw = elem.attribute_value("role").map(|s| s.to_string());
         let name = elem.attribute_value("name").map(|s| s.to_string());
+        let bounds = elem.attribute_value("bbox").and_then(Rect::parse_bbox);
 
         let mut attributes = HashMap::new();
         let mut states = Vec::new();
@@ -499,6 +560,7 @@ pub fn evaluate_xpath_detailed(xml: &str, xpath: &str) -> Result<Vec<ElementInfo
             name,
             attributes,
             states,
+            bounds,
         });
     }
     Ok(out)
@@ -558,6 +620,42 @@ pub async fn do_action_on(
         )));
     }
     Ok(())
+}
+
+/// Read screen/window-relative bounds for the element identified by
+/// `(bus, path)` via the AT-SPI Component interface.
+///
+/// Returns `Ok(None)` when the element doesn't implement Component, when
+/// Component exists but `get_extents` reports a zero-area rect (used by
+/// some toolkits to mean "not laid out yet"), or when the D-Bus call
+/// fails in a way that shouldn't abort snapshot capture. Hard errors
+/// (connection dead) propagate as `Err`.
+pub async fn extents_on(
+    conn: &zbus::Connection,
+    bus: &str,
+    path: &str,
+    coord_type: CoordType,
+) -> zbus::Result<Option<Rect>> {
+    let component = build_component(conn, bus, path).await?;
+    match component.get_extents(coord_type).await {
+        Ok((x, y, width, height)) => {
+            if width <= 0 && height <= 0 {
+                // GTK returns (0,0,0,0) for widgets that exist in the a11y
+                // tree but haven't been realized/mapped yet. Surface that
+                // as "no bounds" rather than a nonsense rect.
+                Ok(None)
+            } else {
+                Ok(Some(Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                }))
+            }
+        }
+        Err(zbus::Error::MethodError(_, _, _)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Give keyboard focus to the element identified by `(bus, path)` via the
@@ -868,5 +966,82 @@ mod tests {
         ));
         assert!(!is_stale_error_name("org.a11y.atspi.Error.SomethingElse"));
         assert!(!is_stale_error_name(""));
+    }
+
+    // ── Rect / bbox ────────────────────────────────────────────────────────
+
+    #[test]
+    fn rect_bbox_roundtrip() {
+        let r = Rect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 30,
+        };
+        assert_eq!(r.to_bbox_string(), "10,20,100,30");
+        assert_eq!(Rect::parse_bbox("10,20,100,30"), Some(r));
+    }
+
+    #[test]
+    fn rect_bbox_handles_negative_coords() {
+        // Scrolled-off-screen elements report negative offsets.
+        let r = Rect::parse_bbox("-50,-10,200,40").unwrap();
+        assert_eq!(r.x, -50);
+        assert_eq!(r.y, -10);
+        assert_eq!(r.width, 200);
+        assert_eq!(r.height, 40);
+    }
+
+    #[test]
+    fn rect_bbox_rejects_malformed() {
+        // Missing components — treated as "no bounds" rather than a panic
+        // so a malformed snapshot attribute doesn't poison downstream callers.
+        assert_eq!(Rect::parse_bbox(""), None);
+        assert_eq!(Rect::parse_bbox("10,20,30"), None);
+        assert_eq!(Rect::parse_bbox("10,20,30,40,50"), None);
+        assert_eq!(Rect::parse_bbox("a,b,c,d"), None);
+        assert_eq!(Rect::parse_bbox("10;20;30;40"), None);
+    }
+
+    #[test]
+    fn evaluate_xpath_detailed_populates_bounds_when_bbox_present() {
+        let xml = r#"<?xml version="1.0"?>
+<Application name="app" _ref="bus|/app">
+  <Button role="button" name="ok" showing="true" bbox="12,34,100,28"
+          _ref="bus|/ok"/>
+  <Button role="button" name="no-bbox" _ref="bus|/none"/>
+</Application>"#;
+        let matches = evaluate_xpath_detailed(xml, "//Button").unwrap();
+        assert_eq!(matches.len(), 2);
+        let ok = &matches[0];
+        assert_eq!(ok.name.as_deref(), Some("ok"));
+        assert_eq!(
+            ok.bounds,
+            Some(Rect {
+                x: 12,
+                y: 34,
+                width: 100,
+                height: 28,
+            })
+        );
+        let no_bbox = &matches[1];
+        assert!(no_bbox.bounds.is_none());
+        // bbox attribute should not leak into the generic attributes map
+        // (it's in SNAPSHOT_BUILTINS).
+        assert!(!ok.attributes.contains_key("bbox"));
+    }
+
+    #[test]
+    fn evaluate_xpath_detailed_malformed_bbox_yields_no_bounds() {
+        // Parse errors on bbox fall through to `bounds: None` without
+        // aborting the whole evaluation — a strict failure here would
+        // make one bad node poison the whole snapshot.
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="bus|/app">
+  <Button role="button" bbox="not-a-rect" _ref="bus|/b"/>
+</Application>"#;
+        let matches = evaluate_xpath_detailed(xml, "//Button").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].bounds.is_none());
     }
 }
