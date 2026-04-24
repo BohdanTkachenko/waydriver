@@ -254,8 +254,8 @@ impl Locator {
     /// expose Component on all widgets — you may see
     /// `Error::Atspi("NotSupported")` from `grab_focus` even when the
     /// widget is visibly focusable on screen. When that happens the
-    /// fallback is to drive focus via keyboard navigation (Tab / Shift+Tab)
-    /// or, once [`WAY-9` pointer actions](crate) land, a pointer click.
+    /// fallback is to drive focus via keyboard navigation (Tab /
+    /// Shift+Tab) or synthesize a pointer click.
     pub async fn focus(&self) -> Result<()> {
         let info = self.wait_for_focusable().await?;
         let (bus, path) = info.ref_;
@@ -662,6 +662,12 @@ mod tests {
     #[async_trait]
     impl InputBackend for StubInput {
         async fn press_keysym(&self, _keysym: u32) -> WdResult<()> {
+            Ok(())
+        }
+        async fn key_down(&self, _keysym: u32) -> WdResult<()> {
+            Ok(())
+        }
+        async fn key_up(&self, _keysym: u32) -> WdResult<()> {
             Ok(())
         }
         async fn pointer_motion_relative(&self, _dx: f64, _dy: f64) -> WdResult<()> {

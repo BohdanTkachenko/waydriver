@@ -16,7 +16,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 use serde::Deserialize;
 
 use waydriver::atspi::ElementInfo;
-use waydriver::keysym::{char_to_keysym, key_name_to_keysym};
+use waydriver::keysym::{char_to_keysym, parse_chord};
 use waydriver::{CompositorRuntime, Session, SessionConfig};
 use waydriver_capture_mutter::MutterCapture;
 use waydriver_compositor_mutter::MutterCompositor;
@@ -1046,7 +1046,12 @@ impl UiTestServer {
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
-    #[tool(description = "Press a keyboard key (e.g. 'Return', 'Tab', 'a')")]
+    #[tool(
+        description = "Press a keyboard key or chord. Accepts either a single-key name \
+                       ('Return', 'Tab', 'a') or a modifier combo ('Ctrl+A', 'Shift+Tab', \
+                       'Ctrl+Shift+Alt+F1'). Modifier aliases: Ctrl=Control, Super=Meta=Win=Cmd. \
+                       Separator can be '+' or '-'. Case-insensitive."
+    )]
     async fn press_key(
         &self,
         Parameters(params): Parameters<PressKeyParams>,
@@ -1062,10 +1067,13 @@ impl UiTestServer {
             Internal(String),
         }
         let outcome: Result<String, PressErr> = async {
-            let keysym = key_name_to_keysym(&params.key)
-                .ok_or_else(|| PressErr::Unknown(format!("unknown key: {}", params.key)))?;
+            // Validate the chord string up front so an unparseable input
+            // surfaces as InvalidParams, not a generic internal error.
+            if parse_chord(&params.key).is_none() {
+                return Err(PressErr::Unknown(format!("unknown key: {}", params.key)));
+            }
             session
-                .press_keysym(keysym)
+                .press_chord(&params.key)
                 .await
                 .map_err(|e| PressErr::Internal(e.to_string()))?;
             Ok(format!("Pressed '{}'", params.key))
@@ -1364,6 +1372,12 @@ mod tests {
     #[async_trait]
     impl InputBackend for MockInput {
         async fn press_keysym(&self, _keysym: u32) -> waydriver::error::Result<()> {
+            Ok(())
+        }
+        async fn key_down(&self, _keysym: u32) -> waydriver::error::Result<()> {
+            Ok(())
+        }
+        async fn key_up(&self, _keysym: u32) -> waydriver::error::Result<()> {
             Ok(())
         }
         async fn pointer_motion_relative(

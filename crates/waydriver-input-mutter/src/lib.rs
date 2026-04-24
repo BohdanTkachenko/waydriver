@@ -26,6 +26,18 @@ impl MutterInput {
 #[async_trait]
 impl InputBackend for MutterInput {
     async fn press_keysym(&self, keysym: u32) -> Result<()> {
+        self.key_down(keysym).await?;
+        // Mutter's RemoteDesktop needs a short gap between press and
+        // release or the app sees a 0ms keystroke that some handlers drop.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        self.key_up(keysym).await?;
+        // Tail delay so back-to-back calls from a test loop don't stack up
+        // faster than GTK can process them.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        Ok(())
+    }
+
+    async fn key_down(&self, keysym: u32) -> Result<()> {
         self.state
             .conn
             .call_method(
@@ -37,7 +49,10 @@ impl InputBackend for MutterInput {
             )
             .await
             .map_err(|e| Error::Process(format!("NotifyKeyboardKeysym press: {e}")))?;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        Ok(())
+    }
+
+    async fn key_up(&self, keysym: u32) -> Result<()> {
         self.state
             .conn
             .call_method(
@@ -49,7 +64,6 @@ impl InputBackend for MutterInput {
             )
             .await
             .map_err(|e| Error::Process(format!("NotifyKeyboardKeysym release: {e}")))?;
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         Ok(())
     }
 

@@ -38,8 +38,20 @@ pub trait CompositorRuntime: Send + Sync {
 #[async_trait]
 pub trait InputBackend: Send + Sync {
     /// Press and release a single X11 keysym. Implementations handle any
-    /// inter-event timing required by the transport.
+    /// inter-event timing required by the transport. Equivalent to
+    /// [`key_down`](Self::key_down) immediately followed by
+    /// [`key_up`](Self::key_up).
     async fn press_keysym(&self, keysym: u32) -> Result<()>;
+
+    /// Press a key and hold it down until a corresponding
+    /// [`key_up`](Self::key_up) fires. Used to build modifier combos — hold
+    /// `Ctrl` down across a target keystroke and release it afterward.
+    async fn key_down(&self, keysym: u32) -> Result<()>;
+
+    /// Release a key that was previously pressed with
+    /// [`key_down`](Self::key_down). Safe to call on a key that isn't held
+    /// (behavior is implementation-defined, but must not panic).
+    async fn key_up(&self, keysym: u32) -> Result<()>;
 
     /// Move the pointer by a relative offset in logical pixels.
     async fn pointer_motion_relative(&self, dx: f64, dy: f64) -> Result<()>;

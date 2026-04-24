@@ -194,6 +194,33 @@ impl Session {
         self.input.press_keysym(keysym).await
     }
 
+    /// Press a chord like `"Ctrl+Shift+A"` — modifiers are held in order,
+    /// the target key is pressed and released, then modifiers are released
+    /// in reverse order.
+    ///
+    /// Accepts single key names (`"Return"`, `"a"`) as chords with no
+    /// modifiers. See [`crate::keysym::parse_chord`] for the full grammar.
+    /// Returns an error if the chord can't be parsed.
+    pub async fn press_chord(&self, chord: &str) -> Result<()> {
+        let parsed = crate::keysym::parse_chord(chord)
+            .ok_or_else(|| Error::Process(format!("invalid chord: {chord:?}")))?;
+        // Press all modifiers in order.
+        for m in &parsed.modifiers {
+            self.input.key_down(*m).await?;
+        }
+        // Press + release the target key while modifiers are held.
+        let target_result = self.input.press_keysym(parsed.key).await;
+        // Release modifiers in reverse order, even if the target press
+        // failed — leaving modifiers stuck down would break subsequent
+        // keyboard input.
+        for m in parsed.modifiers.iter().rev() {
+            if let Err(e) = self.input.key_up(*m).await {
+                tracing::warn!(error = %e, keysym = m, "key_up failed during chord unwind");
+            }
+        }
+        target_result
+    }
+
     /// Move the pointer by a relative offset in logical pixels.
     pub async fn pointer_motion_relative(&self, dx: f64, dy: f64) -> Result<()> {
         self.input.pointer_motion_relative(dx, dy).await
@@ -691,6 +718,12 @@ mod tests {
             async fn press_keysym(&self, _: u32) -> Result<()> {
                 Ok(())
             }
+            async fn key_down(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn key_up(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
             async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
                 Ok(())
             }
@@ -724,5 +757,179 @@ mod tests {
         // set_default_timeout persists.
         s.set_default_timeout(Duration::from_millis(1234));
         assert_eq!(s.default_timeout(), Duration::from_millis(1234));
+    }
+
+    #[tokio::test]
+    async fn press_chord_issues_modifiers_then_target_then_releases_in_reverse() {
+        use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
+        use async_trait::async_trait;
+        use std::path::{Path, PathBuf};
+        use std::sync::Mutex;
+
+        /// What an InputBackend call was — used to assert dispatch order.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Event {
+            Down(u32),
+            Up(u32),
+            Press(u32),
+        }
+
+        struct RecordingInput(Arc<Mutex<Vec<Event>>>);
+        #[async_trait]
+        impl InputBackend for RecordingInput {
+            async fn press_keysym(&self, k: u32) -> Result<()> {
+                self.0.lock().unwrap().push(Event::Press(k));
+                Ok(())
+            }
+            async fn key_down(&self, k: u32) -> Result<()> {
+                self.0.lock().unwrap().push(Event::Down(k));
+                Ok(())
+            }
+            async fn key_up(&self, k: u32) -> Result<()> {
+                self.0.lock().unwrap().push(Event::Up(k));
+                Ok(())
+            }
+            async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        struct StubCompositor;
+        #[async_trait]
+        impl CompositorRuntime for StubCompositor {
+            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+                Ok(())
+            }
+            async fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn id(&self) -> &str {
+                "s"
+            }
+            fn wayland_display(&self) -> &str {
+                "d"
+            }
+            fn runtime_dir(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        struct StubCapture;
+        #[async_trait]
+        impl CaptureBackend for StubCapture {
+            async fn start_stream(&self) -> Result<PipeWireStream> {
+                unimplemented!()
+            }
+            async fn stop_stream(&self, _: PipeWireStream) -> Result<()> {
+                Ok(())
+            }
+            fn pipewire_socket(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+        let s = Session::new_for_test(
+            "t".into(),
+            "a".into(),
+            Box::new(RecordingInput(events.clone())),
+            Box::new(StubCapture),
+            Box::new(StubCompositor),
+        );
+
+        s.press_chord("Ctrl+Shift+A").await.unwrap();
+
+        let ctrl = 0xffe3_u32;
+        let shift = 0xffe1_u32;
+        let a = crate::keysym::char_to_keysym('A');
+        let recorded = events.lock().unwrap().iter().collect::<Vec<_>>().len();
+        let got: Vec<Event> = std::mem::take(&mut *events.lock().unwrap());
+        assert_eq!(recorded, 5);
+        // Expected dispatch: ctrl down, shift down, press(A), shift up, ctrl up.
+        assert_eq!(
+            got,
+            vec![
+                Event::Down(ctrl),
+                Event::Down(shift),
+                Event::Press(a),
+                Event::Up(shift),
+                Event::Up(ctrl),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn press_chord_rejects_garbage() {
+        use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
+        use async_trait::async_trait;
+        use std::path::{Path, PathBuf};
+
+        struct StubCompositor;
+        #[async_trait]
+        impl CompositorRuntime for StubCompositor {
+            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+                Ok(())
+            }
+            async fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn id(&self) -> &str {
+                "s"
+            }
+            fn wayland_display(&self) -> &str {
+                "d"
+            }
+            fn runtime_dir(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        struct StubInput;
+        #[async_trait]
+        impl InputBackend for StubInput {
+            async fn press_keysym(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn key_down(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn key_up(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+        }
+        struct StubCapture;
+        #[async_trait]
+        impl CaptureBackend for StubCapture {
+            async fn start_stream(&self) -> Result<PipeWireStream> {
+                unimplemented!()
+            }
+            async fn stop_stream(&self, _: PipeWireStream) -> Result<()> {
+                Ok(())
+            }
+            fn pipewire_socket(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+        }
+
+        let s = Session::new_for_test(
+            "t".into(),
+            "a".into(),
+            Box::new(StubInput),
+            Box::new(StubCapture),
+            Box::new(StubCompositor),
+        );
+
+        let err = s.press_chord("Hyper+Nope").await.unwrap_err();
+        assert!(
+            matches!(err, Error::Process(ref m) if m.contains("invalid chord")),
+            "expected process:invalid chord, got {err:?}"
+        );
     }
 }

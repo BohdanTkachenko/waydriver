@@ -190,6 +190,66 @@ async fn accessibility_tree_inspection() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
+async fn keyboard_chord_dispatches_modifiers() -> anyhow::Result<()> {
+    // Exercises Session::press_chord end-to-end. We commit an
+    // expression two different ways — via single-key chord calls ("2", "+",
+    // "3", "=") and via a modifier chord ("Ctrl+A", though its effect on
+    // calc's entry isn't what we assert on). The meaningful assertion is
+    // the "2+3" expression landing in the history list, which proves the
+    // chord dispatch path delivers single-key presses correctly.
+    //
+    // Deeper verification of the Ctrl+A select-all behavior is covered by
+    // the unit test `press_chord_issues_modifiers_then_target_then_releases_in_reverse`
+    // in the session module — we can't reliably assert select-all behavior
+    // via AT-SPI in gnome-calculator 49 because its editable TextBox
+    // doesn't expose current input through the Text interface.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init()
+        .ok();
+
+    let (session, _state) = start_calculator_session().await?;
+
+    // Single-key chords dispatch through the same path as multi-key ones —
+    // if these work, modifier routing works too (modifiers go through the
+    // extra key_down/key_up primitives which the unit tests cover).
+    for token in ["2", "+", "3", "="] {
+        session.press_chord(token).await?;
+    }
+
+    // History's last row should be the computation we just committed.
+    session
+        .locate("//ListItem//Label[1]")
+        .wait_for_text(|t| t == "2+3")
+        .await?;
+    session
+        .locate("//ListItem//Label[last()]")
+        .wait_for_text(|t| t == "5")
+        .await?;
+
+    // Also exercise a modifier chord — we can't assert its effect visibly,
+    // but we can assert it doesn't panic or stuck a modifier. If Ctrl got
+    // stuck, subsequent digit entries would be misinterpreted and the next
+    // calculation would break.
+    session.press_chord("Ctrl+A").await?;
+    session.press_chord("BackSpace").await?;
+    for token in ["7", "+", "1", "="] {
+        session.press_chord(token).await?;
+    }
+    // The most recent row's expression should now be "7+1". If Ctrl stayed
+    // down (or Ctrl+A+BackSpace left random state), we'd see a different
+    // expression or no new row at all.
+    session
+        .locate("//ListItem[last()]//Label[1]")
+        .wait_for_text(|t| t == "7+1")
+        .await?;
+
+    kill(session).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
 async fn menu_interaction_auto_waits() -> anyhow::Result<()> {
     // Exercises the auto-wait machinery end-to-end against gnome-calculator:
     //
@@ -255,9 +315,9 @@ async fn menu_interaction_auto_waits() -> anyhow::Result<()> {
         .wait_for_visible()
         .await?;
 
-    // And the wrapping Button now reports expanded=true. Once WAY-8 lands
-    // we'd use `is_expanded()`; today we assert via an XPath predicate that
-    // requires the state attribute.
+    // And the wrapping Button now reports expanded=true. We assert via an
+    // XPath predicate on the state attribute; once an `is_expanded()`
+    // state predicate lands, the equivalent check becomes a direct call.
     session
         .locate("//Button[@name='Main Menu' and @expanded='true']")
         .wait_for_visible()
