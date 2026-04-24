@@ -837,3 +837,90 @@ async fn fixture_select_option_errors_on_non_selection_widget() -> anyhow::Resul
     kill(session).await?;
     Ok(())
 }
+
+/// `Locator::hover`, `double_click`, and `right_click` against the fixture's
+/// pointer-targets row. Each widget emits a distinct stdout event when the
+/// matching pointer gesture lands on it, so tests can assert the element-
+/// scoped method actually routed a real pointer event to the target rather
+/// than just completing its D-Bus calls successfully.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_locator_pointer_actions() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Hover → pointer-enter.
+    let cursor = session.stdout_cursor();
+    session.locate("//*[@name='hover-target']").hover().await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("pointer-enter hover-target"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // Right-click → right-click event on the ctx-target. Move the
+    // pointer away from the hover-target first so the previous event
+    // controller doesn't fire `pointer-leave` in the middle of the
+    // right-click dispatch and confuse the stdout cursor.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//*[@name='ctx-target']")
+        .right_click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("right-click ctx-target"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // Double-click → exactly one `double-click` event. GestureClick with
+    // n_press == 2 only fires on the second press of a real double-click,
+    // so a single emission proves the two pointer_button calls landed
+    // inside the system double-click window.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//*[@name='dc-target']")
+        .double_click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("double-click dc-target"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// `Locator::drag_to` against the DnD section. Holding the primary button
+/// across intermediate pointer moves should drive GTK4's DnD machinery
+/// end-to-end: `drag-started` on the source, `drag-entered` on the target,
+/// `dropped` on release.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_locator_drag_to_drops_payload() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("dnd").await?;
+
+    let cursor = session.stdout_cursor();
+    let source = session.locate("//*[@name='drag-source']");
+    let target = session.locate("//*[@name='drop-target']");
+    source.drag_to(&target).await?;
+
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dropped drop-target"),
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    kill(session).await?;
+    Ok(())
+}

@@ -96,6 +96,40 @@ pub struct FocusParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HoverParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one element at hover time.
+    pub xpath: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DoubleClickParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one element.
+    pub xpath: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RightClickParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one element.
+    pub xpath: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DragToParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector for the drag source; must resolve to exactly one element.
+    pub source_xpath: String,
+    /// XPath selector for the drop target; must resolve to exactly one element.
+    pub target_xpath: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetTextParams {
     /// Session ID
     pub session_id: String,
@@ -972,6 +1006,161 @@ impl UiTestServer {
     }
 
     #[tool(
+        description = "Move the pointer to the centre of the element selected by XPath without \
+                       clicking. Use to reveal hover-only UI like tooltips or slide-out menus."
+    )]
+    async fn hover(
+        &self,
+        Parameters(params): Parameters<HoverParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let xpath = params.xpath.clone();
+        let outcome: Result<String, String> = match managed.session.locate(&xpath).hover().await {
+            Ok(()) => Ok(format!("Hovered {xpath}")),
+            Err(e) => Err(e.to_string()),
+        };
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "hover",
+                serde_json::json!({ "xpath": params.xpath }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(hover) failed");
+        }
+
+        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
+        description = "Double-click the element selected by XPath with the primary mouse button. \
+                       Synthesizes two rapid pointer clicks at the element's centre so toolkits \
+                       see a real double-click (unlike `click`, which routes through AT-SPI)."
+    )]
+    async fn double_click(
+        &self,
+        Parameters(params): Parameters<DoubleClickParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let xpath = params.xpath.clone();
+        let outcome: Result<String, String> =
+            match managed.session.locate(&xpath).double_click().await {
+                Ok(()) => Ok(format!("Double-clicked {xpath}")),
+                Err(e) => Err(e.to_string()),
+            };
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "double_click",
+                serde_json::json!({ "xpath": params.xpath }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(double_click) failed");
+        }
+
+        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
+        description = "Right-click the element selected by XPath, typically opening the widget's \
+                       context menu."
+    )]
+    async fn right_click(
+        &self,
+        Parameters(params): Parameters<RightClickParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let xpath = params.xpath.clone();
+        let outcome: Result<String, String> =
+            match managed.session.locate(&xpath).right_click().await {
+                Ok(()) => Ok(format!("Right-clicked {xpath}")),
+                Err(e) => Err(e.to_string()),
+            };
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "right_click",
+                serde_json::json!({ "xpath": params.xpath }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(right_click) failed");
+        }
+
+        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
+        description = "Drag the element selected by `source_xpath` onto the element selected by \
+                       `target_xpath` with the primary mouse button held. Both selectors must \
+                       resolve to exactly one element."
+    )]
+    async fn drag_to(
+        &self,
+        Parameters(params): Parameters<DragToParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let source = managed.session.locate(&params.source_xpath);
+        let target = managed.session.locate(&params.target_xpath);
+        let outcome: Result<String, String> = match source.drag_to(&target).await {
+            Ok(()) => Ok(format!(
+                "Dragged {} to {}",
+                params.source_xpath, params.target_xpath
+            )),
+            Err(e) => Err(e.to_string()),
+        };
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "drag_to",
+                serde_json::json!({
+                    "source_xpath": params.source_xpath,
+                    "target_xpath": params.target_xpath,
+                }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(drag_to) failed");
+        }
+
+        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
         description = "Replace the editable-text contents of an element selected by XPath. \
                        Target must implement the EditableText AT-SPI interface."
     )]
@@ -1545,8 +1734,11 @@ mod tests {
         async fn pointer_motion_absolute(&self, _x: f64, _y: f64) -> waydriver::error::Result<()> {
             Ok(())
         }
-        async fn pointer_button(&self, button: u32) -> waydriver::error::Result<()> {
+        async fn pointer_button_down(&self, button: u32) -> waydriver::error::Result<()> {
             *self.last_button.lock().unwrap() = Some(button);
+            Ok(())
+        }
+        async fn pointer_button_up(&self, _button: u32) -> waydriver::error::Result<()> {
             Ok(())
         }
         async fn pointer_axis_discrete(

@@ -57,6 +57,25 @@ const INITIAL_POLL_DELAY: Duration = Duration::from_millis(50);
 /// accumulating too much wait between attempts.
 const MAX_POLL_DELAY: Duration = Duration::from_millis(500);
 
+/// Linux evdev primary mouse button. See
+/// <https://www.kernel.org/doc/Documentation/input/event-codes.txt>.
+const BTN_LEFT: u32 = 0x110;
+/// Linux evdev secondary (right) mouse button.
+const BTN_RIGHT: u32 = 0x111;
+
+/// Gap between the two clicks of [`Locator::double_click`]. Short enough
+/// to land inside the typical 400 ms system double-click window, long
+/// enough that most toolkits register two separate button events.
+const DOUBLE_CLICK_GAP: Duration = Duration::from_millis(40);
+
+/// Number of intermediate pointer-move waypoints between the source and
+/// target during [`Locator::drag_to`]. Some toolkits only start their
+/// DnD machinery after the pointer has moved several pixels with the
+/// button held — one synthetic "teleport" to the target often isn't
+/// enough. Three linearly-interpolated steps crosses that threshold on
+/// GTK4 without adding noticeable latency.
+const DRAG_INTERMEDIATE_STEPS: u32 = 3;
+
 /// How [`Locator::select_option`] identifies the option to pick.
 ///
 /// Playwright's `selectOption` accepts any of a label, a value, or an
@@ -75,7 +94,6 @@ pub enum SelectBy<'a> {
     /// container's a11y-tree child order.
     Index(usize),
 }
-
 /// How [`Locator::fill`] clears existing content before typing.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillMode {
@@ -657,6 +675,99 @@ impl Locator {
              likely ignored synthesized axis events",
             self.xpath
         )))
+    }
+
+    // ── Element-scoped pointer actions ─────────────────────────────────────
+
+    /// Move the pointer to the centre of the matched element without
+    /// clicking. Useful for revealing hover states like tooltips and
+    /// slide-out menus.
+    ///
+    /// Auto-waits for the element to be resolvable, showing, and enabled.
+    /// Does **not** call [`scroll_into_view`](Self::scroll_into_view) —
+    /// invoke it explicitly if the element may be off-screen.
+    pub async fn hover(&self) -> Result<()> {
+        let (x, y) = self.wait_and_center().await?;
+        self.session.pointer_motion_absolute(x, y).await
+    }
+
+    /// Double-click the matched element at its centre with the primary
+    /// mouse button.
+    ///
+    /// Differs from calling [`click`](Self::click) twice: `click` routes
+    /// through the AT-SPI `Action` interface and never synthesizes
+    /// pointer events, so toolkits don't see a *double-click* — they see
+    /// two independent activations. This method synthesizes real pointer
+    /// events at the element's centre, with the two clicks spaced inside
+    /// the system double-click window (see [`DOUBLE_CLICK_GAP`]).
+    ///
+    /// Auto-waits for the element to be resolvable, showing, and enabled.
+    pub async fn double_click(&self) -> Result<()> {
+        let (x, y) = self.wait_and_center().await?;
+        self.session.pointer_motion_absolute(x, y).await?;
+        self.session.pointer_button(BTN_LEFT).await?;
+        tokio::time::sleep(DOUBLE_CLICK_GAP).await;
+        self.session.pointer_button(BTN_LEFT).await
+    }
+
+    /// Right-click the matched element at its centre, typically opening
+    /// the widget's context menu.
+    ///
+    /// Auto-waits for the element to be resolvable, showing, and enabled.
+    pub async fn right_click(&self) -> Result<()> {
+        let (x, y) = self.wait_and_center().await?;
+        self.session.pointer_motion_absolute(x, y).await?;
+        self.session.pointer_button(BTN_RIGHT).await
+    }
+
+    /// Drag from the centre of this element to the centre of `target`
+    /// with the primary mouse button held down.
+    ///
+    /// The gesture moves in small linear steps (see
+    /// [`DRAG_INTERMEDIATE_STEPS`]) so toolkits that only start their DnD
+    /// machinery after a few pixels of movement — GTK4 in particular —
+    /// reliably pick it up.
+    ///
+    /// Auto-waits for *both* endpoints to be resolvable, showing, and
+    /// enabled before any button is pressed. If any pointer motion fails
+    /// mid-drag, the button is released before the error propagates so
+    /// subsequent calls don't inherit a stuck button.
+    pub async fn drag_to(&self, target: &Locator) -> Result<()> {
+        let (sx, sy) = self.wait_and_center().await?;
+        let (tx, ty) = target.wait_and_center().await?;
+
+        self.session.pointer_motion_absolute(sx, sy).await?;
+        self.session.pointer_button_down(BTN_LEFT).await?;
+
+        // Move in small increments so DnD start thresholds fire. On any
+        // error, release the button before bubbling up so the next call
+        // doesn't inherit a stuck mouse state.
+        let result = async {
+            for i in 1..=DRAG_INTERMEDIATE_STEPS {
+                let t = i as f64 / DRAG_INTERMEDIATE_STEPS as f64;
+                let x = sx + (tx - sx) * t;
+                let y = sy + (ty - sy) * t;
+                self.session.pointer_motion_absolute(x, y).await?;
+            }
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        let up = self.session.pointer_button_up(BTN_LEFT).await;
+        result.and(up)
+    }
+
+    /// Auto-wait for actionability and return the element's bounds centre
+    /// in logical pixels, ready to feed into `pointer_motion_absolute`.
+    async fn wait_and_center(&self) -> Result<(f64, f64)> {
+        let info = self.wait_for_actionable().await?;
+        let bounds = info.bounds.ok_or_else(|| {
+            Error::Atspi(format!(
+                "no bounds for {} — pointer actions need Component extents",
+                self.xpath
+            ))
+        })?;
+        Ok((bounds.center_x() as f64, bounds.center_y() as f64))
     }
 
     /// Find the closest scrollable ancestor of the element this locator
@@ -1285,7 +1396,10 @@ mod tests {
         async fn pointer_motion_absolute(&self, _x: f64, _y: f64) -> WdResult<()> {
             Ok(())
         }
-        async fn pointer_button(&self, _button: u32) -> WdResult<()> {
+        async fn pointer_button_down(&self, _button: u32) -> WdResult<()> {
+            Ok(())
+        }
+        async fn pointer_button_up(&self, _button: u32) -> WdResult<()> {
             Ok(())
         }
         async fn pointer_axis_discrete(&self, _axis: u32, _steps: i32) -> WdResult<()> {

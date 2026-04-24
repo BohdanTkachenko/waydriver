@@ -63,9 +63,30 @@ pub trait InputBackend: Send + Sync {
     /// should return `Err`.
     async fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<()>;
 
+    /// Press a pointer button and hold it down until a corresponding
+    /// [`pointer_button_up`](Self::pointer_button_up) fires. `button` uses
+    /// Linux evdev codes (e.g. `BTN_LEFT` = 0x110). Used to build drag
+    /// gestures — press, move the pointer across intermediate coordinates,
+    /// then release.
+    async fn pointer_button_down(&self, button: u32) -> Result<()>;
+
+    /// Release a pointer button that was previously pressed with
+    /// [`pointer_button_down`](Self::pointer_button_down). Safe to call on
+    /// a button that isn't held (behavior is implementation-defined, but
+    /// must not panic).
+    async fn pointer_button_up(&self, button: u32) -> Result<()>;
+
     /// Press and release a pointer button. `button` uses Linux evdev codes
-    /// (e.g. `BTN_LEFT` = 0x110).
-    async fn pointer_button(&self, button: u32) -> Result<()>;
+    /// (e.g. `BTN_LEFT` = 0x110). Default impl composes
+    /// [`pointer_button_down`](Self::pointer_button_down) and
+    /// [`pointer_button_up`](Self::pointer_button_up) with a short gap so
+    /// the compositor distinguishes press from release; backends with a
+    /// more efficient combined path can override.
+    async fn pointer_button(&self, button: u32) -> Result<()> {
+        self.pointer_button_down(button).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        self.pointer_button_up(button).await
+    }
 
     /// Emit a discrete pointer-axis (wheel) event. `axis` selects the
     /// direction — `0` is vertical, `1` is horizontal — matching the

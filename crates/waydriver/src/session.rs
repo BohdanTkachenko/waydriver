@@ -281,6 +281,19 @@ impl Session {
         self.input.pointer_button(button).await
     }
 
+    /// Hold a pointer button down until a matching [`pointer_button_up`](Self::pointer_button_up)
+    /// fires. Used to build drag gestures — press, move across intermediate
+    /// coordinates, then release.
+    pub async fn pointer_button_down(&self, button: u32) -> Result<()> {
+        self.input.pointer_button_down(button).await
+    }
+
+    /// Release a pointer button previously pressed with
+    /// [`pointer_button_down`](Self::pointer_button_down).
+    pub async fn pointer_button_up(&self, button: u32) -> Result<()> {
+        self.input.pointer_button_up(button).await
+    }
+
     /// Type a string as keyboard input, one X11 keysym per `char`. Latin-1
     /// characters map directly; other Unicode uses the `0x01000000 + codepoint`
     /// encoding (see [`crate::keysym::char_to_keysym`]). Does not manage
@@ -892,7 +905,10 @@ mod tests {
             async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button(&self, _: u32) -> Result<()> {
+            async fn pointer_button_down(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_up(&self, _: u32) -> Result<()> {
                 Ok(())
             }
             async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
@@ -963,7 +979,10 @@ mod tests {
             async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button(&self, _: u32) -> Result<()> {
+            async fn pointer_button_down(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_up(&self, _: u32) -> Result<()> {
                 Ok(())
             }
             async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
@@ -1077,7 +1096,10 @@ mod tests {
             async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button(&self, _: u32) -> Result<()> {
+            async fn pointer_button_down(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_up(&self, _: u32) -> Result<()> {
                 Ok(())
             }
             async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
@@ -1158,7 +1180,10 @@ mod tests {
             async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button(&self, _: u32) -> Result<()> {
+            async fn pointer_button_down(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_up(&self, _: u32) -> Result<()> {
                 Ok(())
             }
             async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {

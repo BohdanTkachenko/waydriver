@@ -108,7 +108,7 @@ impl InputBackend for MutterInput {
         Ok(())
     }
 
-    async fn pointer_button(&self, button: u32) -> Result<()> {
+    async fn pointer_button_down(&self, button: u32) -> Result<()> {
         let button: i32 = button
             .try_into()
             .map_err(|_| Error::Process(format!("button code {button} exceeds i32::MAX")))?;
@@ -123,7 +123,13 @@ impl InputBackend for MutterInput {
             )
             .await
             .map_err(|e| Error::Process(format!("NotifyPointerButton press: {e}")))?;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        Ok(())
+    }
+
+    async fn pointer_button_up(&self, button: u32) -> Result<()> {
+        let button: i32 = button
+            .try_into()
+            .map_err(|_| Error::Process(format!("button code {button} exceeds i32::MAX")))?;
         self.state
             .conn
             .call_method(

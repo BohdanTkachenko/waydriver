@@ -65,8 +65,8 @@
 use adw::prelude::*;
 use gtk4::{
     gdk, gio, glib, Box as GtkBox, Button, CheckButton, ComboBoxText, DragSource, DropDown,
-    DropTarget, Entry, Label, ListBox, ListBoxRow, MenuButton, Orientation, PopoverMenu,
-    ScrolledWindow, StringList, TextView, ToggleButton,
+    DropTarget, Entry, EventControllerMotion, GestureClick, Label, ListBox, ListBoxRow, MenuButton,
+    Orientation, PopoverMenu, ScrolledWindow, StringList, TextView, ToggleButton,
 };
 use libadwaita as adw;
 use std::cell::RefCell;
@@ -220,7 +220,77 @@ fn append_gtk4_widgets(col: &GtkBox, parent: &adw::ApplicationWindow) {
     col.append(&build_list_section());
     col.append(&build_notes_area());
     col.append(&build_scroll_area());
+    col.append(&build_pointer_targets_row());
     col.append(&build_dialog_row(parent));
+}
+
+/// Row of three widgets that exercise the element-scoped pointer methods:
+/// `hover-target` (emits `pointer-enter`), `dc-target` (emits `double-click`
+/// on `n_press == 2` with the primary button), and `ctx-target` (emits
+/// `right-click` when clicked with the secondary button).
+fn build_pointer_targets_row() -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+
+    // Hover target — a Label with a pointer-motion controller. Emits
+    // `pointer-enter hover-target` as soon as the cursor crosses into the
+    // widget, which is a stronger signal than `query-tooltip` (the latter
+    // fires only after the tooltip delay elapses, making tests flaky).
+    let hover = Label::builder()
+        .label("hover-target")
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+    hover.add_css_class("card");
+    hover.set_tooltip_text(Some("hover tooltip"));
+    name(&hover, "hover-target");
+    let motion = EventControllerMotion::new();
+    motion.connect_enter(|_, _, _| emit("pointer-enter hover-target"));
+    motion.connect_leave(|_| emit("pointer-leave hover-target"));
+    hover.add_controller(motion);
+    row.append(&hover);
+
+    // Double-click target — emits only on `n_press == 2` with the primary
+    // button. Using `GestureClick` rather than `Button::connect_clicked`
+    // so we can distinguish single vs double click and avoid emitting two
+    // separate events for a real double-click.
+    let dc = Label::builder()
+        .label("dc-target")
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+    dc.add_css_class("card");
+    name(&dc, "dc-target");
+    let dc_gesture = GestureClick::new();
+    dc_gesture.set_button(gdk::BUTTON_PRIMARY);
+    dc_gesture.connect_pressed(|_, n_press, _, _| {
+        if n_press == 2 {
+            emit("double-click dc-target");
+        }
+    });
+    dc.add_controller(dc_gesture);
+    row.append(&dc);
+
+    // Right-click target — emits on any press of the secondary button.
+    let ctx = Label::builder()
+        .label("ctx-target")
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+    ctx.add_css_class("card");
+    name(&ctx, "ctx-target");
+    let ctx_gesture = GestureClick::new();
+    ctx_gesture.set_button(gdk::BUTTON_SECONDARY);
+    ctx_gesture.connect_pressed(|_, _, _, _| emit("right-click ctx-target"));
+    ctx.add_controller(ctx_gesture);
+    row.append(&ctx);
+
+    row
 }
 
 fn build_buttons_row() -> GtkBox {
