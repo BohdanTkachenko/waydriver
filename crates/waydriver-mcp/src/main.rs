@@ -122,6 +122,23 @@ pub struct FillParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SelectOptionParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one container
+    /// implementing the AT-SPI Selection interface (combobox,
+    /// dropdown, listbox, etc.).
+    pub xpath: String,
+    /// Discriminator: `"label"` picks the child whose accessible
+    /// name matches `value`; `"index"` parses `value` as a 0-indexed
+    /// integer and passes it to `Selection::select_child` directly.
+    pub by: String,
+    /// Either the accessible name to match (when `by == "label"`) or
+    /// a decimal integer (when `by == "index"`).
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadTextParams {
     /// Session ID
     pub session_id: String,
@@ -1053,6 +1070,67 @@ impl UiTestServer {
     }
 
     #[tool(
+        description = "Pick an option in a combobox, dropdown, or other AT-SPI Selection \
+                       container. Calls Selection::select_child on the located element — much \
+                       faster and less flaky than clicking the widget open and clicking the \
+                       item. `by`: \"label\" (matches the option's accessible name) or \
+                       \"index\" (parses `value` as a 0-indexed integer). Container must \
+                       implement the Selection interface."
+    )]
+    async fn select_option(
+        &self,
+        Parameters(params): Parameters<SelectOptionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let xpath = params.xpath.clone();
+        let by = params.by.clone();
+        let value = params.value.clone();
+
+        let parsed_by: Result<waydriver::SelectBy<'_>, String> = match by.as_str() {
+            "label" => Ok(waydriver::SelectBy::Label(value.as_str())),
+            "index" => value
+                .parse::<usize>()
+                .map(waydriver::SelectBy::Index)
+                .map_err(|e| format!("invalid index {value:?}: {e}")),
+            other => Err(format!(
+                "invalid `by` {other:?}; expected \"label\" or \"index\""
+            )),
+        };
+
+        let outcome: Result<String, String> = match parsed_by {
+            Ok(selector) => match managed.session.locate(&xpath).select_option(selector).await {
+                Ok(()) => Ok(format!("Selected {by}={value:?} on {xpath}")),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e),
+        };
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "select_option",
+                serde_json::json!({
+                    "xpath": params.xpath,
+                    "by": params.by,
+                    "value": params.value,
+                }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(select_option) failed");
+        }
+
+        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
         description = "Read the text contents of an element selected by XPath. Target must \
                        implement the Text AT-SPI interface."
     )]
@@ -1601,6 +1679,21 @@ mod tests {
                 session_id: "bogus".into(),
                 xpath: "//Text".into(),
                 text: "hi".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn select_option_not_found() {
+        let s = server();
+        let err = s
+            .select_option(Parameters(SelectOptionParams {
+                session_id: "bogus".into(),
+                xpath: "//ComboBox".into(),
+                by: "label".into(),
+                value: "Small".into(),
             }))
             .await
             .unwrap_err();

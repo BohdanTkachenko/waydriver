@@ -26,7 +26,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use waydriver::{CompositorRuntime, Error, FillMode, InputBackend, Session, SessionConfig};
+use waydriver::{
+    CompositorRuntime, Error, FillMode, InputBackend, SelectBy, Session, SessionConfig,
+};
 use waydriver_capture_mutter::MutterCapture;
 use waydriver_compositor_mutter::{MutterCompositor, MutterState};
 use waydriver_input_mutter::MutterInput;
@@ -729,6 +731,108 @@ async fn fixture_locator_fill_on_entry() -> anyhow::Result<()> {
             Duration::from_secs(5),
         )
         .await?;
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// `Locator::select_option` against the GTK4 fixture's selection widgets.
+/// Each assertion reads the fixture's stdout event — ground truth that
+/// the selection model actually advanced, not just that the AT-SPI call
+/// returned OK.
+///
+/// GTK4 toolkit note: `GtkDropDown` doesn't expose the AT-SPI Selection
+/// interface on the widget (its selected index is surfaced only via the
+/// container's accessible name and a `valuetext` attribute, with the
+/// item list absent from the a11y tree until the popup opens). Selecting
+/// into a DropDown via the pure-AT-SPI path isn't possible until the
+/// toolkit fills that gap — the error-shape test below locks in the
+/// clean failure mode for now. The widgets below exercise the paths
+/// that do work today:
+///
+/// - `GtkComboBoxText` (`size-combo`) — Selection on the container; the
+///   menu items don't appear in the a11y tree with the popup closed, so
+///   `SelectBy::Label` would fail here. `Index` mode works.
+/// - `GtkListBox` (`item-list`) — rows are always in the a11y tree, so
+///   both `Label` and `Index` modes work directly.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_select_option_combos() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // GtkComboBoxText: index-based. Fixture defaults to "Medium" (index
+    // 1); pick index 0 (Small) and check the active_id in the event.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//ComboBox[@name='size-combo']")
+        .select_option(SelectBy::Index(0))
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("selected size-combo") && l.contains("active_id=\"s\""),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // GtkListBox: pick row 2 by index. No row is selected at startup.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//List[@name='item-list']")
+        .select_option(SelectBy::Index(2))
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("row-selected item-list index=2"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // GtkListBox, Label mode: rows are in the a11y tree with stable
+    // accessible names ("item-row-0", "item-row-1", ...), so label
+    // dispatch resolves cleanly. Pick "item-row-0" and verify the
+    // row-selected event reports index=0.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//List[@name='item-list']")
+        .select_option(SelectBy::Label("item-row-0"))
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("row-selected item-list index=0"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Error shape when the located element doesn't implement Selection.
+/// A plain Button doesn't — select_option should surface a helpful
+/// `Error::Atspi` rather than a cryptic D-Bus panic.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_select_option_errors_on_non_selection_widget() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let err = session
+        .locate("//Button[@name='primary-button']")
+        .select_option(SelectBy::Index(0))
+        .await
+        .unwrap_err();
+    // A Button has no Selection interface. Either a select_child call
+    // returns false (mapped to Error::Atspi), or the D-Bus proxy build
+    // fails with NotSupported (also mapped to Error::Atspi). Both are
+    // fine — the caller just needs a readable error.
+    assert!(
+        matches!(err, Error::Atspi(_) | Error::ElementStale { .. }),
+        "expected Atspi-flavored error, got {err:?}"
+    );
 
     kill(session).await?;
     Ok(())

@@ -25,5 +25,5 @@ pub mod session;
 pub use atspi::Rect;
 pub use backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
 pub use error::{Error, Result};
-pub use locator::{FillMode, Locator};
+pub use locator::{FillMode, Locator, SelectBy};
 pub use session::{Session, SessionConfig};

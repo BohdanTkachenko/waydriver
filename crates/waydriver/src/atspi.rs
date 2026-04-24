@@ -5,6 +5,7 @@ use atspi::proxy::bus::BusProxy;
 use atspi::proxy::collection::CollectionProxy;
 use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::editable_text::EditableTextProxy;
+use atspi::proxy::selection::SelectionProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::{CoordType, ScrollType, State, StateSet};
 use std::collections::HashMap;
@@ -152,6 +153,19 @@ async fn build_component<'a>(
     path: &str,
 ) -> zbus::Result<ComponentProxy<'a>> {
     ComponentProxy::builder(conn)
+        .destination(bus_name.to_owned())?
+        .path(path.to_owned())?
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+}
+
+async fn build_selection<'a>(
+    conn: &'a zbus::Connection,
+    bus_name: &str,
+    path: &str,
+) -> zbus::Result<SelectionProxy<'a>> {
+    SelectionProxy::builder(conn)
         .destination(bus_name.to_owned())?
         .path(path.to_owned())?
         .cache_properties(CacheProperties::No)
@@ -787,6 +801,39 @@ pub async fn set_text_on(
     if !ok {
         return Err(Error::Atspi(format!(
             "set_text_contents returned false on {bus}{path} — element rejected input"
+        )));
+    }
+    Ok(())
+}
+
+/// Select the child at `index` on a container that implements the AT-SPI
+/// Selection interface — the core primitive behind `Locator::select_option`.
+///
+/// Maps a `select_child` call that returns `Ok(false)` into an
+/// `Error::Atspi` with a diagnostic suggesting the most likely causes
+/// (no Selection interface on this element, or the widget rejected the
+/// request — e.g. the index is out of range for the model). MethodError
+/// from `(bus, path)` going stale between resolution and the call
+/// produces `Error::ElementStale` via [`map_action_err`].
+pub async fn select_child_on(
+    conn: &AccessibilityConnection,
+    xpath: &str,
+    bus: &str,
+    path: &str,
+    index: i32,
+) -> Result<()> {
+    let sel = build_selection(conn.connection(), bus, path)
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    let ok = sel
+        .select_child(index)
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    if !ok {
+        return Err(Error::Atspi(format!(
+            "select_child({index}) returned false on {bus}{path} — element \
+             may not implement the Selection interface or the index is out \
+             of range"
         )));
     }
     Ok(())

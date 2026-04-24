@@ -57,6 +57,25 @@ const INITIAL_POLL_DELAY: Duration = Duration::from_millis(50);
 /// accumulating too much wait between attempts.
 const MAX_POLL_DELAY: Duration = Duration::from_millis(500);
 
+/// How [`Locator::select_option`] identifies the option to pick.
+///
+/// Playwright's `selectOption` accepts any of a label, a value, or an
+/// index. AT-SPI doesn't expose per-option values separately from
+/// their accessible names (toolkits store the id internally but don't
+/// surface it on the a11y tree), so we only support the two modes that
+/// round-trip cleanly.
+#[derive(Debug, Clone, Copy)]
+pub enum SelectBy<'a> {
+    /// Select the direct child of the located element whose accessible
+    /// name matches. The match must be unique — if two siblings carry
+    /// the same name, the call returns [`Error::AmbiguousSelector`]
+    /// against a synthetic xpath so the caller can see what collided.
+    Label(&'a str),
+    /// Select the direct child at the given 0-indexed position in the
+    /// container's a11y-tree child order.
+    Index(usize),
+}
+
 /// How [`Locator::fill`] clears existing content before typing.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillMode {
@@ -396,6 +415,59 @@ impl Locator {
     /// Shorthand for `fill(text, FillMode::default())`.
     pub async fn fill_default(&self, text: &str) -> Result<()> {
         self.fill(text, FillMode::default()).await
+    }
+
+    /// Pick an option in a combobox, dropdown, or other AT-SPI Selection
+    /// container — the equivalent of Playwright's `selectOption`.
+    ///
+    /// Resolves to one container element (auto-waits for showing +
+    /// enabled), then calls `Selection::select_child(index)` on it.
+    /// Much faster and less flaky than clicking the widget open,
+    /// locating the item in the popup, and clicking it — no popup
+    /// positioning to race against.
+    ///
+    /// # Modes
+    ///
+    /// - [`SelectBy::Index`] — no tree walk; the index is passed
+    ///   through directly. Use when tests don't care about the visible
+    ///   label or when the popup's options don't appear in the
+    ///   accessibility tree until it's opened (GTK4 `DropDown` can
+    ///   behave this way in headless compositors).
+    /// - [`SelectBy::Label`] — takes a fresh snapshot, enumerates the
+    ///   container's direct a11y children in document order, and
+    ///   picks the one whose accessible name matches. Exactly one
+    ///   match is required; zero → `Error::Atspi`, more than one →
+    ///   [`Error::AmbiguousSelector`].
+    ///
+    /// # Errors
+    ///
+    /// - `Error::Atspi("select_child(..) returned false ...")` when
+    ///   the target doesn't implement the Selection interface or the
+    ///   index is out of range for its selection model.
+    /// - `Error::ElementStale` if the container went away between
+    ///   resolution and the D-Bus call.
+    /// - Auto-wait timeout if the container never becomes actionable.
+    pub async fn select_option(&self, by: SelectBy<'_>) -> Result<()> {
+        let info = self.wait_for_actionable().await?;
+        let (bus, path) = info.ref_.clone();
+        let a11y = self.a11y()?;
+
+        let index = match by {
+            SelectBy::Index(i) => i,
+            SelectBy::Label(label) => {
+                let xml = self.snapshot().await?;
+                let children_xpath = format!("({})/*", self.xpath);
+                let children = atspi_client::evaluate_xpath_detailed(&xml, &children_xpath)?;
+                child_index_for_label(&children, label, &self.xpath)?
+            }
+        };
+
+        let index_i32 = i32::try_from(index).map_err(|_| {
+            Error::Atspi(format!(
+                "select_option: index {index} too large to fit AT-SPI's i32 child index"
+            ))
+        })?;
+        atspi_client::select_child_on(a11y, &self.xpath, &bus, &path, index_i32).await
     }
 
     /// Give keyboard focus to the matched element.
@@ -950,6 +1022,35 @@ fn wheel_direction(elem: &crate::atspi::Rect, scrollable: &crate::atspi::Rect) -
 /// auto-wait and `is_enabled` accept either.
 fn is_enabled_in(states: &[String]) -> bool {
     states.iter().any(|s| s == "enabled" || s == "sensitive")
+}
+
+/// Resolve a [`SelectBy::Label`] against a container's direct a11y
+/// children. Kept free-standing so the dispatch logic can be unit-tested
+/// against synthetic snapshot XML without a live AT-SPI session.
+///
+/// Returns the 0-indexed child position matching the label, or:
+/// - `Error::Atspi` when no child's accessible name matches.
+/// - [`Error::AmbiguousSelector`] (against a synthetic `<xpath>#<label>`
+///   string) when two or more children share the same name — a rare
+///   enough case that failing loud beats silently picking the first.
+fn child_index_for_label(children: &[ElementInfo], label: &str, xpath: &str) -> Result<usize> {
+    let mut hits = children
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.name.as_deref() == Some(label));
+    let Some((first_idx, _)) = hits.next() else {
+        return Err(Error::Atspi(format!(
+            "select_option: no child with accessible name {label:?} under {xpath}"
+        )));
+    };
+    let extra = hits.count();
+    if extra > 0 {
+        return Err(Error::AmbiguousSelector {
+            xpath: format!("{xpath} options named {label:?}"),
+            count: extra + 1,
+        });
+    }
+    Ok(first_idx)
 }
 
 /// Whether a multi-match node-set contains exactly one element with the
@@ -1661,6 +1762,80 @@ mod tests {
 <Application _ref="b|/r"><CheckBox _ref="b|/c"/></Application>"#;
         let states = states_for(xml, "//CheckBox");
         assert!(!states.iter().any(|s| s == "checked"));
+    }
+
+    // ── child_index_for_label (select_option dispatch) ─────────────────────
+
+    fn children_from(xml: &str, parent_xpath: &str) -> Vec<crate::atspi::ElementInfo> {
+        let children_xpath = format!("({parent_xpath})/*");
+        evaluate_xpath_detailed(xml, &children_xpath).unwrap()
+    }
+
+    const COMBO_XML: &str = r#"<?xml version="1.0"?>
+<Application _ref="b|/r">
+  <ComboBox name="size" _ref="b|/c">
+    <MenuItem name="Small" _ref="b|/c/0"/>
+    <MenuItem name="Medium" _ref="b|/c/1"/>
+    <MenuItem name="Large" _ref="b|/c/2"/>
+  </ComboBox>
+</Application>"#;
+
+    #[test]
+    fn child_index_for_label_finds_unique_match() {
+        let children = children_from(COMBO_XML, "//ComboBox");
+        assert_eq!(
+            super::child_index_for_label(&children, "Medium", "//ComboBox").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn child_index_for_label_surfaces_absent_label() {
+        let children = children_from(COMBO_XML, "//ComboBox");
+        let err = super::child_index_for_label(&children, "Jumbo", "//ComboBox").unwrap_err();
+        match err {
+            Error::Atspi(msg) => {
+                assert!(msg.contains("Jumbo"), "error should name the label: {msg}");
+                assert!(
+                    msg.contains("//ComboBox"),
+                    "error should name the container: {msg}"
+                );
+            }
+            other => panic!("expected Atspi error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_index_for_label_flags_ambiguity() {
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r">
+  <ComboBox _ref="b|/c">
+    <MenuItem name="Red" _ref="b|/c/0"/>
+    <MenuItem name="Red" _ref="b|/c/1"/>
+  </ComboBox>
+</Application>"#;
+        let children = children_from(xml, "//ComboBox");
+        let err = super::child_index_for_label(&children, "Red", "//ComboBox").unwrap_err();
+        match err {
+            Error::AmbiguousSelector { count, xpath } => {
+                assert_eq!(count, 2);
+                assert!(
+                    xpath.contains("Red"),
+                    "synthetic xpath should include the label: {xpath}"
+                );
+            }
+            other => panic!("expected AmbiguousSelector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_index_for_label_empty_children_is_not_found() {
+        let xml = r#"<?xml version="1.0"?>
+<Application _ref="b|/r"><ComboBox _ref="b|/c"/></Application>"#;
+        let children = children_from(xml, "//ComboBox");
+        assert!(children.is_empty());
+        let err = super::child_index_for_label(&children, "anything", "//ComboBox").unwrap_err();
+        assert!(matches!(err, Error::Atspi(_)));
     }
 
     #[test]
