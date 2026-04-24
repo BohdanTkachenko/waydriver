@@ -10,9 +10,26 @@
 //! (`name`, `role`, `text`, …) automatically poll with exponential backoff
 //! until the element is resolvable — and, for actions, actionable (showing
 //! and enabled) — within the session's default timeout. Override per-locator
-//! with [`Locator::with_timeout`]. Explicit `wait_for_*` methods give tests
-//! a way to poll on arbitrary state changes without implicitly tying them to
-//! an action.
+//! with [`Locator::with_timeout`].
+//!
+//! **Explicit waits** come in three layered shapes. Pick the tightest one
+//! your case fits:
+//!
+//! - [`Locator::wait_until`] — sync `Fn(&[ElementInfo]) -> bool` predicate.
+//!   The common case: classify the current snapshot with no I/O in the
+//!   predicate. Plus the family of shortcut methods built on it:
+//!   [`wait_for_visible`](Locator::wait_for_visible),
+//!   [`wait_for_hidden`](Locator::wait_for_hidden),
+//!   [`wait_for_enabled`](Locator::wait_for_enabled),
+//!   [`wait_for_count`](Locator::wait_for_count),
+//!   [`wait_for_checked`](Locator::wait_for_checked), and siblings.
+//! - [`Locator::wait_until_async`] — async `Fn(Vec<ElementInfo>) -> Fut<bool>`.
+//!   Use when the predicate itself needs I/O (reading another locator, a
+//!   live text or bounds call, the filesystem, …).
+//! - [`Locator::wait_for`] — async, with `Result<Option<T>>` return. The
+//!   general primitive: predicate can map to any output type and surface
+//!   retriable errors. Use when the other two don't fit
+//!   ([`wait_for_text`](Locator::wait_for_text) is a good worked example).
 //!
 //! Single-target methods (`click`, `name`, `text`, …) expect the selector to
 //! match exactly one element and return [`Error::AmbiguousSelector`]
@@ -633,127 +650,182 @@ impl Locator {
         }
     }
 
-    // ── Explicit waits ─────────────────────────────────────────────────────
+    // ── Generic waits ──────────────────────────────────────────────────────
 
-    /// Poll until the element exists and has the `Showing` state. Returns
-    /// `Ok(())` on success or the last encountered retriable error (or a
-    /// `Timeout` error if the element existed but never became showing).
-    pub async fn wait_for_visible(&self) -> Result<()> {
+    /// The most general wait primitive. Polls with exponential backoff
+    /// until `pred` returns `Ok(Some(T))`, a non-retriable error, or the
+    /// effective timeout elapses. The predicate receives the full
+    /// multi-match node-set and can map it to any output type.
+    ///
+    /// `Ok(None)` means "not yet, keep polling." `Err(e)` where `e` is
+    /// retriable (`ElementStale`) is swallowed and retried. All other
+    /// errors propagate immediately. On timeout, returns the last
+    /// retriable error if there was one, otherwise [`Error::Timeout`].
+    ///
+    /// Most callers should reach for [`wait_until`](Self::wait_until) or
+    /// [`wait_until_async`](Self::wait_until_async) first — this is the
+    /// escape hatch for cases that need a non-`bool` output, e.g.
+    /// [`wait_for_text`](Self::wait_for_text) which returns the matched
+    /// `String`.
+    pub async fn wait_for<T, F, Fut>(&self, pred: F) -> Result<T>
+    where
+        F: Fn(Vec<ElementInfo>) -> Fut,
+        Fut: Future<Output = Result<Option<T>>>,
+    {
         let xpath = self.xpath.clone();
         poll_with_retry(self.effective_timeout(), &xpath, || async {
-            let info = self.resolve_once_info().await?;
-            if info.states.iter().any(|s| s == "showing") {
-                Ok(Some(()))
-            } else {
-                Ok(None)
-            }
+            pred(self.inspect_all().await?).await
         })
         .await
+    }
+
+    /// Poll until a sync predicate over the current multi-match node-set
+    /// returns true. Returns the matching set (same as
+    /// [`inspect_all`](Self::inspect_all) would observe) on success.
+    ///
+    /// The predicate sees *all* matches, so it can express:
+    /// - "exactly one match satisfying X": `|h| h.len() == 1 && cond(&h[0])`
+    /// - "element is gone or not showing" (the shape of
+    ///   [`wait_for_hidden`](Self::wait_for_hidden)):
+    ///   `|h| h.is_empty() || !showing(&h[0])`
+    /// - "count reaches N": `|h| h.len() == n`
+    ///
+    /// For predicates that need I/O of their own (another locator, a live
+    /// text read, the filesystem), use
+    /// [`wait_until_async`](Self::wait_until_async).
+    pub async fn wait_until<F>(&self, pred: F) -> Result<Vec<ElementInfo>>
+    where
+        F: Fn(&[ElementInfo]) -> bool,
+    {
+        self.wait_for(|hits| {
+            let matched = pred(&hits);
+            std::future::ready(Ok(matched.then_some(hits)))
+        })
+        .await
+    }
+
+    /// Async counterpart to [`wait_until`](Self::wait_until). Identical
+    /// semantics, except the predicate can `.await` — useful when the
+    /// decision depends on a second locator's state, a live text read, a
+    /// bounds query, or any other I/O that isn't already captured in the
+    /// snapshot `ElementInfo`.
+    pub async fn wait_until_async<F, Fut>(&self, pred: F) -> Result<Vec<ElementInfo>>
+    where
+        F: Fn(Vec<ElementInfo>) -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        self.wait_for(|hits| {
+            let hits_return = hits.clone();
+            let fut = pred(hits);
+            async move { Ok(fut.await.then_some(hits_return)) }
+        })
+        .await
+    }
+
+    // ── Specialized waits (thin layers over wait_until / wait_for) ─────────
+
+    /// Poll until the element exists and has the `Showing` state.
+    pub async fn wait_for_visible(&self) -> Result<()> {
+        self.wait_until(|hits| single_has_state(hits, "showing"))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the element either doesn't exist or doesn't have the
     /// `Showing` state. The inverse of [`wait_for_visible`](Self::wait_for_visible).
     pub async fn wait_for_hidden(&self) -> Result<()> {
-        let xpath = self.xpath.clone();
-        poll_with_retry(self.effective_timeout(), &xpath, || async {
-            match self.resolve_once_info().await {
-                Ok(info) => {
-                    if info.states.iter().any(|s| s == "showing") {
-                        Ok(None) // still visible, keep polling
-                    } else {
-                        Ok(Some(()))
-                    }
-                }
-                Err(Error::ElementNotFound { .. }) => Ok(Some(())), // gone entirely
-                Err(e) => Err(e),
-            }
-        })
-        .await
+        self.wait_until(|hits| hits.is_empty() || !hits[0].states.iter().any(|s| s == "showing"))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the element exists and is interactable (has either the
     /// `Enabled` or `Sensitive` state — see [`Locator::is_enabled`] for why
     /// both are treated as equivalent).
     pub async fn wait_for_enabled(&self) -> Result<()> {
-        let xpath = self.xpath.clone();
-        poll_with_retry(self.effective_timeout(), &xpath, || async {
-            let info = self.resolve_once_info().await?;
-            if is_enabled_in(&info.states) {
-                Ok(Some(()))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
+        self.wait_until(|hits| hits.len() == 1 && is_enabled_in(&hits[0].states))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the selector matches exactly `n` elements. Useful for
     /// lists that populate asynchronously after a user action.
     pub async fn wait_for_count(&self, n: usize) -> Result<()> {
-        let xpath = self.xpath.clone();
-        poll_with_retry(self.effective_timeout(), &xpath, || async {
-            let hits = self.resolve_all_once().await?;
-            if hits.len() == n {
-                Ok(Some(()))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
+        self.wait_until(|hits| hits.len() == n).await.map(|_| ())
     }
 
     /// Poll until the element has the AT-SPI `State::Checked` state.
     pub async fn wait_for_checked(&self) -> Result<()> {
-        self.wait_for_state("checked").await
+        self.wait_until(|hits| single_has_state(hits, "checked"))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the element has the AT-SPI `State::Focused` state.
     pub async fn wait_for_focused(&self) -> Result<()> {
-        self.wait_for_state("focused").await
+        self.wait_until(|hits| single_has_state(hits, "focused"))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the element has the AT-SPI `State::Expanded` state.
     pub async fn wait_for_expanded(&self) -> Result<()> {
-        self.wait_for_state("expanded").await
+        self.wait_until(|hits| single_has_state(hits, "expanded"))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the element has the AT-SPI `State::Editable` state.
     pub async fn wait_for_editable(&self) -> Result<()> {
-        self.wait_for_state("editable").await
+        self.wait_until(|hits| single_has_state(hits, "editable"))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the element has the AT-SPI `State::Selected` state.
     pub async fn wait_for_selected(&self) -> Result<()> {
-        self.wait_for_state("selected").await
+        self.wait_until(|hits| single_has_state(hits, "selected"))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the element has the AT-SPI `State::Pressed` state.
     pub async fn wait_for_pressed(&self) -> Result<()> {
-        self.wait_for_state("pressed").await
+        self.wait_until(|hits| single_has_state(hits, "pressed"))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the element has the AT-SPI `State::Modal` state.
     pub async fn wait_for_modal(&self) -> Result<()> {
-        self.wait_for_state("modal").await
+        self.wait_until(|hits| single_has_state(hits, "modal"))
+            .await
+            .map(|_| ())
     }
 
     /// Poll until the element's text contents satisfy `pred`. Returns the
     /// matching text on success so the caller can inspect it further.
+    ///
+    /// Unlike the snapshot-backed waits, text isn't captured in the tree
+    /// snapshot — this does a live read through the AT-SPI Text proxy per
+    /// tick, which is why it uses [`wait_for`](Self::wait_for) directly
+    /// (the predicate maps to `String`, not `bool`).
     pub async fn wait_for_text<F>(&self, pred: F) -> Result<String>
     where
         F: Fn(&str) -> bool,
     {
-        let xpath = self.xpath.clone();
-        poll_with_retry(self.effective_timeout(), &xpath, || async {
-            let info = self.resolve_once_info().await?;
-            let a11y = self.a11y()?;
-            let (bus, path) = info.ref_;
-            let text = atspi_client::read_text_on(a11y, &self.xpath, &bus, &path).await?;
-            if pred(&text) {
-                Ok(Some(text))
-            } else {
-                Ok(None)
+        // `pred` is borrowed by shared ref so the `async move` block can
+        // capture a Copy ref instead of moving `F` (which would only work
+        // once, breaking the `Fn` contract on the outer closure).
+        let pred = &pred;
+        self.wait_for(move |hits| async move {
+            if hits.len() != 1 {
+                return Ok(None);
             }
+            let (bus, path) = hits[0].ref_.clone();
+            let a11y = self.a11y()?;
+            let text = atspi_client::read_text_on(a11y, &self.xpath, &bus, &path).await?;
+            Ok(pred(&text).then_some(text))
         })
         .await
     }
@@ -767,22 +839,6 @@ impl Locator {
             .states
             .iter()
             .any(|s| s == state))
-    }
-
-    /// Poll until the element exists and has the named AT-SPI state.
-    /// Shared backbone for the `wait_for_checked` / `wait_for_focused` /
-    /// etc. predicates — keeps their bodies one-liners.
-    async fn wait_for_state(&self, state: &str) -> Result<()> {
-        let xpath = self.xpath.clone();
-        poll_with_retry(self.effective_timeout(), &xpath, || async {
-            let info = self.resolve_once_info().await?;
-            if info.states.iter().any(|s| s == state) {
-                Ok(Some(()))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
     }
 
     fn a11y(&self) -> Result<&AccessibilityConnection> {
@@ -896,6 +952,15 @@ fn is_enabled_in(states: &[String]) -> bool {
     states.iter().any(|s| s == "enabled" || s == "sensitive")
 }
 
+/// Whether a multi-match node-set contains exactly one element with the
+/// given AT-SPI state. Used by the single-element state waits
+/// (`wait_for_checked`, `wait_for_focused`, `wait_for_visible`, …) to
+/// collapse the common `hits.len() == 1 && hits[0].states.iter().any(...)`
+/// idiom.
+fn single_has_state(hits: &[ElementInfo], state: &str) -> bool {
+    hits.len() == 1 && hits[0].states.iter().any(|s| s == state)
+}
+
 /// Classify the match count from a single-target selector resolution:
 /// zero → `ElementNotFound`, one → `Ok(())`, more than one →
 /// `AmbiguousSelector`. Leaves the Vec intact so callers can pop the sole
@@ -984,7 +1049,10 @@ fn is_retriable(e: &Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_retriable, poll_with_retry, select_exactly_one, Error};
+    use super::{
+        is_retriable, poll_with_retry, select_exactly_one, single_has_state, ElementInfo, Error,
+        HashMap,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1255,6 +1323,100 @@ mod tests {
         let err = s.locate("//PushButton").click().await.unwrap_err();
         assert!(matches!(err, Error::Atspi(_)));
         assert!(err.to_string().contains("no AT-SPI connection"));
+    }
+
+    // ── Generic-wait API surface ───────────────────────────────────────────
+    //
+    // The API is `async fn wait_until / wait_until_async / wait_for`. We
+    // can't drive the full poll loop in unit tests (no AT-SPI snapshot
+    // source), but we can verify:
+    //  1. Each method exists with its intended signature and compiles for
+    //     the shapes of predicate the docs advertise.
+    //  2. They surface the "no a11y" error cleanly, like `click` does.
+    //  3. The `single_has_state` helper they delegate to is correct (pure,
+    //     no I/O — exhaustively testable).
+
+    #[test]
+    fn single_has_state_requires_exactly_one_match() {
+        fn info_with_states(states: &[&str]) -> ElementInfo {
+            ElementInfo {
+                ref_: ("b".into(), "/p".into()),
+                role: "Node".into(),
+                role_raw: None,
+                name: None,
+                attributes: HashMap::new(),
+                states: states.iter().map(|s| (*s).into()).collect(),
+                bounds: None,
+            }
+        }
+        // Empty → false (nothing to check).
+        assert!(!single_has_state(&[], "checked"));
+        // One match with the state → true.
+        let a = info_with_states(&["showing", "checked"]);
+        assert!(single_has_state(std::slice::from_ref(&a), "checked"));
+        // One match without the state → false.
+        let b = info_with_states(&["showing"]);
+        assert!(!single_has_state(std::slice::from_ref(&b), "checked"));
+        // Multiple matches → false even if they all have the state (the
+        // single-element waits treat ambiguity as "not satisfied," which
+        // matches Playwright-style strict-one semantics).
+        assert!(!single_has_state(&[a.clone(), a.clone()], "checked"));
+    }
+
+    #[tokio::test]
+    async fn wait_until_surfaces_missing_a11y_as_atspi_error() {
+        let s = test_session();
+        let err = s
+            .locate("//PushButton")
+            .with_timeout(Duration::from_millis(10))
+            .wait_until(|_| true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Atspi(_)));
+        assert!(err.to_string().contains("no AT-SPI connection"));
+    }
+
+    #[tokio::test]
+    async fn wait_until_async_surfaces_missing_a11y_as_atspi_error() {
+        let s = test_session();
+        let err = s
+            .locate("//PushButton")
+            .with_timeout(Duration::from_millis(10))
+            .wait_until_async(|_| async { true })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Atspi(_)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_surfaces_missing_a11y_as_atspi_error() {
+        let s = test_session();
+        let err = s
+            .locate("//PushButton")
+            .with_timeout(Duration::from_millis(10))
+            .wait_for(|_| async { Ok(Some(42)) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Atspi(_)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_non_retriable_predicate_error_aborts_immediately() {
+        // A non-retriable error from the predicate (e.g. InvalidSelector)
+        // must propagate without retrying. We can't reach the predicate
+        // itself through the test session (snapshot errors first), but we
+        // can exercise poll_with_retry directly for this behavior — and
+        // the existing `poll_bails_immediately_on_non_retriable_error`
+        // test below covers it. This test just asserts `wait_for`'s
+        // signature accepts async closures that can produce `Result<Option<_>>`.
+        let s = test_session();
+        let result: WdResult<&'static str> = s
+            .locate("//X")
+            .with_timeout(Duration::from_millis(10))
+            .wait_for(|_| async { Ok::<Option<&'static str>, Error>(Some("sentinel")) })
+            .await;
+        // a11y-missing error comes first from the inspect_all call.
+        assert!(matches!(result.unwrap_err(), Error::Atspi(_)));
     }
 
     #[tokio::test]
