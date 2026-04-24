@@ -3,6 +3,7 @@ use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
 use atspi::proxy::bus::BusProxy;
 use atspi::proxy::collection::CollectionProxy;
+use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::{State, StateSet};
@@ -64,6 +65,19 @@ async fn build_text<'a>(
     path: &str,
 ) -> zbus::Result<TextProxy<'a>> {
     TextProxy::builder(conn)
+        .destination(bus_name.to_owned())?
+        .path(path.to_owned())?
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+}
+
+async fn build_component<'a>(
+    conn: &'a zbus::Connection,
+    bus_name: &str,
+    path: &str,
+) -> zbus::Result<ComponentProxy<'a>> {
+    ComponentProxy::builder(conn)
         .destination(bus_name.to_owned())?
         .path(path.to_owned())?
         .cache_properties(CacheProperties::No)
@@ -541,6 +555,33 @@ pub async fn do_action_on(
     if !success {
         return Err(Error::Atspi(format!(
             "do_action(0) returned false on {bus}{path} — element may not support activation"
+        )));
+    }
+    Ok(())
+}
+
+/// Give keyboard focus to the element identified by `(bus, path)` via the
+/// AT-SPI Component interface.
+///
+/// Returns `Err(Error::Atspi(...))` when the element doesn't implement
+/// Component or when `grab_focus` returned false (the toolkit rejected the
+/// focus request — typically because the element isn't focusable).
+pub async fn grab_focus_on(
+    conn: &AccessibilityConnection,
+    xpath: &str,
+    bus: &str,
+    path: &str,
+) -> Result<()> {
+    let component = build_component(conn.connection(), bus, path)
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    let ok = component
+        .grab_focus()
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    if !ok {
+        return Err(Error::Atspi(format!(
+            "grab_focus returned false on {bus}{path} — element not focusable"
         )));
     }
     Ok(())

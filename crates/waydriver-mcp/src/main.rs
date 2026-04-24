@@ -88,6 +88,14 @@ pub struct ClickParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FocusParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one focusable element.
+    pub xpath: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetTextParams {
     /// Session ID
     pub session_id: String,
@@ -346,6 +354,7 @@ const PILL_CLASS = {{
   kill_session:    'bg-slate-200 text-slate-800',
   take_screenshot: 'bg-indigo-100 text-indigo-800',
   click:           'bg-blue-100 text-blue-800',
+  focus:           'bg-blue-100 text-blue-800',
   set_text:        'bg-blue-100 text-blue-800',
   read_text:       'bg-blue-100 text-blue-800',
   type_text:       'bg-blue-100 text-blue-800',
@@ -884,6 +893,44 @@ impl UiTestServer {
     }
 
     #[tool(
+        description = "Give keyboard focus to the element selected by XPath. The selector must \
+                       resolve to exactly one focusable element. Use this before sending \
+                       keyboard input via `type_text` or `press_key` when you need the input \
+                       to land on a specific widget."
+    )]
+    async fn focus(
+        &self,
+        Parameters(params): Parameters<FocusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let xpath = params.xpath.clone();
+        let outcome: Result<String, String> = match managed.session.locate(&xpath).focus().await {
+            Ok(()) => Ok(format!("Focused {xpath}")),
+            Err(e) => Err(e.to_string()),
+        };
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "focus",
+                serde_json::json!({ "xpath": params.xpath }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(focus) failed");
+        }
+
+        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
         description = "Replace the editable-text contents of an element selected by XPath. \
                        Target must implement the EditableText AT-SPI interface."
     )]
@@ -1413,6 +1460,19 @@ mod tests {
             .click(Parameters(ClickParams {
                 session_id: "bogus".into(),
                 xpath: "//PushButton".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn focus_not_found() {
+        let s = server();
+        let err = s
+            .focus(Parameters(FocusParams {
+                session_id: "bogus".into(),
+                xpath: "//TextBox".into(),
             }))
             .await
             .unwrap_err();

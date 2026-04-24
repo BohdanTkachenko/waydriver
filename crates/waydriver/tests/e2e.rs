@@ -180,6 +180,14 @@ async fn accessibility_tree_inspection() -> anyhow::Result<()> {
     Ok(())
 }
 
+// NOTE: a positive e2e for Locator::focus against gnome-calculator would
+// belong here, but calc 49 doesn't implement the AT-SPI Component
+// interface on any widget — both Button and TextBox return D-Bus
+// NotSupported on grab_focus. That's a documented GTK4 gap (see
+// Locator::focus docs). The API is covered by unit tests in the locator
+// module; real-world validation waits for a test fixture that implements
+// Component properly (gnome-text-editor is a candidate).
+
 #[tokio::test]
 #[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
 async fn menu_interaction_auto_waits() -> anyhow::Result<()> {

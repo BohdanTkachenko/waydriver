@@ -239,6 +239,30 @@ impl Locator {
         atspi_client::set_text_on(a11y, &self.xpath, &bus, &path, text).await
     }
 
+    /// Give keyboard focus to the matched element.
+    ///
+    /// Auto-waits for the element to be resolvable, showing, and `focusable`
+    /// — the last is a weaker check than "actionable" because some widgets
+    /// accept focus without accepting activation (read-only text boxes,
+    /// scroll regions, etc.). Uses AT-SPI's `Component::grab_focus` under
+    /// the hood.
+    ///
+    /// ## Toolkit caveats
+    ///
+    /// This relies on the target widget implementing the AT-SPI Component
+    /// interface. Some toolkits (notably GTK4 in its current form) don't
+    /// expose Component on all widgets — you may see
+    /// `Error::Atspi("NotSupported")` from `grab_focus` even when the
+    /// widget is visibly focusable on screen. When that happens the
+    /// fallback is to drive focus via keyboard navigation (Tab / Shift+Tab)
+    /// or, once [`WAY-9` pointer actions](crate) land, a pointer click.
+    pub async fn focus(&self) -> Result<()> {
+        let info = self.wait_for_focusable().await?;
+        let (bus, path) = info.ref_;
+        let a11y = self.a11y()?;
+        atspi_client::grab_focus_on(a11y, &self.xpath, &bus, &path).await
+    }
+
     // ── Explicit waits ─────────────────────────────────────────────────────
 
     /// Poll until the element exists and has the `Showing` state. Returns
@@ -395,6 +419,25 @@ impl Locator {
             let info = self.resolve_once_info().await?;
             let showing = info.states.iter().any(|s| s == "showing");
             if showing && is_enabled_in(&info.states) {
+                Ok(Some(info))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    /// Auto-wait: poll until the selector resolves to exactly one element
+    /// that is showing and has the `Focusable` state. Weaker than
+    /// actionability because a read-only but navigable widget can accept
+    /// focus without accepting activation.
+    async fn wait_for_focusable(&self) -> Result<ElementInfo> {
+        let xpath = self.xpath.clone();
+        poll_with_retry(self.effective_timeout(), &xpath, || async {
+            let info = self.resolve_once_info().await?;
+            let showing = info.states.iter().any(|s| s == "showing");
+            let focusable = info.states.iter().any(|s| s == "focusable");
+            if showing && focusable {
                 Ok(Some(info))
             } else {
                 Ok(None)

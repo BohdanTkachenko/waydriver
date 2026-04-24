@@ -83,6 +83,7 @@ async fn run_calculator_test(
         "dump_tree",
         "query",
         "click",
+        "focus",
         "set_text",
         "read_text",
         "type_text",
