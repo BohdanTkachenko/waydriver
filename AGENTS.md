@@ -44,25 +44,25 @@ The `Dockerfile` (Fedora 42, multi-stage) produces two publishable images from t
 Both are published to `ghcr.io/bohdantkachenko/` on each release and on push to main.
 
 ```sh
-docker build -t waydriver-mcp .                                        # runtime image
-docker build --target builder-base -t waydriver-mcp-builder .          # builder image
-docker build --build-arg INSTALL_CALCULATOR=true -t waydriver-mcp-e2e . # runtime + gnome-calculator
+docker build -t waydriver-mcp .                                       # runtime image
+docker build --target builder-base -t waydriver-mcp-builder .         # builder image
+docker build --target runtime-e2e   -t waydriver-mcp-e2e .            # runtime + waydriver-fixture-gtk
 ```
 
 Or via Nix convenience apps:
 ```sh
 nix run .#docker-build       # runtime
-nix run .#docker-build-e2e   # runtime + gnome-calculator
+nix run .#docker-build-e2e   # runtime + waydriver-fixture-gtk
 ```
 
 #### Container isolation
 
 `docker-entrypoint.sh` launches a container-private dbus-daemon before exec-ing waydriver-mcp. Each container gets its own D-Bus session bus, so:
-- gnome-calculator's singleton D-Bus activation is scoped to that container
+- App D-Bus activations (any app the MCP drives) are scoped to that container
 - AT-SPI registry is per-container
 - No interference between concurrent test sessions
 
-This is why the Docker-based e2e test (`calculator_add_via_docker` in `crates/waydriver-mcp/tests/e2e.rs`) works reliably — unlike the host-based test which needs `--test-threads=1`.
+The Docker-based e2e test (`fixture_via_docker` in `crates/waydriver-mcp/tests/e2e.rs`) drives the fixture through this isolated bus. Library-level host tests use the same fixture binary directly — its unique app-id means they don't collide on the host bus either.
 
 #### User dev workflow — bringing app binaries into the MCP container
 
@@ -245,18 +245,20 @@ Unit tests live inside `#[cfg(test)] mod tests` blocks:
 
 These tests are pure — they don't spawn mutter or touch D-Bus — so `cargo test --workspace` runs fast and works without the full runtime stack.
 
-End-to-end tests exercise the full stack (mutter, pipewire, AT-SPI, gnome-calculator):
+End-to-end tests exercise the full stack (mutter, pipewire, AT-SPI, target app):
 
-**Library e2e** (`crates/waydriver/tests/e2e.rs`):
-- `calculator_screenshots_change` — keyboard input + screenshot comparison.
-- `accessibility_tree_inspection` — AT-SPI tree dump, element search, ElementNotFound error.
-- `click_element_changes_display` — AT-SPI click_element + screenshot verification.
-- `pointer_input_operations` — pointer motion and button input.
-- `#[ignore]` — host D-Bus singleton issue. Run with `--ignored --test-threads=1`.
+**Library e2e** (`crates/waydriver/tests/e2e.rs`) — all against the project's own `waydriver-fixture-gtk` binary:
+- `fixture_exposes_{gtk4,adw,dnd}_widgets` — per-section tree diagnostic assertions.
+- `fixture_click_emits_stdout_event` — click via Locator, verify signal handler fired via fixture stdout.
+- `fixture_toggle_changes_screenshot` — locator action → pixel diff.
+- `fixture_tree_and_locator_features` — tree dump, count, wait_for_visible, ElementNotFound shape.
+- `fixture_keyboard_chord_dispatches_modifiers` — end-to-end chord dispatch, modifier release.
+- `fixture_main_menu_opens_auto_waits` — Locator auto-wait through a state transition.
+- `fixture_pointer_input_operations` — pointer motion and button input primitives.
+- `#[ignore]` — spawn mutter + pipewire. Run with `--ignored --test-threads=1`. Run `cargo build -p waydriver-fixture-gtk` first.
 
-**MCP e2e** (`crates/waydriver-mcp/tests/e2e.rs`):
-- `calculator_add_via_mcp` — spawns local waydriver-mcp binary, exercises all 11 tools via JSON-RPC. `#[ignore]` — same host D-Bus issue.
-- `calculator_add_via_docker` — spawns `docker run -i waydriver-mcp-e2e:latest`, same test flow. `#[ignore]` — requires pre-built Docker image. **Runs in CI** via the `e2e` job in `.github/workflows/ci.yml`.
+**MCP e2e** (`crates/waydriver-mcp/tests/e2e.rs`) — one Docker-based test:
+- `fixture_via_docker` — spawns `docker run -i waydriver-mcp-e2e:latest` and exercises the full MCP tool surface against the `waydriver-fixture-gtk` binary running inside the container. `#[ignore]` — requires pre-built Docker image. **Runs in CI** via the `e2e` job in `.github/workflows/ci.yml`.
 
 ### CI pipeline
 
@@ -267,7 +269,7 @@ CI (`.github/workflows/ci.yml`) does not use Nix — it uses standard `apt-get` 
 | `fmt` | `cargo fmt --check` |
 | `clippy` | `cargo clippy -- -D warnings` (needs system dev headers) |
 | `test` | `cargo test --workspace` (unit tests only, no `--ignored`) |
-| `e2e` | Builds `waydriver-mcp-e2e` Docker image, runs `calculator_add_via_docker` |
+| `e2e` | Builds `waydriver-mcp-e2e` Docker image, runs `fixture_via_docker` |
 
 Docker images are published to ghcr.io via `.github/workflows/publish-docker.yml` on push to main (`:main` tag) and on release tags (`:latest`, `:<version>`, `:<minor>`, `:<major>`).
 

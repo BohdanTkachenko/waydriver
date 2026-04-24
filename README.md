@@ -78,10 +78,10 @@ let session = Session::start(
     Box::new(input),
     Box::new(capture),
     SessionConfig {
-        command: "gnome-calculator".into(),
+        command: "your-gtk-app".into(),
         args: vec![],
         cwd: None,
-        app_name: "gnome-calculator".into(),
+        app_name: "your-gtk-app".into(),
         // Record the entire session to a WebM file. Set to `None` to skip.
         video_output: Some("/tmp/session.webm".into()),
         video_bitrate: None, // defaults to waydriver::capture::DEFAULT_VIDEO_BITRATE (2 Mbps)
@@ -137,7 +137,7 @@ waydriver-mcp needs ~8 system services at runtime (mutter, pipewire, wireplumber
 
 - **Security** — the MCP server spawns arbitrary processes, interacts with them via D-Bus, and captures their screen. Running this on your host session gives it access to everything your user can do. Inside a container, it only sees what you explicitly mount — no access to your files, browser sessions, or credentials. Add `--network none` to block network access entirely (the report viewer is purely static `file://`, so it works without any network)
 - **Zero-setup distribution** — `docker pull` and you're running, no system packages to install
-- **D-Bus isolation** — each container gets its own dbus-daemon, so apps like gnome-calculator don't interfere across concurrent test sessions (the singleton D-Bus activation problem)
+- **D-Bus isolation** — each container gets its own dbus-daemon, so apps with singleton D-Bus activation don't interfere across concurrent test sessions
 - **ABI compatibility** — apps built inside the container are guaranteed to link against the same libraries the MCP runtime uses
 
 ### Running with Docker (recommended)

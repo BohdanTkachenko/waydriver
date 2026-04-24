@@ -86,10 +86,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: runtime-e2e
           tags: waydriver-mcp-e2e:latest
-          build-args: INSTALL_CALCULATOR=true
           load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Run Docker-based e2e test
-        run: cargo test -p waydriver-mcp --test e2e -- --ignored calculator_add_via_docker --test-threads=1
+        run: cargo test -p waydriver-mcp --test e2e -- --ignored fixture_via_docker --test-threads=1

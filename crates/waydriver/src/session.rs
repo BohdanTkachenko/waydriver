@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use atspi::connection::AccessibilityConnection;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::Notify;
 
 use crate::atspi as atspi_client;
 use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend};
@@ -38,6 +40,15 @@ pub struct SessionConfig {
     /// consulted when `video_output` is `Some`. When `None`, falls back to
     /// [`crate::capture::DEFAULT_VIDEO_BITRATE`].
     pub video_bitrate: Option<u32>,
+}
+
+/// Buffer of lines emitted on the target app's stdout, with a Notify the
+/// reader task pokes on every append so [`Session::wait_for_stdout_line`]
+/// can wake and rescan.
+#[derive(Default)]
+struct AppStdout {
+    lines: Mutex<Vec<String>>,
+    notify: Notify,
 }
 
 /// A running UI test session: a compositor, input + capture backends, the
@@ -76,6 +87,11 @@ pub struct Session {
     input: Box<dyn InputBackend>,
     capture: Box<dyn CaptureBackend>,
     compositor: Box<dyn CompositorRuntime>,
+    /// Captured lines from the app process's stdout. A background task
+    /// reads from the child pipe and pushes each line here, notifying
+    /// waiters so they can rescan the buffer. Lines persist for the
+    /// session's lifetime (no ring-buffer eviction yet).
+    stdout: Arc<AppStdout>,
 }
 
 impl Session {
@@ -95,13 +111,39 @@ impl Session {
         tracing::info!(id, "starting session");
 
         let dbus_address = get_host_session_bus()?;
-        let app = spawn_app(
+        let mut app = spawn_app(
             &cfg,
             compositor.wayland_display(),
             compositor.runtime_dir(),
             &dbus_address,
         )?;
         tracing::debug!(id, app_name = %cfg.app_name, "app spawned");
+
+        let stdout = Arc::new(AppStdout::default());
+        if let Some(child_stdout) = app.stdout.take() {
+            let captured = stdout.clone();
+            let id_for_task = id.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(child_stdout).lines();
+                loop {
+                    match reader.next_line().await {
+                        Ok(Some(line)) => {
+                            tracing::trace!(id = id_for_task, line = %line, "app stdout");
+                            {
+                                let mut guard = captured.lines.lock().unwrap();
+                                guard.push(line);
+                            }
+                            captured.notify.notify_waiters();
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::debug!(id = id_for_task, error = %e, "app stdout read error");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         let a11y_connection = atspi_client::connect_a11y(&dbus_address).await?;
         let (app_bus_name, app_path) = wait_for_app(&a11y_connection, &cfg.app_name).await?;
@@ -145,6 +187,7 @@ impl Session {
             input,
             capture,
             compositor,
+            stdout,
         };
 
         Ok(session)
@@ -264,6 +307,87 @@ impl Session {
             .store(timeout.as_nanos() as u64, Ordering::Relaxed);
     }
 
+    /// Snapshot of every stdout line the app process has printed so far.
+    ///
+    /// The returned vector is a copy; later lines won't appear in it even
+    /// as the app continues to emit. Combine with [`stdout_cursor`] +
+    /// [`wait_for_stdout_line`] for event-driven assertions, or call this
+    /// directly after a `wait_for_stdout_line` if you want the full buffer.
+    ///
+    /// [`stdout_cursor`]: Self::stdout_cursor
+    /// [`wait_for_stdout_line`]: Self::wait_for_stdout_line
+    pub fn stdout_lines(&self) -> Vec<String> {
+        self.stdout.lines.lock().unwrap().clone()
+    }
+
+    /// Current length of the stdout buffer — useful as a high-water mark
+    /// before an action so [`wait_for_stdout_line`] can ignore older lines
+    /// from the buffer and only wait for ones emitted afterwards.
+    ///
+    /// ```ignore
+    /// let before = session.stdout_cursor();
+    /// locator.click().await?;
+    /// session
+    ///     .wait_for_stdout_line(before, |l| l == "fixture-event: clicked ok", Duration::from_secs(1))
+    ///     .await?;
+    /// ```
+    ///
+    /// [`wait_for_stdout_line`]: Self::wait_for_stdout_line
+    pub fn stdout_cursor(&self) -> usize {
+        self.stdout.lines.lock().unwrap().len()
+    }
+
+    /// Wait for a stdout line matching `pred` to appear at or after index
+    /// `after` in the buffer. Returns the matched line on success, or
+    /// `Error::Timeout` if no matching line arrives before the deadline.
+    ///
+    /// Lines already in the buffer at or after `after` count as matches —
+    /// there's no "only future lines" mode. Pass `self.stdout_cursor()`
+    /// before kicking off the action to exclude history.
+    pub async fn wait_for_stdout_line<F>(
+        &self,
+        after: usize,
+        pred: F,
+        timeout: Duration,
+    ) -> Result<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Register for notifications *before* scanning so we don't
+            // miss lines appended between the scan and the wait.
+            let notified = self.stdout.notify.notified();
+            tokio::pin!(notified);
+
+            {
+                let guard = self.stdout.lines.lock().unwrap();
+                for line in guard.iter().skip(after) {
+                    if pred(line) {
+                        return Ok(line.clone());
+                    }
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Timeout(format!(
+                    "no stdout line matched within {timeout:?} (buffer had {} line(s) after cursor {after})",
+                    self.stdout.lines.lock().unwrap().len().saturating_sub(after),
+                )));
+            }
+            if tokio::time::timeout(remaining, &mut notified)
+                .await
+                .is_err()
+            {
+                return Err(Error::Timeout(format!(
+                    "no stdout line matched within {timeout:?} (buffer had {} line(s) after cursor {after})",
+                    self.stdout.lines.lock().unwrap().len().saturating_sub(after),
+                )));
+            }
+        }
+    }
+
     /// Serialize the live AT-SPI accessibility tree rooted at this session's
     /// application to XML. The same snapshot format XPath locators resolve
     /// against — useful for debugging selectors.
@@ -370,7 +494,19 @@ impl Session {
             input,
             capture,
             compositor,
+            stdout: Arc::new(AppStdout::default()),
         }
+    }
+
+    /// Push a fake stdout line into the capture buffer. Used by tests that
+    /// exercise [`Session::wait_for_stdout_line`] without an actual child
+    /// process.
+    pub fn push_stdout_line_for_test(&self, line: impl Into<String>) {
+        {
+            let mut guard = self.stdout.lines.lock().unwrap();
+            guard.push(line.into());
+        }
+        self.stdout.notify.notify_waiters();
     }
 }
 
@@ -435,7 +571,7 @@ fn spawn_app(
         .env("GSETTINGS_BACKEND", "keyfile")
         .env("NO_AT_BRIDGE", "0")
         .env("GTK_A11Y", "atspi")
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if let Some(dir) = &cfg.cwd {
         cmd.current_dir(dir);
@@ -931,5 +1067,144 @@ mod tests {
             matches!(err, Error::Process(ref m) if m.contains("invalid chord")),
             "expected process:invalid chord, got {err:?}"
         );
+    }
+
+    /// Build a test-only Session whose input/capture/compositor are no-op
+    /// stubs — so we can exercise stdout-capture plumbing without spinning
+    /// up mutter.
+    fn make_test_session() -> Session {
+        use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
+        use async_trait::async_trait;
+        use std::path::{Path, PathBuf};
+
+        struct StubCompositor;
+        #[async_trait]
+        impl CompositorRuntime for StubCompositor {
+            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+                Ok(())
+            }
+            async fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn id(&self) -> &str {
+                "s"
+            }
+            fn wayland_display(&self) -> &str {
+                "d"
+            }
+            fn runtime_dir(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        struct StubInput;
+        #[async_trait]
+        impl InputBackend for StubInput {
+            async fn press_keysym(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn key_down(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn key_up(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+        }
+        struct StubCapture;
+        #[async_trait]
+        impl CaptureBackend for StubCapture {
+            async fn start_stream(&self) -> Result<PipeWireStream> {
+                unimplemented!()
+            }
+            async fn stop_stream(&self, _: PipeWireStream) -> Result<()> {
+                Ok(())
+            }
+            fn pipewire_socket(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+        }
+
+        Session::new_for_test(
+            "t".into(),
+            "a".into(),
+            Box::new(StubInput),
+            Box::new(StubCapture),
+            Box::new(StubCompositor),
+        )
+    }
+
+    #[tokio::test]
+    async fn wait_for_stdout_line_returns_existing_match_immediately() {
+        let s = make_test_session();
+        s.push_stdout_line_for_test("fixture-event: clicked primary-button");
+        let line = s
+            .wait_for_stdout_line(
+                0,
+                |l| l.contains("clicked primary-button"),
+                Duration::from_millis(100),
+            )
+            .await
+            .expect("should match existing line");
+        assert!(line.contains("clicked primary-button"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_stdout_line_respects_after_cursor() {
+        let s = make_test_session();
+        // Pre-existing noise the test should skip past.
+        s.push_stdout_line_for_test("some startup chatter");
+        s.push_stdout_line_for_test("fixture-event: clicked old-button");
+        let cursor = s.stdout_cursor();
+        assert_eq!(cursor, 2);
+
+        // Line added after cursor — should match.
+        s.push_stdout_line_for_test("fixture-event: clicked new-button");
+        let line = s
+            .wait_for_stdout_line(
+                cursor,
+                |l| l.contains("clicked"),
+                Duration::from_millis(100),
+            )
+            .await
+            .expect("should match line after cursor");
+        assert!(line.contains("new-button"), "got: {line}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_stdout_line_wakes_on_notify() {
+        let s = Arc::new(make_test_session());
+        let cursor = s.stdout_cursor();
+
+        // Push a matching line 50ms into the wait.
+        let pusher = s.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            pusher.push_stdout_line_for_test("fixture-event: clicked async-button");
+        });
+
+        let line = s
+            .wait_for_stdout_line(
+                cursor,
+                |l| l.contains("async-button"),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("should wake on notify");
+        assert!(line.contains("async-button"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_stdout_line_times_out_when_no_match() {
+        let s = make_test_session();
+        let err = s
+            .wait_for_stdout_line(0, |l| l == "never", Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "got: {err:?}");
     }
 }

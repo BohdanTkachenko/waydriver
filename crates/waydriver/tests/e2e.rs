@@ -1,22 +1,30 @@
 //! End-to-end tests for the waydriver library against headless mutter.
 //!
-//! Each test spins up its own mutter session with gnome-calculator (isolated
-//! from the user's settings via keyfile GSettings backend), exercises a
-//! different part of the API, and tears the session down.
+//! Each test spins up its own mutter session with the project's
+//! `waydriver-fixture-gtk` binary (a purpose-built GTK4 + libadwaita
+//! fixture with stable selectors and stdout event emission on every
+//! primary signal) and exercises a different part of the API.
 //!
-//! These tests are `#[ignore]`-gated because they currently depend on the
-//! host AT-SPI session bus, and `gnome-calculator`'s singleton D-Bus
-//! activation causes parallel test sessions to latch onto a shared calculator
-//! instance — tests then race on its UI state. See the tracking issue for
-//! the session-isolation fix.
+//! These tests are `#[ignore]`-gated because they spawn real mutter +
+//! pipewire processes and share the host AT-SPI session bus. The
+//! fixture has a unique app-id so parallel test instances don't collide
+//! on D-Bus, but the shared host bus still means running with
+//! `--test-threads=1` is the reliable path.
 //!
 //! Run them explicitly with:
 //!
 //! ```sh
+//! cargo build -p waydriver-fixture-gtk  # tests don't rebuild the fixture
 //! cargo test -p waydriver --test e2e -- --ignored --test-threads=1
 //! ```
+//!
+//! The MCP-level e2e test in `crates/waydriver-mcp/tests/e2e.rs` drives
+//! the same fixture through the MCP JSON-RPC surface inside a Docker
+//! container. Both test layers target the fixture only — no external
+//! app dependencies.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use waydriver::{CompositorRuntime, Error, InputBackend, Session, SessionConfig};
 use waydriver_capture_mutter::MutterCapture;
@@ -32,39 +40,15 @@ fn extract_png(raw: &[u8]) -> Vec<u8> {
     raw[png_start..].to_vec()
 }
 
-/// Start a gnome-calculator session, returning the Session wrapped in Arc
-/// (so callers can use the XPath Locator API that lives behind `&Arc<Session>`)
-/// and the shared MutterState for constructing extra InputBackends.
-async fn start_calculator_session() -> anyhow::Result<(Arc<Session>, Arc<MutterState>)> {
-    let mut compositor = MutterCompositor::new();
-    compositor.start(None).await?;
-    let state = compositor.state();
-    let input = MutterInput::new(state.clone());
-    let capture = MutterCapture::new(state.clone());
-
-    let session = Session::start(
-        Box::new(compositor),
-        Box::new(input),
-        Box::new(capture),
-        SessionConfig {
-            command: "gnome-calculator".into(),
-            args: vec![],
-            cwd: None,
-            app_name: "gnome-calculator".into(),
-            video_output: None,
-            video_bitrate: None,
-        },
-    )
-    .await?;
-
-    // Let the app render its initial frame.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    // Dismiss any startup dialog.
-    session.press_keysym(0xff1b).await?; // Escape
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    Ok((Arc::new(session), state))
+/// Count pixels that differ between two PNG byte blobs.
+fn diff_png_pixels(a: &[u8], b: &[u8]) -> anyhow::Result<usize> {
+    let img1 = image::load_from_memory(a)?.to_rgba8();
+    let img2 = image::load_from_memory(b)?.to_rgba8();
+    Ok(img1
+        .pixels()
+        .zip(img2.pixels())
+        .filter(|(p1, p2)| p1 != p2)
+        .count())
 }
 
 /// Consume the Arc wrapper and call Session::kill. Any Locator clone from
@@ -77,253 +61,422 @@ async fn kill(session: Arc<Session>) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
-async fn calculator_screenshots_change() -> anyhow::Result<()> {
+/// Resolve the path to the `waydriver-fixture-gtk` binary based on the
+/// test executable's location. Same pattern the MCP e2e uses for
+/// `waydriver-mcp`.
+///
+/// **Important:** `cargo test -p waydriver` does *not* rebuild the
+/// fixture crate — the fixture isn't a dep of waydriver. Run `cargo
+/// build -p waydriver-fixture-gtk` first (or `cargo build --workspace`)
+/// if you've edited the fixture since its last build, otherwise the
+/// test runs against a stale binary.
+fn fixture_binary() -> std::path::PathBuf {
+    let mut path = std::env::current_exe()
+        .expect("current_exe")
+        .parent() // deps/
+        .unwrap()
+        .parent() // debug/
+        .unwrap()
+        .to_path_buf();
+    path.push("waydriver-fixture-gtk");
+    path
+}
+
+/// Start a session running the repo's own GTK4 fixture binary, pinned to
+/// a specific `--section` so the AT-SPI tree contains only that
+/// section's widgets.
+async fn start_fixture_session(section: &str) -> anyhow::Result<(Arc<Session>, Arc<MutterState>)> {
+    let mut compositor = MutterCompositor::new();
+    compositor.start(None).await?;
+    let state = compositor.state();
+    let input = MutterInput::new(state.clone());
+    let capture = MutterCapture::new(state.clone());
+
+    let fixture_bin = fixture_binary();
+    assert!(
+        fixture_bin.exists(),
+        "fixture binary missing at {fixture_bin:?}; run `cargo build -p waydriver-fixture-gtk` first"
+    );
+
+    let session = Session::start(
+        Box::new(compositor),
+        Box::new(input),
+        Box::new(capture),
+        SessionConfig {
+            command: fixture_bin.to_string_lossy().into_owned(),
+            args: vec![format!("--section={section}")],
+            cwd: None,
+            app_name: "waydriver-fixture-gtk".into(),
+            video_output: None,
+            video_bitrate: None,
+        },
+    )
+    .await?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    Ok((Arc::new(session), state))
+}
+
+/// Spot-check every name in `expected` appears at least once in the tree.
+/// Shared body used by the three per-section diagnostic tests.
+async fn assert_widgets_exist(session: &Arc<Session>, section: &str, expected: &[&str]) {
+    let tree = session.dump_tree().await.expect("dump_tree");
+    eprintln!(
+        "── fixture tree ({section}) ─────────────────────────────\n{tree}\n\
+         ────────────────────────────────────────────────────────────"
+    );
+    for expected_name in expected {
+        let count = session
+            .locate(&format!("//*[@name='{expected_name}']"))
+            .count()
+            .await
+            .unwrap_or(usize::MAX);
+        assert!(
+            count >= 1,
+            "expected named widget '{expected_name}' to be in the tree (count: {count})"
+        );
+    }
+}
+
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .try_init()
         .ok();
+}
 
-    let (session, _state) = start_calculator_session().await?;
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_exposes_gtk4_widgets() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+    assert_widgets_exist(
+        &session,
+        "gtk4",
+        &[
+            "primary-button",
+            "mode-toggle",
+            "agree-check",
+            "text-entry",
+            "main-menu",
+            "open-dialog",
+        ],
+    )
+    .await;
+    kill(session).await?;
+    Ok(())
+}
 
-    // Baseline screenshot.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_exposes_adw_widgets() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+    assert_widgets_exist(
+        &session,
+        "adw",
+        &[
+            "adw-prefs-group",
+            "adw-entry-row",
+            "adw-combo-row",
+            "adw-switch-row",
+            "adw-action-row",
+            "open-adw-dialog",
+            // The main-menu button lives in the header bar and is present
+            // regardless of which section is selected.
+            "main-menu",
+        ],
+    )
+    .await;
+    kill(session).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_exposes_dnd_widgets() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("dnd").await?;
+    assert_widgets_exist(
+        &session,
+        "dnd",
+        &["drag-source", "drop-target", "drop-status", "main-menu"],
+    )
+    .await;
+    kill(session).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_click_emits_stdout_event() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Capture the stdout cursor before the click so any startup noise the
+    // fixture printed at boot is excluded from the match window.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='primary-button']")
+        .click()
+        .await?;
+
+    let line = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("clicked primary-button"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    eprintln!("observed stdout event: {line}");
+    assert!(
+        line.starts_with("fixture-event: clicked primary-button"),
+        "unexpected line: {line}"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Screenshot before/after toggling a ToggleButton — proves that locator
+/// actions produce real pixel changes in the compositor, not just AT-SPI
+/// state updates.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_toggle_changes_screenshot() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
     let baseline = extract_png(&session.take_screenshot().await?);
     assert!(baseline.len() > 1000, "baseline screenshot too small");
 
-    // Type "6" then "=" via RemoteDesktop keysym input.
-    for keysym in [0x36 /* '6' */, 0x3d /* '=' */] {
-        session.press_keysym(keysym).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//ToggleButton[@name='mode-toggle']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("toggled mode-toggle"),
+            Duration::from_secs(3),
+        )
+        .await?;
 
-    // After-input screenshot.
-    let after_input = extract_png(&session.take_screenshot().await?);
+    // Extra beat for the compositor to flush the repaint.
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Decode PNGs and compare actual pixel data.
-    let img1 = image::load_from_memory(&baseline)?.to_rgba8();
-    let img2 = image::load_from_memory(&after_input)?.to_rgba8();
-    let diff_pixels = img1
-        .pixels()
-        .zip(img2.pixels())
-        .filter(|(a, b)| a != b)
-        .count();
-    eprintln!("pixel diff: {diff_pixels} / {} pixels", img1.pixels().len());
+    let after = extract_png(&session.take_screenshot().await?);
+    let diff_pixels = diff_png_pixels(&baseline, &after)?;
+    eprintln!("pixel diff: {diff_pixels}");
 
     kill(session).await?;
 
     assert!(
         diff_pixels > 100,
-        "screenshot should change after typing 6 = (only {diff_pixels} pixels differ)"
+        "screenshot should change after toggling mode-toggle (only {diff_pixels} pixels differ)"
     );
-
     Ok(())
 }
 
+/// XPath tree inspection, counts, and element-not-found error shape.
 #[tokio::test]
-#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
-async fn accessibility_tree_inspection() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .try_init()
-        .ok();
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_tree_and_locator_features() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
 
-    let (session, _state) = start_calculator_session().await?;
-
-    // Dump the accessibility tree as XML and verify shape.
     let tree = session.dump_tree().await?;
     assert!(!tree.is_empty(), "accessibility tree should not be empty");
     assert!(
         tree.contains("<?xml"),
-        "tree should start with an XML declaration, got:\n{tree}"
+        "tree should start with XML declaration, got:\n{tree}"
     );
     assert!(
         tree.contains("<Button"),
         "tree should contain Button elements, got:\n{tree}"
     );
 
-    // Find a known element — the "1" button — with a scoped XPath.
-    let button_one = session.locate("//Button[@name='1']");
-    assert!(button_one.count().await? >= 1, "should find button '1'");
+    // Known element — primary-button — resolves.
+    assert!(
+        session
+            .locate("//Button[@name='primary-button']")
+            .count()
+            .await?
+            >= 1,
+        "should find primary-button"
+    );
 
-    // A non-existent selector yields ElementNotFound when resolved as single.
-    // Use a short timeout so the auto-wait doesn't stretch the test by 5s
-    // while it polls for an element we know won't appear.
-    let missing = session
+    // Missing element yields ElementNotFound on a single-target action.
+    let err = session
         .locate("//Button[@name='nonexistent_xyz_12345']")
-        .with_timeout(std::time::Duration::from_millis(250));
-    let err = missing.click().await.unwrap_err();
+        .with_timeout(Duration::from_millis(250))
+        .click()
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, Error::ElementNotFound { .. }),
         "expected ElementNotFound, got: {err}"
     );
 
-    // wait_for_visible on an already-visible button returns quickly (the
-    // auto-wait path), exercising the positive branch of poll_with_retry.
+    // Auto-wait on an already-visible button returns quickly.
     session
-        .locate("//Button[@name='1']")
+        .locate("//Button[@name='primary-button']")
         .wait_for_visible()
         .await?;
 
-    // wait_for_count: the calculator keypad has a known number of digit
-    // buttons. We don't hard-code the exact count (it varies across GNOME
-    // Calculator versions) — just verify the selector resolves non-zero
-    // and wait_for_count accepts the current count as a no-op.
-    let digit_count = session.locate("//Button").count().await?;
-    assert!(digit_count > 0, "expected some buttons, got 0");
+    // wait_for_count accepts the current count as a no-op.
+    let button_count = session.locate("//Button").count().await?;
+    assert!(button_count > 0, "expected some buttons, got 0");
     session
         .locate("//Button")
-        .wait_for_count(digit_count)
+        .wait_for_count(button_count)
         .await?;
 
     kill(session).await?;
     Ok(())
 }
 
-// NOTE: a positive e2e for Locator::focus against gnome-calculator would
-// belong here, but calc 49 doesn't implement the AT-SPI Component
-// interface on any widget — both Button and TextBox return D-Bus
-// NotSupported on grab_focus. That's a documented GTK4 gap (see
-// Locator::focus docs). The API is covered by unit tests in the locator
-// module; real-world validation waits for a test fixture that implements
-// Component properly (gnome-text-editor is a candidate).
-
+/// End-to-end verification of `Session::press_chord`: types characters
+/// into the text-entry and asserts the final state via stdout events.
+/// Stdout events are ground truth here — the fixture fires
+/// `text-changed text-entry text="..."` on every keystroke, which is a
+/// much stronger signal than any a11y property read.
 #[tokio::test]
-#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
-async fn keyboard_chord_dispatches_modifiers() -> anyhow::Result<()> {
-    // Exercises Session::press_chord end-to-end. We commit an
-    // expression two different ways — via single-key chord calls ("2", "+",
-    // "3", "=") and via a modifier chord ("Ctrl+A", though its effect on
-    // calc's entry isn't what we assert on). The meaningful assertion is
-    // the "2+3" expression landing in the history list, which proves the
-    // chord dispatch path delivers single-key presses correctly.
-    //
-    // Deeper verification of the Ctrl+A select-all behavior is covered by
-    // the unit test `press_chord_issues_modifiers_then_target_then_releases_in_reverse`
-    // in the session module — we can't reliably assert select-all behavior
-    // via AT-SPI in gnome-calculator 49 because its editable TextBox
-    // doesn't expose current input through the Text interface.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .try_init()
-        .ok();
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_keyboard_chord_dispatches_modifiers() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
 
-    let (session, _state) = start_calculator_session().await?;
-
-    // Single-key chords dispatch through the same path as multi-key ones —
-    // if these work, modifier routing works too (modifiers go through the
-    // extra key_down/key_up primitives which the unit tests cover).
-    for token in ["2", "+", "3", "="] {
-        session.press_chord(token).await?;
+    // Focus-routing handshake. The fixture emits `focus-acquired text-entry`
+    // as soon as GTK grabs focus client-side, but the Wayland compositor
+    // needs time to redirect keyboard input to the newly-focused surface —
+    // key events sent too soon after the focus event get routed to
+    // whichever surface held focus before. Fire warmup keystrokes until
+    // we see one actually land on the entry; that's the deterministic
+    // signal that routing has caught up. Then clear the entry and let
+    // the buffer settle so the real test starts from a clean state.
+    session
+        .wait_for_stdout_line(
+            0,
+            |l| l.contains("focus-acquired text-entry"),
+            Duration::from_secs(5),
+        )
+        .await?;
+    let mut routed = false;
+    let warmup_start = session.stdout_cursor();
+    for _ in 0..15 {
+        session.press_chord("a").await?;
+        if session
+            .wait_for_stdout_line(
+                warmup_start,
+                |l| l.contains("text-changed text-entry"),
+                Duration::from_millis(250),
+            )
+            .await
+            .is_ok()
+        {
+            routed = true;
+            break;
+        }
     }
-
-    // History's last row should be the computation we just committed.
-    session
-        .locate("//ListItem//Label[1]")
-        .wait_for_text(|t| t == "2+3")
-        .await?;
-    session
-        .locate("//ListItem//Label[last()]")
-        .wait_for_text(|t| t == "5")
-        .await?;
-
-    // Also exercise a modifier chord — we can't assert its effect visibly,
-    // but we can assert it doesn't panic or stuck a modifier. If Ctrl got
-    // stuck, subsequent digit entries would be misinterpreted and the next
-    // calculation would break.
+    assert!(
+        routed,
+        "keystrokes never reached text-entry despite focus-acquired"
+    );
+    // Any additional buffered 'a' presses may still be queued — sleep
+    // briefly so they flush, then clear, then sleep again so the clear
+    // event is the last thing in the buffer before the real test runs.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     session.press_chord("Ctrl+A").await?;
     session.press_chord("BackSpace").await?;
-    for token in ["7", "+", "1", "="] {
-        session.press_chord(token).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Real test starts here. Cursor captures the state after clear +
+    // settle; anything appearing after this point is produced by the
+    // presses we're about to issue.
+
+    // Type "hi". Proves single-key chord dispatch lands in the entry.
+    let cursor = session.stdout_cursor();
+    for ch in ['h', 'i'] {
+        session.press_chord(&ch.to_string()).await?;
     }
-    // The most recent row's expression should now be "7+1". If Ctrl stayed
-    // down (or Ctrl+A+BackSpace left random state), we'd see a different
-    // expression or no new row at all.
     session
-        .locate("//ListItem[last()]//Label[1]")
-        .wait_for_text(|t| t == "7+1")
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("text-changed text-entry") && l.contains("\"hi\""),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // Modifier chord: Shift+j should produce an uppercase 'J'. Proves
+    // modifiers hold through the target key press and release cleanly
+    // on the unwind path. (Ctrl+A + BackSpace would be the more natural
+    // "clear" primitive but Ctrl-letter chords end up getting mapped to
+    // the control-character keysym — 0x01 for Ctrl+A — before reaching
+    // the client, so Ctrl-chords can't be verified by text output alone.)
+    let shift_cursor = session.stdout_cursor();
+    session.press_chord("Shift+j").await?;
+    session
+        .wait_for_stdout_line(
+            shift_cursor,
+            |l| l.contains("text-changed text-entry") && l.contains("\"hiJ\""),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // Typing another plain 'k' after the Shift chord should land as
+    // lowercase — if Shift stayed stuck, we'd see 'K' and the check
+    // below would fail.
+    let unstuck_cursor = session.stdout_cursor();
+    session.press_chord("k").await?;
+    session
+        .wait_for_stdout_line(
+            unstuck_cursor,
+            |l| l.contains("text-changed text-entry") && l.contains("\"hiJk\""),
+            Duration::from_secs(3),
+        )
         .await?;
 
     kill(session).await?;
     Ok(())
 }
 
+/// Auto-wait exercises a state transition that only shows up after a
+/// compositor frame tick: clicking the header-bar menu button opens the
+/// popover, whose visible state we observe via a subsequent locator
+/// query that polls until the expanded state flips.
 #[tokio::test]
-#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
-async fn menu_interaction_auto_waits() -> anyhow::Result<()> {
-    // Exercises the auto-wait machinery end-to-end against gnome-calculator:
-    //
-    //   1. type 2+3= via keyboard → populates the history list
-    //   2. wait_for_text on the last history label → polls until "5" appears
-    //   3. click the Main Menu toggle → opens the hamburger popover
-    //   4. wait_for state change on the menu button (expanded=true) →
-    //      demonstrates auto-wait picking up async state transitions
-    //
-    // Known limitation (documented here so the test's scope is clear):
-    // gnome-calculator 49's GtkPopoverMenu children aren't exposed in the
-    // AT-SPI tree — the Menu element appears but its MenuItem children
-    // remain an empty Generic/TabPanel. Clicking a specific menu item like
-    // "Clear History" by accessible name isn't possible today in this
-    // particular app. Other GTK4 apps with properly-annotated popovers
-    // (text editor, system settings) expose their menu items and would
-    // work through this same auto-wait path.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .try_init()
-        .ok();
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_main_menu_opens_auto_waits() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
 
-    let (session, _state) = start_calculator_session().await?;
-
-    // Compute 2+3= via keyboard. GTK4 calculator's digit buttons don't
-    // expose the AT-SPI Action interface (activation comes from GtkShortcut,
-    // not a registered action), so `locator.click()` on them returns
-    // "no action with index 0". Keyboard input is the idiomatic path for
-    // number entry anyway.
-    for keysym in [0x32, 0x2b, 0x33, 0x3d] {
-        session.press_keysym(keysym).await?;
-    }
-
-    // The calculation result shows up as the final Label in the history
-    // ListItem. wait_for_text polls until the label's text is "5" — the
-    // auto-wait case of "element exists but content not yet ready." Without
-    // it, the test would need a manual sleep here.
-    let result = session
-        .locate("//ListItem//Label[last()]")
-        .wait_for_text(|t| t == "5")
-        .await?;
-    assert_eq!(result, "5", "expected history result '5', got {result:?}");
-
-    // Open the primary ("hamburger") menu via its ToggleButton. The outer
-    // <Button> wrapper doesn't carry an Action interface in GTK4; the inner
-    // ToggleButton does. Name "Main Menu" matches GNOME Calculator 49 —
-    // older versions may differ and this selector would need updating.
+    // The main-menu button wraps a ToggleButton with role=toggle-button;
+    // AT-SPI exposes the wrapping Button with a `main-menu` name and an
+    // inner ToggleButton. Click the ToggleButton to open the popover.
     session
-        .locate("//ToggleButton[@name='Main Menu']")
+        .locate("//ToggleButton[@name='main-menu']")
         .click()
         .await?;
+
     // Wake GTK's event loop so the popover actually renders. AT-SPI actions
     // mutate GTK's model but don't tick the frame clock; in headless mutter
     // the popover won't appear in the tree until a compositor event forces
     // a repaint.
     session.press_keysym(0xffe1).await?; // Shift_L
 
-    // Auto-wait: the Menu element only appears in the tree once the popover
-    // is actually open. No manual sleep — `wait_for_visible` polls until
-    // it shows up.
+    // Auto-wait: the outer Button's `expanded` state should flip to true
+    // once the popover is open. wait_for_visible polls the snapshot until
+    // this becomes matchable — exercising the auto-wait retry machinery
+    // against a real state transition.
     session
-        .locate("//Menu[@name='Main Menu']")
+        .locate("//Button[@name='main-menu' and @expanded='true']")
         .wait_for_visible()
         .await?;
 
-    // And the wrapping Button now reports expanded=true. We assert via an
-    // XPath predicate on the state attribute; once an `is_expanded()`
-    // state predicate lands, the equivalent check becomes a direct call.
-    session
-        .locate("//Button[@name='Main Menu' and @expanded='true']")
-        .wait_for_visible()
-        .await?;
-
-    // Dump the tree so the limitation noted at the top is visible in CI logs.
+    // Dump the tree so the popover structure is visible in CI logs.
     let tree = session.dump_tree().await?;
     eprintln!(
         "── tree after opening menu ─────────────────────────────────\n{tree}\n\
@@ -334,68 +487,14 @@ async fn menu_interaction_auto_waits() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Exercises pointer-input primitives against a running app — proves
+/// the InputBackend pointer_motion_relative / pointer_button dispatch
+/// path doesn't error under headless mutter.
 #[tokio::test]
-#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
-async fn click_element_changes_display() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .try_init()
-        .ok();
-
-    let (session, _state) = start_calculator_session().await?;
-
-    // Baseline screenshot.
-    let baseline = extract_png(&session.take_screenshot().await?);
-
-    // Click "5" via the XPath locator, then wake GTK's event loop.
-    session.locate("//Button[@name='5']").click().await?;
-    session.press_keysym(0xffe1).await?; // Shift_L wake
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    // Press "+" via keysym.
-    session.press_keysym(0x2b).await?; // '+'
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    // Click "3" via locator + wake.
-    session.locate("//Button[@name='3']").click().await?;
-    session.press_keysym(0xffe1).await?; // Shift_L wake
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    // Press "=" via keysym.
-    session.press_keysym(0x3d).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    // After-click screenshot.
-    let after_click = extract_png(&session.take_screenshot().await?);
-
-    let img1 = image::load_from_memory(&baseline)?.to_rgba8();
-    let img2 = image::load_from_memory(&after_click)?.to_rgba8();
-    let diff_pixels = img1
-        .pixels()
-        .zip(img2.pixels())
-        .filter(|(a, b)| a != b)
-        .count();
-    eprintln!("pixel diff after click: {diff_pixels}");
-
-    kill(session).await?;
-
-    assert!(
-        diff_pixels > 100,
-        "display should change after clicking 5 + 3 = (only {diff_pixels} pixels differ)"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "flaky: shared gnome-calculator instance on host a11y bus"]
-async fn pointer_input_operations() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .try_init()
-        .ok();
-
-    let (session, state) = start_calculator_session().await?;
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_pointer_input_operations() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, state) = start_fixture_session("gtk4").await?;
 
     // Verify Session::wayland_display() accessor.
     assert!(
@@ -404,20 +503,20 @@ async fn pointer_input_operations() -> anyhow::Result<()> {
         session.wayland_display()
     );
 
-    // Create a second InputBackend from the shared state for pointer tests.
+    // Create a second InputBackend from the shared compositor state — the
+    // pattern tests use when they need both the Session's backend and a
+    // directly-owned one for pointer calls.
     let pointer = MutterInput::new(state);
 
-    // Move pointer — should succeed without error.
     pointer.pointer_motion_relative(100.0, 100.0).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Click (BTN_LEFT = 0x110) — should succeed without error.
+    // BTN_LEFT = 0x110.
     pointer.pointer_button(0x110).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Move pointer again with negative offsets.
     pointer.pointer_motion_relative(-50.0, -50.0).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Confirm session is still functional by taking a screenshot.
     let screenshot = session.take_screenshot().await?;

@@ -1,0 +1,16 @@
+[package]
+name = "waydriver-fixture-gtk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Purpose-built GTK4 demo app used as a deterministic e2e test fixture for waydriver"
+readme = "README.md"
+publish = false
+
+[dependencies]
+gtk4.workspace = true
+libadwaita.workspace = true

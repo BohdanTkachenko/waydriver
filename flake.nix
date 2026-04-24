@@ -31,7 +31,29 @@
         gst_all_1.gstreamer
         gst_all_1.gst-plugins-base
         gst_all_1.gst-plugins-good
-        gnome-calculator
+        # GTK4 + its pkg-config-advertised transitive deps — linked against
+        # by the waydriver-fixture-gtk demo crate. `buildEnv` doesn't follow
+        # propagated inputs, so every pc dep GTK4 declares has to appear
+        # here by name. `out` is needed at runtime; `dev` carries .pc files.
+        gtk4
+        gtk4.dev
+        pango.dev
+        cairo.dev
+        gdk-pixbuf.dev
+        harfbuzz.dev
+        libepoxy.dev
+        fribidi.dev
+        libxkbcommon.dev
+        wayland.dev
+        vulkan-headers
+        vulkan-loader.dev
+        # libadwaita — the GNOME HIG widget layer on top of GTK4. The
+        # fixture uses Adw widgets alongside raw GTK4 ones so we can
+        # isolate AT-SPI behavior to whichever layer actually produces
+        # the output for a given test.
+        libadwaita
+        libadwaita.dev
+        appstream.dev
         # CI / release verification tooling
         actionlint
         act
@@ -88,7 +110,6 @@
                   pkgs.gst_all_1.gstreamer
                   pkgs.gst_all_1.gst-plugins-base
                   pkgs.gst_all_1.gst-plugins-good
-                  pkgs.gnome-calculator
                 ]
               }:$PATH"
               export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
@@ -112,13 +133,14 @@
             "${script}/bin/waydriver-docker-build";
         };
 
-        # nix run .#docker-build-e2e — builds the e2e Docker image (adds gnome-calculator)
+        # nix run .#docker-build-e2e — builds the e2e Docker image (adds the
+        # waydriver-fixture-gtk binary and its GTK4/libadwaita runtime libs).
         docker-build-e2e = {
           type = "app";
           program =
             let
               script = pkgs.writeShellScriptBin "waydriver-docker-build-e2e" ''
-                exec docker build --build-arg INSTALL_CALCULATOR=true -t waydriver-mcp-e2e "$@" .
+                exec docker build --target runtime-e2e -t waydriver-mcp-e2e "$@" .
               '';
             in
             "${script}/bin/waydriver-docker-build-e2e";
@@ -184,7 +206,6 @@
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
           gst_all_1.gst-plugins-good
-          gnome-calculator
         ];
 
         checkPhase = ''
@@ -207,6 +228,10 @@
           export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
           export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${pkgs.gsettings-desktop-schemas}/share:''${XDG_DATA_DIRS:-/run/current-system/sw/share}"
           export GST_PLUGIN_PATH="${gstPluginPath}"
+          # pkg-config lookup for packages that only ship their .pc files
+          # under the dev-profile (GTK4's `.dev` output is pulled in via
+          # devPackages but buildEnv concatenates pkgconfig dirs here):
+          export PKG_CONFIG_PATH="$PWD/.nix-profile/lib/pkgconfig:$PWD/.nix-profile/share/pkgconfig:''${PKG_CONFIG_PATH:-}"
         '';
       };
     };

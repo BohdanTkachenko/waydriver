@@ -6,6 +6,7 @@ members = [
     "crates/waydriver-input-mutter",
     "crates/waydriver-capture-mutter",
     "crates/waydriver-mcp",
+    "crates/waydriver-fixture-gtk",
 ]
 
 [workspace.package]
@@ -39,3 +40,7 @@ gstreamer = "0.25"
 gstreamer-app = "0.25"
 sxd-document = "0.3"
 sxd-xpath = "0.4"
+gtk4 = "0.10"
+# `v1_5` enables AdwDialog (the modern dialog primitive) and SwitchRow.
+# Bump this the same time the flake's libadwaita version bumps.
+libadwaita = { version = "0.8", features = ["v1_5"] }
