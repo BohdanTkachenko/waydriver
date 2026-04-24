@@ -38,7 +38,9 @@ jobs:
             libatspi2.0-dev \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
-            libpipewire-0.3-dev
+            libpipewire-0.3-dev \
+            libgtk-4-dev \
+            libadwaita-1-dev
       - uses: Swatinem/rust-cache@v2
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -58,7 +60,9 @@ jobs:
             libatspi2.0-dev \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
-            libpipewire-0.3-dev
+            libpipewire-0.3-dev \
+            libgtk-4-dev \
+            libadwaita-1-dev
       - uses: Swatinem/rust-cache@v2
       - name: Run unit tests
         run: cargo test --workspace
