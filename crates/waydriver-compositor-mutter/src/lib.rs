@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
@@ -37,8 +37,27 @@ pub struct MutterState {
     pub conn: zbus::Connection,
     /// RemoteDesktop session path, used by input injection.
     pub rd_session_path: String,
+    /// RemoteDesktop session id, read from the `SessionId` property on
+    /// the RD session. `waydriver-capture-mutter` passes this as the
+    /// `remote-desktop-session-id` option to `ScreenCast.CreateSession`
+    /// so mutter links the two; the link is required for
+    /// `NotifyPointerMotionAbsolute` to be accepted.
+    pub rd_session_id: String,
+    /// Whether `RemoteDesktop.Session.Start` has been called yet. Mutter
+    /// requires the RD session to be *unstarted* when linking a
+    /// ScreenCast session (`remote-desktop-session-id` only accepted
+    /// pre-Start), so `waydriver-capture-mutter` defers `RD.Start`
+    /// until after the first linked `ScreenCast.CreateSession` returns.
+    /// Guarded by `Mutex` to make the check-and-set race-free.
+    pub rd_started: Arc<Mutex<bool>>,
     /// Per-session XDG_RUNTIME_DIR, used by capture to locate the PipeWire socket.
     pub runtime_dir: PathBuf,
+    /// ScreenCast Stream object path of the currently active stream.
+    /// Set by `waydriver-capture-mutter` in `start_stream`, cleared in
+    /// `stop_stream`. `waydriver-input-mutter` needs it to route
+    /// `NotifyPointerMotionAbsolute` at the correct monitor. `None`
+    /// when no stream is open — absolute pointer motion will error.
+    pub active_stream_path: Arc<Mutex<Option<String>>>,
 }
 
 /// Headless mutter instance.
@@ -224,24 +243,51 @@ impl CompositorRuntime for MutterCompositor {
             .body()
             .deserialize()
             .map_err(|e| Error::Process(format!("parse RD session path: {e}")))?;
-        // Start the RemoteDesktop session.
-        mutter_conn
+        // Intentionally do NOT call `RemoteDesktop.Session.Start` here.
+        // Mutter only accepts `remote-desktop-session-id` on
+        // `ScreenCast.CreateSession` when the RD session is not yet
+        // started, so `waydriver-capture-mutter::start_stream` defers
+        // the Start call until after it has created the linked
+        // ScreenCast session.
+        // Read the RD session's `SessionId` property — it's the token
+        // ScreenCast.CreateSession needs in `remote-desktop-session-id`
+        // to link the two sessions. Without that link, mutter rejects
+        // NotifyPointerMotionAbsolute with "No screen cast active".
+        let rd_session_id_reply = mutter_conn
             .call_method(
                 Some("org.gnome.Mutter.RemoteDesktop"),
                 rd_session_path.as_str(),
-                Some("org.gnome.Mutter.RemoteDesktop.Session"),
-                "Start",
-                &(),
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.gnome.Mutter.RemoteDesktop.Session", "SessionId"),
             )
             .await
-            .map_err(|e| Error::Process(format!("RemoteDesktop Start: {e}")))?;
+            .map_err(|e| Error::Process(format!("Get SessionId: {e}")))?;
+        // `Get` returns a variant; deserialize as `OwnedValue` to detach
+        // the string from the reply's body before the reply is dropped.
+        let rd_session_id_body = rd_session_id_reply.body();
+        let rd_session_id_variant: zbus::zvariant::OwnedValue = rd_session_id_body
+            .deserialize()
+            .map_err(|e| Error::Process(format!("parse SessionId variant: {e}")))?;
+        let rd_session_id: String = rd_session_id_variant
+            .try_into()
+            .map_err(|e| Error::Process(format!("SessionId not a string: {e}")))?;
+
         let rd_session_path = rd_session_path.to_string();
-        tracing::debug!(id = self.id, rd_session_path = %rd_session_path, "RemoteDesktop session started");
+        tracing::debug!(
+            id = self.id,
+            rd_session_path = %rd_session_path,
+            rd_session_id = %rd_session_id,
+            "RemoteDesktop session started"
+        );
 
         self.state = Some(Arc::new(MutterState {
             conn: mutter_conn,
             rd_session_path,
+            rd_session_id,
+            rd_started: Arc::new(Mutex::new(false)),
             runtime_dir: self.runtime_dir.clone(),
+            active_stream_path: Arc::new(Mutex::new(None)),
         }));
 
         Ok(())

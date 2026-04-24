@@ -82,6 +82,32 @@ impl InputBackend for MutterInput {
         Ok(())
     }
 
+    async fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<()> {
+        let stream = self
+            .state
+            .active_stream_path
+            .lock()
+            .expect("active_stream_path mutex poisoned")
+            .clone()
+            .ok_or_else(|| {
+                Error::Process(
+                    "no active ScreenCast stream; absolute pointer motion needs one".into(),
+                )
+            })?;
+        self.state
+            .conn
+            .call_method(
+                Some("org.gnome.Mutter.RemoteDesktop"),
+                self.state.rd_session_path.as_str(),
+                Some("org.gnome.Mutter.RemoteDesktop.Session"),
+                "NotifyPointerMotionAbsolute",
+                &(stream.as_str(), x, y),
+            )
+            .await
+            .map_err(|e| Error::Process(format!("NotifyPointerMotionAbsolute: {e}")))?;
+        Ok(())
+    }
+
     async fn pointer_button(&self, button: u32) -> Result<()> {
         let button: i32 = button
             .try_into()

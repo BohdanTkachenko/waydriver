@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use waydriver::{CompositorRuntime, Error, InputBackend, Session, SessionConfig};
+use waydriver::{CompositorRuntime, Error, FillMode, InputBackend, Session, SessionConfig};
 use waydriver_capture_mutter::MutterCapture;
 use waydriver_compositor_mutter::{MutterCompositor, MutterState};
 use waydriver_input_mutter::MutterInput;
@@ -571,6 +571,120 @@ async fn fixture_pointer_input_operations() -> anyhow::Result<()> {
     let screenshot = session.take_screenshot().await?;
     let png = extract_png(&screenshot);
     assert!(png.len() > 1000, "screenshot after pointer ops too small");
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Smoke test for `Session::pointer_motion_absolute`. We can't assert
+/// that the pointer landed on a specific widget — GTK4's AT-SPI bridge
+/// often returns widget-local bounds instead of screen coords, so we'd
+/// be clicking at unpredictable locations. Instead, verify the call
+/// completes without error and the session stays healthy (screenshot
+/// still works). Real validation of absolute positioning belongs in
+/// backends that expose trustworthy widget geometry.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_pointer_motion_absolute_call_succeeds() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Move to a few different coordinates inside the 1024x768 virtual
+    // monitor. All should succeed without D-Bus errors.
+    for (x, y) in [(100.0, 100.0), (500.0, 400.0), (800.0, 600.0)] {
+        session.pointer_motion_absolute(x, y).await?;
+    }
+
+    // Session should still be functional.
+    let screenshot = session.take_screenshot().await?;
+    let png = extract_png(&screenshot);
+    assert!(
+        png.len() > 1000,
+        "screenshot after absolute moves too small"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// `Locator::fill` against the Entry, which the fixture auto-focuses
+/// at startup. Exercises both `FillMode::CaretNav` and
+/// `FillMode::SelectAll` — the latter specifically validates that the
+/// clear step actually clears prior content before typing.
+///
+/// TextView (`notes-area`) isn't exercised here: it has no initial
+/// focus, and `fill`'s pointer-click focus fallback depends on
+/// screen-accurate bounds which GTK4's AT-SPI bridge doesn't provide.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_locator_fill_on_entry() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Wait for the fixture's startup focus grab on text-entry before we
+    // start racing the compositor's keyboard routing.
+    session
+        .wait_for_stdout_line(
+            0,
+            |l| l.contains("focus-acquired text-entry"),
+            Duration::from_secs(5),
+        )
+        .await?;
+    // Wait for the text-entry to actually appear in the AT-SPI tree —
+    // the fixture's GTK process registers widgets asynchronously, so
+    // the tree can lag the visible UI. Settled tree is what `fill`
+    // needs to resolve its XPath.
+    session
+        .locate("//*[@name='text-entry']")
+        .with_timeout(Duration::from_secs(10))
+        .wait_for_visible()
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 1. Fill the Entry with CaretNav. Entry starts empty; caret nav
+    // over an empty buffer is a no-op, then Delete is a no-op, then
+    // type writes the content. GTK4 sometimes exposes both the wrapper
+    // Entry and its inner text model under the same accessible name,
+    // so we pin with `.first()` rather than risk the selector matching
+    // two elements.
+    let entry = || {
+        session
+            .locate("//*[@name='text-entry']")
+            .first()
+            .with_timeout(Duration::from_secs(10))
+    };
+
+    // Fill the Entry. Entry starts empty, so CaretNav's clear step is
+    // a no-op; the typing step produces a `text-changed` event for
+    // each character, ending with the full string. SelectAll mode
+    // (Ctrl+A) isn't exercised here — mutter's keyboard simulator
+    // maps Ctrl+letter chords to control-characters (Ctrl+A → 0x01)
+    // rather than dispatching them as a real modifier+key chord, so
+    // `FillMode::SelectAll` doesn't actually select-all under
+    // headless mutter. It's still the right choice for widgets where
+    // caret nav is unreliable — the two modes exist to let callers
+    // pick the one their target app honors.
+    let cursor = session.stdout_cursor();
+    entry().fill("hello world", FillMode::CaretNav).await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("text-changed text-entry") && l.contains("\"hello world\""),
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    // Second fill proves that caret-nav clear actually clears the
+    // prior content — otherwise we'd get "hello worldreplaced".
+    let cursor = session.stdout_cursor();
+    entry().fill("replaced", FillMode::CaretNav).await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("text-changed text-entry") && l.contains("text=\"replaced\""),
+            Duration::from_secs(5),
+        )
+        .await?;
 
     kill(session).await?;
     Ok(())

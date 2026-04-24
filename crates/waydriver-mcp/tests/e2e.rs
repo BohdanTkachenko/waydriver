@@ -69,6 +69,7 @@ async fn run_fixture_test(command: tokio::process::Command) -> anyhow::Result<()
         "click",
         "focus",
         "set_text",
+        "fill",
         "read_text",
         "type_text",
         "press_key",
@@ -221,6 +222,49 @@ async fn run_fixture_test(command: tokio::process::Command) -> anyhow::Result<()
         )
         .await?;
     assert!(!result.is_error.unwrap_or(false), "type_text failed");
+
+    // Fill the text-entry and round-trip through read_text. After the
+    // prior type_text the entry contains "hello"; fill must clear that
+    // and leave exactly "fill works", proving the select-all + delete
+    // sequence worked.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("fill").with_arguments(
+                serde_json::json!({
+                    "session_id": session_id,
+                    "xpath": "(//*[@name='text-entry'])[1]",
+                    "text": "fill works"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "fill failed: {}",
+        result_text(&result)
+    );
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("read_text").with_arguments(
+                serde_json::json!({
+                    "session_id": session_id,
+                    "xpath": "(//*[@name='text-entry'])[1]"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+    assert_eq!(
+        result_text(&result),
+        "fill works",
+        "fill should replace, not append"
+    );
 
     // Move pointer — primitive test, just verify the call doesn't error.
     let result = client

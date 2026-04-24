@@ -40,6 +40,18 @@ const INITIAL_POLL_DELAY: Duration = Duration::from_millis(50);
 /// accumulating too much wait between attempts.
 const MAX_POLL_DELAY: Duration = Duration::from_millis(500);
 
+/// How [`Locator::fill`] clears existing content before typing.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillMode {
+    /// `Ctrl+Home` then `Ctrl+Shift+End` — explicit caret navigation.
+    /// Two chords; slightly slower. The default.
+    #[default]
+    CaretNav,
+    /// `Ctrl+A` — one chord; faster when the target honors the
+    /// standard select-all binding.
+    SelectAll,
+}
+
 /// A lazy, re-resolving handle to one or more AT-SPI elements.
 ///
 /// See the [module-level documentation](crate::locator) for the resolution model.
@@ -270,7 +282,6 @@ impl Locator {
             ))
         })
     }
-
     /// Text contents of the matched element via the AT-SPI Text interface.
     /// Unlike other metadata, text isn't captured in the snapshot — each
     /// call makes a live read through the Text proxy after auto-waiting for
@@ -295,7 +306,11 @@ impl Locator {
         atspi_client::do_action_on(a11y, &self.xpath, &bus, &path).await
     }
 
-    /// Replace the contents of an editable text element.
+    /// Replace the contents of an editable text element via the AT-SPI
+    /// `EditableText::SetTextContents` interface. Fast (one D-Bus round
+    /// trip) but requires the target to implement `EditableText` — some
+    /// toolkits (notably GTK4 `TextView` and widgets with custom entry
+    /// buffers) don't. For those, use [`fill`](Self::fill) instead.
     ///
     /// Auto-waits for the element to be resolvable, showing, and enabled.
     pub async fn set_text(&self, text: &str) -> Result<()> {
@@ -303,6 +318,67 @@ impl Locator {
         let (bus, path) = info.ref_;
         let a11y = self.a11y()?;
         atspi_client::set_text_on(a11y, &self.xpath, &bus, &path, text).await
+    }
+
+    /// Replace the contents of a text widget by simulating keyboard input:
+    /// focus the element, clear existing content per `mode`, then type.
+    ///
+    /// Slower than [`set_text`](Self::set_text) but works on any widget
+    /// that accepts keyboard input — including `GtkTextView` and other
+    /// targets that don't implement the AT-SPI `EditableText` interface.
+    /// Use `set_text` when the target exposes `EditableText`; use `fill`
+    /// as the compatibility fallback.
+    ///
+    /// Focus handling: `fill` tries AT-SPI `Component::grab_focus`. If
+    /// that returns `NotSupported` (GTK4 text widgets don't implement
+    /// Component in current releases), a warning is logged and the
+    /// method continues — it trusts the caller to have focused the
+    /// widget through some other path: an app-level `grab_focus` on
+    /// startup, a prior pointer click, or Tab navigation. Once WAY-4-
+    /// era widget bounds become reliable across toolkits, `fill` can
+    /// synthesize a pointer click itself; for now the fallback is too
+    /// unreliable to trust (GTK4's AT-SPI bridge often returns
+    /// widget-local bounds where screen coords are expected).
+    ///
+    /// See [`FillMode`] for the tradeoffs between select-all strategies.
+    pub async fn fill(&self, text: &str, mode: FillMode) -> Result<()> {
+        // 1. Focus best-effort. Propagate any error other than
+        // NotSupported — NotSupported is the known GTK4 case where the
+        // caller is expected to manage focus themselves.
+        match self.focus().await {
+            Ok(()) => {}
+            Err(e) if e.to_string().contains("NotSupported") => {
+                tracing::warn!(
+                    xpath = %self.xpath,
+                    "fill: AT-SPI focus NotSupported; \
+                     proceeding on the assumption caller has focused the widget"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+
+        // 2. Clear existing content.
+        match mode {
+            FillMode::CaretNav => {
+                self.session.press_chord("Ctrl+Home").await?;
+                self.session.press_chord("Ctrl+Shift+End").await?;
+            }
+            FillMode::SelectAll => {
+                self.session.press_chord("Ctrl+A").await?;
+            }
+        }
+        let delete =
+            crate::keysym::key_name_to_keysym("delete").expect("'delete' is a known key name");
+        self.session.press_keysym(delete).await?;
+
+        // 3. Type new content.
+        self.session.type_text(text).await?;
+        Ok(())
+    }
+
+    /// Shorthand for `fill(text, FillMode::default())`.
+    pub async fn fill_default(&self, text: &str) -> Result<()> {
+        self.fill(text, FillMode::default()).await
     }
 
     /// Give keyboard focus to the matched element.
@@ -788,6 +864,9 @@ mod tests {
             Ok(())
         }
         async fn pointer_motion_relative(&self, _dx: f64, _dy: f64) -> WdResult<()> {
+            Ok(())
+        }
+        async fn pointer_motion_absolute(&self, _x: f64, _y: f64) -> WdResult<()> {
             Ok(())
         }
         async fn pointer_button(&self, _button: u32) -> WdResult<()> {

@@ -269,9 +269,28 @@ impl Session {
         self.input.pointer_motion_relative(dx, dy).await
     }
 
+    /// Move the pointer to a screen-relative absolute position in logical
+    /// pixels. Requires an active capture stream on backends that route
+    /// through the compositor's ScreenCast pipeline (mutter).
+    pub async fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<()> {
+        self.input.pointer_motion_absolute(x, y).await
+    }
+
     /// Press and release a pointer button (Linux evdev code, e.g. BTN_LEFT = 0x110).
     pub async fn pointer_button(&self, button: u32) -> Result<()> {
         self.input.pointer_button(button).await
+    }
+
+    /// Type a string as keyboard input, one X11 keysym per `char`. Latin-1
+    /// characters map directly; other Unicode uses the `0x01000000 + codepoint`
+    /// encoding (see [`crate::keysym::char_to_keysym`]). Does not manage
+    /// focus — call [`crate::Locator::focus`] or click the target widget
+    /// first.
+    pub async fn type_text(&self, text: &str) -> Result<()> {
+        for ch in text.chars() {
+            self.press_keysym(crate::keysym::char_to_keysym(ch)).await?;
+        }
+        Ok(())
     }
 
     /// Wayland display socket name this session is running against.
@@ -863,6 +882,9 @@ mod tests {
             async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
                 Ok(())
             }
+            async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
+                Ok(())
+            }
             async fn pointer_button(&self, _: u32) -> Result<()> {
                 Ok(())
             }
@@ -926,6 +948,9 @@ mod tests {
                 Ok(())
             }
             async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
                 Ok(())
             }
             async fn pointer_button(&self, _: u32) -> Result<()> {
@@ -1036,6 +1061,9 @@ mod tests {
             async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
                 Ok(())
             }
+            async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
+                Ok(())
+            }
             async fn pointer_button(&self, _: u32) -> Result<()> {
                 Ok(())
             }
@@ -1109,6 +1137,9 @@ mod tests {
                 Ok(())
             }
             async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
                 Ok(())
             }
             async fn pointer_button(&self, _: u32) -> Result<()> {

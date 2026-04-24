@@ -16,7 +16,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 use serde::Deserialize;
 
 use waydriver::atspi::ElementInfo;
-use waydriver::keysym::{char_to_keysym, parse_chord};
+use waydriver::keysym::parse_chord;
 use waydriver::{CompositorRuntime, Session, SessionConfig};
 use waydriver_capture_mutter::MutterCapture;
 use waydriver_compositor_mutter::MutterCompositor;
@@ -103,6 +103,22 @@ pub struct SetTextParams {
     pub xpath: String,
     /// Text to write to the element (replaces existing contents).
     pub text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FillParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one text-accepting element.
+    pub xpath: String,
+    /// Text to type into the element (replaces existing contents).
+    pub text: String,
+    /// How to clear existing content before typing. `"caret_nav"`
+    /// (default) uses `Ctrl+Home` then `Ctrl+Shift+End` — works on any
+    /// single-line or multi-line widget. `"select_all"` uses `Ctrl+A`
+    /// — faster, but depends on the app honoring the binding.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -977,6 +993,66 @@ impl UiTestServer {
     }
 
     #[tool(
+        description = "Replace text contents by simulating keyboard input: focus the element, \
+                       clear existing content, then type. Works on any standard text widget \
+                       — including GtkTextView and others that don't implement EditableText. \
+                       Prefer set_text when the target supports it (one D-Bus call); use \
+                       fill as the compatibility fallback. \
+                       `mode`: \"caret_nav\" (default; Ctrl+Home then Ctrl+Shift+End) or \
+                       \"select_all\" (Ctrl+A — faster when the app honors it)."
+    )]
+    async fn fill(
+        &self,
+        Parameters(params): Parameters<FillParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(&params.session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
+        })?;
+
+        let mode = match params.mode.as_deref() {
+            None | Some("caret_nav") => waydriver::FillMode::CaretNav,
+            Some("select_all") => waydriver::FillMode::SelectAll,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "invalid fill mode {other:?}; expected \"caret_nav\" or \"select_all\""
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        let xpath = params.xpath.clone();
+        let text = params.text.clone();
+        let outcome: Result<String, String> =
+            match managed.session.locate(&xpath).fill(&text, mode).await {
+                Ok(()) => Ok(format!("Filled {xpath}")),
+                Err(e) => Err(e.to_string()),
+            };
+        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
+        if let Err(e) = managed
+            .log_event(
+                &params.session_id,
+                "fill",
+                serde_json::json!({
+                    "xpath": params.xpath,
+                    "text": params.text,
+                    "mode": params.mode,
+                }),
+                log_outcome,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "log_event(fill) failed");
+        }
+
+        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
         description = "Read the text contents of an element selected by XPath. Target must \
                        implement the Text AT-SPI interface."
     )]
@@ -1025,17 +1101,10 @@ impl UiTestServer {
         })?;
         let session = &managed.session;
 
-        let outcome: Result<String, String> = async {
-            for ch in params.text.chars() {
-                let keysym = char_to_keysym(ch);
-                session
-                    .press_keysym(keysym)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(format!("Typed '{}'", params.text))
-        }
-        .await;
+        let outcome: Result<String, String> = match session.type_text(&params.text).await {
+            Ok(()) => Ok(format!("Typed '{}'", params.text)),
+            Err(e) => Err(e.to_string()),
+        };
         let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
         if let Err(e) = managed
             .log_event(
@@ -1393,6 +1462,9 @@ mod tests {
             _dx: f64,
             _dy: f64,
         ) -> waydriver::error::Result<()> {
+            Ok(())
+        }
+        async fn pointer_motion_absolute(&self, _x: f64, _y: f64) -> waydriver::error::Result<()> {
             Ok(())
         }
         async fn pointer_button(&self, button: u32) -> waydriver::error::Result<()> {

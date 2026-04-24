@@ -56,6 +56,13 @@ pub trait InputBackend: Send + Sync {
     /// Move the pointer by a relative offset in logical pixels.
     async fn pointer_motion_relative(&self, dx: f64, dy: f64) -> Result<()>;
 
+    /// Move the pointer to a screen-relative absolute position in logical
+    /// pixels. Implementations route through whatever channel their
+    /// compositor exposes (e.g. `NotifyPointerMotionAbsolute` on mutter's
+    /// RemoteDesktop). Backends with no active capture stream to address
+    /// should return `Err`.
+    async fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<()>;
+
     /// Press and release a pointer button. `button` uses Linux evdev codes
     /// (e.g. `BTN_LEFT` = 0x110).
     async fn pointer_button(&self, button: u32) -> Result<()>;

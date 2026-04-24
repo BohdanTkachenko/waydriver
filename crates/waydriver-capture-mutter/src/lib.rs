@@ -33,15 +33,22 @@ impl CaptureBackend for MutterCapture {
     async fn start_stream(&self) -> Result<PipeWireStream> {
         let conn = &self.state.conn;
 
-        // Step 1: Create ScreenCast session.
+        // Step 1: Create ScreenCast session, linking it to the existing
+        // RemoteDesktop session so absolute pointer motion works (mutter
+        // routes NotifyPointerMotionAbsolute through the linked stream).
         let empty_opts: HashMap<&str, Value> = HashMap::new();
+        let mut create_opts: HashMap<&str, Value> = HashMap::new();
+        create_opts.insert(
+            "remote-desktop-session-id",
+            Value::from(self.state.rd_session_id.as_str()),
+        );
         let reply = conn
             .call_method(
                 Some("org.gnome.Mutter.ScreenCast"),
                 "/org/gnome/Mutter/ScreenCast",
                 Some("org.gnome.Mutter.ScreenCast"),
                 "CreateSession",
-                &(empty_opts.clone(),),
+                &(create_opts,),
             )
             .await
             .map_err(|e| Error::Screenshot(format!("CreateSession: {e}")))?;
@@ -85,16 +92,49 @@ impl CaptureBackend for MutterCapture {
             .await
             .map_err(|e| Error::Screenshot(format!("receive_signal: {e}")))?;
 
-        // Step 4: Start the ScreenCast session.
-        conn.call_method(
-            Some("org.gnome.Mutter.ScreenCast"),
-            session_path.as_str(),
-            Some("org.gnome.Mutter.ScreenCast.Session"),
-            "Start",
-            &(),
-        )
-        .await
-        .map_err(|e| Error::Screenshot(format!("Start: {e}")))?;
+        // Step 4: Start the ScreenCast session — via either the SC
+        // interface (standalone) or the linked RD session. When the SC
+        // session is linked to an RD session, mutter requires
+        // `RemoteDesktop.Session.Start` to drive it; calling
+        // `ScreenCast.Session.Start` directly yields
+        // "Must be started from remote desktop session". Starting RD
+        // also unlocks `NotifyPointerMotionAbsolute` on the input
+        // backend. Only the first stream triggers RD.Start; subsequent
+        // streams share the same RD session and skip.
+        let should_start_rd = {
+            let mut guard = self
+                .state
+                .rd_started
+                .lock()
+                .expect("rd_started mutex poisoned");
+            if *guard {
+                false
+            } else {
+                *guard = true;
+                true
+            }
+        };
+        if should_start_rd {
+            conn.call_method(
+                Some("org.gnome.Mutter.RemoteDesktop"),
+                self.state.rd_session_path.as_str(),
+                Some("org.gnome.Mutter.RemoteDesktop.Session"),
+                "Start",
+                &(),
+            )
+            .await
+            .map_err(|e| Error::Screenshot(format!("RemoteDesktop Start: {e}")))?;
+        } else {
+            conn.call_method(
+                Some("org.gnome.Mutter.ScreenCast"),
+                session_path.as_str(),
+                Some("org.gnome.Mutter.ScreenCast.Session"),
+                "Start",
+                &(),
+            )
+            .await
+            .map_err(|e| Error::Screenshot(format!("Start: {e}")))?;
+        }
 
         // Step 5: Wait for PipeWireStreamAdded signal to get the node id.
         let node_id: u32 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -111,6 +151,14 @@ impl CaptureBackend for MutterCapture {
         .map_err(|_| Error::Screenshot("timeout waiting for PipeWireStreamAdded".to_string()))??;
 
         tracing::debug!(node_id, "got PipeWire node id for screenshot");
+
+        // Publish the stream object path so MutterInput can route
+        // NotifyPointerMotionAbsolute at the correct monitor.
+        *self
+            .state
+            .active_stream_path
+            .lock()
+            .expect("active_stream_path mutex poisoned") = Some(stream_path.to_string());
 
         Ok(PipeWireStream {
             node_id,
@@ -133,6 +181,11 @@ impl CaptureBackend for MutterCapture {
                 &(),
             )
             .await;
+        *self
+            .state
+            .active_stream_path
+            .lock()
+            .expect("active_stream_path mutex poisoned") = None;
         Ok(())
     }
 
