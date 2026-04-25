@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
-use waydriver::{CaptureBackend, Error, PipeWireStream, Result};
+use waydriver::{CaptureBackend, Error, PipeWireStream, Result, StreamToken};
 use waydriver_compositor_mutter::MutterState;
 
 /// Mutter ScreenCast + PipeWire capture backend.
@@ -31,7 +31,7 @@ impl MutterCapture {
 #[async_trait]
 impl CaptureBackend for MutterCapture {
     async fn start_stream(&self) -> Result<PipeWireStream> {
-        let conn = &self.state.conn;
+        let conn = self.state.conn();
 
         // Step 1: Create ScreenCast session, linking it to the existing
         // RemoteDesktop session so absolute pointer motion works (mutter
@@ -40,7 +40,7 @@ impl CaptureBackend for MutterCapture {
         let mut create_opts: HashMap<&str, Value> = HashMap::new();
         create_opts.insert(
             "remote-desktop-session-id",
-            Value::from(self.state.rd_session_id.as_str()),
+            Value::from(self.state.rd_session_id()),
         );
         let reply = conn
             .call_method(
@@ -102,11 +102,7 @@ impl CaptureBackend for MutterCapture {
         // backend. Only the first stream triggers RD.Start; subsequent
         // streams share the same RD session and skip.
         let should_start_rd = {
-            let mut guard = self
-                .state
-                .rd_started
-                .lock()
-                .map_err(|_| Error::process("rd_started mutex poisoned"))?;
+            let mut guard = self.state.rd_started_lock()?;
             if *guard {
                 false
             } else {
@@ -117,7 +113,7 @@ impl CaptureBackend for MutterCapture {
         if should_start_rd {
             conn.call_method(
                 Some("org.gnome.Mutter.RemoteDesktop"),
-                self.state.rd_session_path.as_str(),
+                self.state.rd_session_path(),
                 Some("org.gnome.Mutter.RemoteDesktop.Session"),
                 "Start",
                 &(),
@@ -154,26 +150,24 @@ impl CaptureBackend for MutterCapture {
 
         // Publish the stream object path so MutterInput can route
         // NotifyPointerMotionAbsolute at the correct monitor.
-        *self
-            .state
-            .active_stream_path
-            .lock()
-            .map_err(|_| Error::process("active_stream_path mutex poisoned"))? =
-            Some(stream_path.to_string());
+        *self.state.active_stream_path_lock()? = Some(stream_path.to_string());
 
         Ok(PipeWireStream {
             node_id,
-            token: Box::new(session_path),
+            // The session_path is an `OwnedObjectPath`; `stop_stream`
+            // below downcasts back to it. `StreamToken::downcast`
+            // returns a typed error if a future change ever feeds a
+            // different value here, instead of a `()` from
+            // `Box::downcast`.
+            token: StreamToken::new(session_path),
         })
     }
 
     async fn stop_stream(&self, stream: PipeWireStream) -> Result<()> {
-        let session_path = stream.token.downcast::<OwnedObjectPath>().map_err(|_| {
-            Error::screenshot("stop_stream: token was not an OwnedObjectPath")
-        })?;
+        let session_path = stream.token.downcast::<OwnedObjectPath>()?;
         let _ = self
             .state
-            .conn
+            .conn()
             .call_method(
                 Some("org.gnome.Mutter.ScreenCast"),
                 session_path.as_str(),
@@ -182,15 +176,11 @@ impl CaptureBackend for MutterCapture {
                 &(),
             )
             .await;
-        *self
-            .state
-            .active_stream_path
-            .lock()
-            .map_err(|_| Error::process("active_stream_path mutex poisoned"))? = None;
+        *self.state.active_stream_path_lock()? = None;
         Ok(())
     }
 
     fn pipewire_socket(&self) -> PathBuf {
-        self.state.runtime_dir.join("pipewire-0")
+        self.state.runtime_dir().join("pipewire-0")
     }
 }

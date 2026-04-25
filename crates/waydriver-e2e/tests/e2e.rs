@@ -34,12 +34,28 @@ use waydriver_compositor_mutter::{MutterCompositor, MutterState};
 use waydriver_input_mutter::MutterInput;
 
 /// Strip any GStreamer status messages preceding the PNG magic bytes.
-fn extract_png(raw: &[u8]) -> Vec<u8> {
+///
+/// Returns an error including a hex preview of the input when the magic
+/// bytes are absent — the previous `.expect("no PNG magic found")`
+/// turned upstream encoder failures into opaque panics with no context
+/// about what was actually returned.
+fn extract_png(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
     let png_start = raw
         .windows(4)
         .position(|w| w == [0x89, b'P', b'N', b'G'])
-        .expect("no PNG magic found in screenshot data");
-    raw[png_start..].to_vec()
+        .ok_or_else(|| {
+            let preview_len = raw.len().min(64);
+            let preview: Vec<String> = raw[..preview_len]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let preview = preview.join(" ");
+            anyhow::anyhow!(
+                "no PNG magic in screenshot data ({} bytes; first {preview_len} bytes: {preview})",
+                raw.len()
+            )
+        })?;
+    Ok(raw[png_start..].to_vec())
 }
 
 /// Count pixels that differ between two PNG byte blobs.
@@ -90,7 +106,13 @@ fn fixture_binary() -> std::path::PathBuf {
 async fn start_fixture_session(section: &str) -> anyhow::Result<(Arc<Session>, Arc<MutterState>)> {
     let mut compositor = MutterCompositor::new();
     compositor.start(None).await?;
-    let state = compositor.state();
+    // `state()` returns `Option` post-API-tightening; immediately after
+    // a successful `start()` it is always `Some`, but `expect` makes
+    // the contract local to the call site rather than implicit in the
+    // type.
+    let state = compositor
+        .state()
+        .expect("MutterCompositor::state must be Some immediately after start() succeeded");
     let input = MutterInput::new(state.clone());
     let capture = MutterCapture::new(state.clone());
 
@@ -123,8 +145,23 @@ async fn start_fixture_session(section: &str) -> anyhow::Result<(Arc<Session>, A
 
 /// Spot-check every name in `expected` appears at least once in the tree.
 /// Shared body used by the three per-section diagnostic tests.
-async fn assert_widgets_exist(session: &Arc<Session>, section: &str, expected: &[&str]) {
-    let tree = session.dump_tree().await.expect("dump_tree");
+///
+/// Errors from `dump_tree` and `locate(...).count()` propagate as
+/// `anyhow::Result` so that AT-SPI / D-Bus failures surface with their
+/// full chain in the test report, instead of being collapsed into a
+/// terse `expect("dump_tree")` panic or silently masked as
+/// `unwrap_or(usize::MAX)` which the `>= 1` assertion would still
+/// accept. Missing widgets remain a panicking assertion — that's the
+/// scenario the test is *for*.
+async fn assert_widgets_exist(
+    session: &Arc<Session>,
+    section: &str,
+    expected: &[&str],
+) -> anyhow::Result<()> {
+    let tree = session
+        .dump_tree()
+        .await
+        .map_err(|e| anyhow::anyhow!("dump_tree failed for section {section:?}: {e}"))?;
     eprintln!(
         "── fixture tree ({section}) ─────────────────────────────\n{tree}\n\
          ────────────────────────────────────────────────────────────"
@@ -134,19 +171,27 @@ async fn assert_widgets_exist(session: &Arc<Session>, section: &str, expected: &
             .locate(&format!("//*[@name='{expected_name}']"))
             .count()
             .await
-            .unwrap_or(usize::MAX);
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "locate(name={expected_name:?}).count() failed in section {section:?}: {e}"
+                )
+            })?;
         assert!(
             count >= 1,
             "expected named widget '{expected_name}' to be in the tree (count: {count})"
         );
     }
+    Ok(())
 }
 
 fn init_tracing() {
-    tracing_subscriber::fmt()
+    // `try_init` only fails if a global subscriber is already installed,
+    // which happens whenever a test process runs more than one test in
+    // sequence. That's the expected steady state, so swallowing the
+    // result here is correct — there is nothing meaningful to report.
+    let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .try_init()
-        .ok();
+        .try_init();
 }
 
 #[tokio::test]
@@ -166,7 +211,7 @@ async fn fixture_exposes_gtk4_widgets() -> anyhow::Result<()> {
             "open-dialog",
         ],
     )
-    .await;
+    .await?;
     kill(session).await?;
     Ok(())
 }
@@ -191,7 +236,7 @@ async fn fixture_exposes_adw_widgets() -> anyhow::Result<()> {
             "main-menu",
         ],
     )
-    .await;
+    .await?;
     kill(session).await?;
     Ok(())
 }
@@ -206,7 +251,7 @@ async fn fixture_exposes_dnd_widgets() -> anyhow::Result<()> {
         "dnd",
         &["drag-source", "drop-target", "drop-status", "main-menu"],
     )
-    .await;
+    .await?;
     kill(session).await?;
     Ok(())
 }
@@ -344,7 +389,7 @@ async fn fixture_toggle_changes_screenshot() -> anyhow::Result<()> {
     init_tracing();
     let (session, _state) = start_fixture_session("gtk4").await?;
 
-    let baseline = extract_png(&session.take_screenshot().await?);
+    let baseline = extract_png(&session.take_screenshot().await?)?;
     assert!(baseline.len() > 1000, "baseline screenshot too small");
 
     let cursor = session.stdout_cursor();
@@ -363,7 +408,7 @@ async fn fixture_toggle_changes_screenshot() -> anyhow::Result<()> {
     // Extra beat for the compositor to flush the repaint.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let after = extract_png(&session.take_screenshot().await?);
+    let after = extract_png(&session.take_screenshot().await?)?;
     let diff_pixels = diff_png_pixels(&baseline, &after)?;
     eprintln!("pixel diff: {diff_pixels}");
 
@@ -608,19 +653,24 @@ async fn fixture_pointer_input_operations() -> anyhow::Result<()> {
     // token is the right default for a straight-line input sequence.
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    pointer.pointer_motion_relative(100.0, 100.0, &cancel).await?;
+    pointer
+        .pointer_motion_relative(100.0, 100.0, &cancel)
+        .await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // BTN_LEFT = 0x110.
-    pointer.pointer_button(0x110, &cancel).await?;
+    pointer
+        .pointer_button(waydriver::PointerButton::Left, &cancel)
+        .await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    pointer.pointer_motion_relative(-50.0, -50.0, &cancel).await?;
+    pointer
+        .pointer_motion_relative(-50.0, -50.0, &cancel)
+        .await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Confirm session is still functional by taking a screenshot.
     let screenshot = session.take_screenshot().await?;
-    let png = extract_png(&screenshot);
+    let png = extract_png(&screenshot)?;
     assert!(png.len() > 1000, "screenshot after pointer ops too small");
 
     kill(session).await?;
@@ -648,7 +698,7 @@ async fn fixture_pointer_motion_absolute_call_succeeds() -> anyhow::Result<()> {
 
     // Session should still be functional.
     let screenshot = session.take_screenshot().await?;
-    let png = extract_png(&screenshot);
+    let png = extract_png(&screenshot)?;
     assert!(
         png.len() > 1000,
         "screenshot after absolute moves too small"
@@ -716,7 +766,9 @@ async fn fixture_locator_fill_on_entry() -> anyhow::Result<()> {
     // caret nav is unreliable — the two modes exist to let callers
     // pick the one their target app honors.
     let cursor = session.stdout_cursor();
-    entry().fill_with_opts("hello world", FillMode::CaretNav).await?;
+    entry()
+        .fill_with_opts("hello world", FillMode::CaretNav)
+        .await?;
     session
         .wait_for_stdout_line(
             cursor,
@@ -728,7 +780,9 @@ async fn fixture_locator_fill_on_entry() -> anyhow::Result<()> {
     // Second fill proves that caret-nav clear actually clears the
     // prior content — otherwise we'd get "hello worldreplaced".
     let cursor = session.stdout_cursor();
-    entry().fill_with_opts("replaced", FillMode::CaretNav).await?;
+    entry()
+        .fill_with_opts("replaced", FillMode::CaretNav)
+        .await?;
     session
         .wait_for_stdout_line(
             cursor,

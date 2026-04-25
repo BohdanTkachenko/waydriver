@@ -70,12 +70,9 @@ impl UiTestServer {
         // whole map.
         let managed = {
             let sessions = self.sessions.read().await;
-            sessions
-                .get(session_id)
-                .cloned()
-                .ok_or_else(|| {
-                    McpError::invalid_params(format!("session not found: {session_id}"), None)
-                })?
+            sessions.get(session_id).cloned().ok_or_else(|| {
+                McpError::invalid_params(format!("session not found: {session_id}"), None)
+            })?
         };
         // Phase 2: take the per-session drain lock in read mode. This is
         // what `kill_session`'s `write_owned().await` waits on to learn
@@ -128,7 +125,10 @@ impl UiTestServer {
             Ok(msg) => Ok(msg.clone()),
             Err(e) => Err(mcp_error::format_chain(e)),
         };
-        let log_outcome = log_view.as_ref().map(String::as_str).map_err(String::as_str);
+        let log_outcome = log_view
+            .as_ref()
+            .map(String::as_str)
+            .map_err(String::as_str);
         if let Err(e) = held
             .log_event(session_id, action, log_params, log_outcome, None)
             .await
@@ -247,8 +247,8 @@ mod tests {
 
     use crate::params::{
         ClickParams, FocusParams, MovePointerParams, PointerClickParams, PressKeyParams,
-        QueryParams, ReadTextParams, SelectOptionParams, SessionIdParams, SetTextParams,
-        TypeTextParams,
+        QueryParams, ReadTextParams, SelectOptionByParam, SelectOptionParams, SessionIdParams,
+        SetTextParams, TypeTextParams,
     };
     use crate::tools::lifecycle::{resolve_video_output, seed_viewer};
 
@@ -293,7 +293,7 @@ mod tests {
     }
 
     struct MockInput {
-        last_button: std::sync::Mutex<Option<u32>>,
+        last_button: std::sync::Mutex<Option<waydriver::PointerButton>>,
     }
 
     impl MockInput {
@@ -345,7 +345,7 @@ mod tests {
         }
         async fn pointer_button_down(
             &self,
-            button: u32,
+            button: waydriver::PointerButton,
             _: &tokio_util::sync::CancellationToken,
         ) -> waydriver::error::Result<()> {
             *self.last_button.lock().unwrap() = Some(button);
@@ -353,14 +353,14 @@ mod tests {
         }
         async fn pointer_button_up(
             &self,
-            _button: u32,
+            _button: waydriver::PointerButton,
             _: &tokio_util::sync::CancellationToken,
         ) -> waydriver::error::Result<()> {
             Ok(())
         }
         async fn pointer_axis_discrete(
             &self,
-            _axis: u32,
+            _axis: waydriver::PointerAxis,
             _steps: i32,
             _: &tokio_util::sync::CancellationToken,
         ) -> waydriver::error::Result<()> {
@@ -410,7 +410,7 @@ mod tests {
                 session: Arc::new(session),
                 report_dir,
                 screenshot_counter: AtomicU32::new(0),
-                events: Mutex::new(Vec::new()),
+                events: Mutex::new(report::EventLog::new()),
                 report_enabled,
                 kill_lock: Arc::new(tokio::sync::RwLock::new(())),
             }),
@@ -501,7 +501,7 @@ mod tests {
             .select_option(Parameters(SelectOptionParams {
                 session_id: "bogus".into(),
                 xpath: "//ComboBox".into(),
-                by: "label".into(),
+                by: SelectOptionByParam::Label,
                 value: "Small".into(),
             }))
             .await
@@ -717,7 +717,7 @@ mod tests {
             session: Arc::new(session),
             report_dir: dir,
             screenshot_counter: AtomicU32::new(0),
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(report::EventLog::new()),
             report_enabled: true,
             kill_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
@@ -1084,8 +1084,15 @@ mod tests {
     #[tokio::test]
     async fn run_action_logs_event_on_success() {
         let tmp = TempDir::new().unwrap();
-        let s = UiTestServer::new(tmp.path().to_path_buf(), "1024x768".into(), false, 2_000_000);
-        tokio::fs::create_dir_all(tmp.path().join("sid")).await.unwrap();
+        let s = UiTestServer::new(
+            tmp.path().to_path_buf(),
+            "1024x768".into(),
+            false,
+            2_000_000,
+        );
+        tokio::fs::create_dir_all(tmp.path().join("sid"))
+            .await
+            .unwrap();
         insert_test_session(&s, "sid", "app", "wayland-x").await;
 
         let result = s
@@ -1114,8 +1121,15 @@ mod tests {
         // The whole point of the new error plumbing: log_event sees the
         // same chain-serialized message the MCP response carries.
         let tmp = TempDir::new().unwrap();
-        let s = UiTestServer::new(tmp.path().to_path_buf(), "1024x768".into(), false, 2_000_000);
-        tokio::fs::create_dir_all(tmp.path().join("sid")).await.unwrap();
+        let s = UiTestServer::new(
+            tmp.path().to_path_buf(),
+            "1024x768".into(),
+            false,
+            2_000_000,
+        );
+        tokio::fs::create_dir_all(tmp.path().join("sid"))
+            .await
+            .unwrap();
         insert_test_session(&s, "sid", "app", "wayland-x").await;
 
         let _ = s
@@ -1154,7 +1168,12 @@ mod tests {
         // signal cancellation after a delay.
         let token = {
             let sessions = s.sessions.read().await;
-            sessions.get("sid").unwrap().session.cancellation_token().clone()
+            sessions
+                .get("sid")
+                .unwrap()
+                .session
+                .cancellation_token()
+                .clone()
         };
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1163,18 +1182,23 @@ mod tests {
 
         let start = std::time::Instant::now();
         let err = s
-            .run_action("sid", "slow", serde_json::json!({}), move |sess| async move {
-                // Race the token against a long sleep, same pattern
-                // poll_with_retry uses internally.
-                tokio::select! {
-                    _ = sess.cancellation_token().cancelled() => {
-                        Err(waydriver::Error::Cancelled)
+            .run_action(
+                "sid",
+                "slow",
+                serde_json::json!({}),
+                move |sess| async move {
+                    // Race the token against a long sleep, same pattern
+                    // poll_with_retry uses internally.
+                    tokio::select! {
+                        _ = sess.cancellation_token().cancelled() => {
+                            Err(waydriver::Error::Cancelled)
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            Ok("slept 30s".to_string())
+                        }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        Ok("slept 30s".to_string())
-                    }
-                }
-            })
+                },
+            )
             .await
             .unwrap_err();
         let elapsed = start.elapsed();

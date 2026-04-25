@@ -246,7 +246,9 @@ fn role_to_element_name(role: &str) -> Option<String> {
         return None;
     }
     let mut it = out.chars();
-    let first = it.next().unwrap();
+    let first = it
+        .next()
+        .expect("invariant: out.is_empty() returned false above");
     if !(first.is_ascii_alphabetic() || first == '_') {
         return None;
     }
@@ -272,7 +274,10 @@ fn sanitize_attr_key(key: &str) -> Option<String> {
     if out.is_empty() {
         return None;
     }
-    let first = out.chars().next().unwrap();
+    let first = out
+        .chars()
+        .next()
+        .expect("invariant: out.is_empty() returned false above");
     if !(first.is_ascii_alphabetic() || first == '_') {
         out.insert(0, '_');
     }
@@ -355,6 +360,34 @@ pub async fn snapshot_tree(
 
 type SnapshotFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+/// Snapshot policy: per-node D-Bus introspection calls
+/// (`name`, `get_role_name`, `get_state`, `get_attributes`) that
+/// return an error are mapped to their default value so the
+/// snapshot of the surrounding tree still succeeds — the invariant
+/// is "one poisoned node doesn't abort the snapshot."
+///
+/// The substituted default is indistinguishable on the wire from a
+/// genuinely empty value (a node really *can* have name=""), so
+/// this helper logs the swallowed error at `warn` to make flakiness
+/// recoverable post-hoc via the trace stream. Modeling the
+/// fallibility on the snapshot itself (e.g. a `partial="true"`
+/// attribute) would make it observable to consumers but adds churn
+/// to every locator that reads metadata; this hybrid keeps the
+/// snapshot shape stable while putting the flakiness signal where
+/// it's most actionable — the operator's logs, not the test's
+/// assertion path.
+fn snapshot_default_on_err<T, E>(bus: &str, path: &str, op: &'static str, err: E) -> T
+where
+    T: Default,
+    E: std::fmt::Display,
+{
+    tracing::warn!(
+        %bus, %path, op, error = %err,
+        "snapshot: per-node introspection call failed; substituting default"
+    );
+    T::default()
+}
+
 fn snapshot_node<'a>(
     conn: &'a zbus::Connection,
     proxy: &'a AccessibleProxy<'a>,
@@ -364,13 +397,30 @@ fn snapshot_node<'a>(
     output: &'a mut String,
 ) -> SnapshotFuture<'a> {
     Box::pin(async move {
-        let raw_role = proxy
-            .get_role_name()
+        // role has its own non-Default fallback ("unknown") because
+        // an empty role string would change the meaning of the
+        // emitted XML element tag (`role_to_element_name` would map
+        // it to `<Node>` for a different reason than the
+        // genuinely-unmapped role case).
+        let raw_role = proxy.get_role_name().await.unwrap_or_else(|e| {
+            tracing::warn!(
+                %bus_name, %path, error = %e,
+                "snapshot: get_role_name failed; substituting \"unknown\""
+            );
+            "unknown".into()
+        });
+        let name: String = proxy
+            .name()
             .await
-            .unwrap_or_else(|_| "unknown".into());
-        let name = proxy.name().await.unwrap_or_default();
-        let states: StateSet = proxy.get_state().await.unwrap_or_default();
-        let attrs: HashMap<String, String> = proxy.get_attributes().await.unwrap_or_default();
+            .unwrap_or_else(|e| snapshot_default_on_err(bus_name, path, "name", e));
+        let states: StateSet = proxy
+            .get_state()
+            .await
+            .unwrap_or_else(|e| snapshot_default_on_err(bus_name, path, "get_state", e));
+        let attrs: HashMap<String, String> = proxy
+            .get_attributes()
+            .await
+            .unwrap_or_else(|e| snapshot_default_on_err(bus_name, path, "get_attributes", e));
         // Fetch window-relative bounds via the Component interface. Any
         // error — element doesn't implement Component, toolkit refused,
         // D-Bus NoReply — maps to "no bounds available" rather than
@@ -490,8 +540,8 @@ fn is_state_attr(key: &str) -> bool {
 /// [`snapshot_tree`] and return the AT-SPI `(bus, path)` tuples of the
 /// matching elements, in document order.
 pub fn evaluate_xpath(xml: &str, xpath: &str) -> Result<Vec<(String, String)>> {
-    let package = parser::parse(xml)
-        .map_err(|e| Error::atspi_with("failed to parse snapshot XML", e))?;
+    let package =
+        parser::parse(xml).map_err(|e| Error::atspi_with("failed to parse snapshot XML", e))?;
     let doc = package.as_document();
 
     let factory = Factory::new();
@@ -540,8 +590,8 @@ pub fn evaluate_xpath(xml: &str, xpath: &str) -> Result<Vec<(String, String)>> {
 /// Evaluate an XPath expression against a snapshot and return full metadata
 /// for each matched element, in document order.
 pub fn evaluate_xpath_detailed(xml: &str, xpath: &str) -> Result<Vec<ElementInfo>> {
-    let package = parser::parse(xml)
-        .map_err(|e| Error::atspi_with("failed to parse snapshot XML", e))?;
+    let package =
+        parser::parse(xml).map_err(|e| Error::atspi_with("failed to parse snapshot XML", e))?;
     let doc = package.as_document();
 
     let factory = Factory::new();
@@ -623,6 +673,17 @@ pub fn evaluate_xpath_detailed(xml: &str, xpath: &str) -> Result<Vec<ElementInfo
 fn map_action_err(xpath: &str, bus: &str, path: &str, err: zbus::Error) -> Error {
     if let zbus::Error::MethodError(name, _, _) = &err {
         if is_stale_error_name(name.as_str()) {
+            // Log every classify-as-stale so post-hoc analysis can
+            // see when the heuristic fires and on which error name.
+            // If a future toolkit (Qt6, KWin's a11y bridge) starts
+            // surfacing a name that *should* count as stale but
+            // doesn't yet, the log will show the gap; conversely a
+            // name that gets classified as stale but shouldn't will
+            // show up here too.
+            tracing::debug!(
+                %xpath, %bus, %path, error_name = %name.as_str(),
+                "classified D-Bus error as ElementStale"
+            );
             return Error::ElementStale {
                 xpath: xpath.to_string(),
                 bus: bus.to_string(),
@@ -635,12 +696,28 @@ fn map_action_err(xpath: &str, bus: &str, path: &str, err: zbus::Error) -> Error
 
 /// Classify a D-Bus error-name string as indicating the element is gone.
 ///
-/// Returns true for the three AT-SPI error names that surface when the
-/// target widget was destroyed between resolution and action:
-/// `org.freedesktop.DBus.Error.UnknownObject`,
-/// `org.freedesktop.DBus.Error.ServiceUnknown`, and any `NoReply` variant.
+/// Returns true for error names that surface when the target widget
+/// was destroyed between resolution and action:
+/// - `org.freedesktop.DBus.Error.UnknownObject` — service still
+///   alive, object path no longer registered.
+/// - `org.freedesktop.DBus.Error.ServiceUnknown` — whole bus name is
+///   gone (the app exited).
+/// - `…NoReply` — the call timed out waiting for a response, which
+///   for AT-SPI means the peer queue has drained because the widget
+///   is being torn down.
+/// - `…Disconnected` — toolkit-emitted variant (notably surfaced by
+///   `org.a11y.atspi.Error.Disconnected` and analogous bridges in
+///   Qt's a11y stack) when the underlying object is no longer
+///   reachable. Substring-match keeps the classifier
+///   toolkit-agnostic; if a new bridge introduces yet another name
+///   it lands as a non-stale error and the tracing log in
+///   `map_action_err` makes the gap visible without requiring code
+///   changes to discover it.
 fn is_stale_error_name(name: &str) -> bool {
-    name.contains("UnknownObject") || name.contains("ServiceUnknown") || name.contains("NoReply")
+    name.contains("UnknownObject")
+        || name.contains("ServiceUnknown")
+        || name.contains("NoReply")
+        || name.contains("Disconnected")
 }
 
 /// Invoke action index 0 on the element identified by `(bus, path)`.

@@ -100,8 +100,20 @@ pub fn key_name_to_keysym(key: &str) -> Option<u32> {
         "f10" => Some(0xffc7),
         "f11" => Some(0xffc8),
         "f12" => Some(0xffc9),
-        _ if key.len() == 1 => Some(char_to_keysym(key.chars().next().unwrap())),
-        _ => None,
+        // Fall through to the single-character path when `key` is a literal
+        // character ("a", "+", "é"). `len()` is the byte length, so a guard
+        // of `len() == 1` would silently reject any non-ASCII single char
+        // (e.g. "é" is 2 bytes in UTF-8). Count chars instead so any
+        // single Unicode scalar reaches `char_to_keysym`. The `expect()`
+        // is then infallible: count == 1 implies at least one char.
+        _ => {
+            let mut chars = key.chars();
+            let first = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            Some(char_to_keysym(first))
+        }
     }
 }
 
@@ -304,6 +316,53 @@ mod tests {
         assert_eq!(parse_chord("   "), None);
         // "-+-" is 3 chars, not single-char, and splits into empty tokens.
         assert_eq!(parse_chord("-+-"), None);
+    }
+
+    #[test]
+    fn parse_chord_accepts_multibyte_single_char() {
+        // Regression: a previous `key.len() == 1` guard in
+        // `key_name_to_keysym` (byte length, not char count) silently
+        // rejected single multi-byte Unicode characters. Any Unicode
+        // scalar value should round-trip through `char_to_keysym`.
+        for ch in ['é', 'ß', '€', '日'] {
+            let s = ch.to_string();
+            let c = parse_chord(&s)
+                .unwrap_or_else(|| panic!("parse_chord rejected single char {ch:?}"));
+            assert!(c.modifiers.is_empty());
+            assert_eq!(c.key, char_to_keysym(ch));
+        }
+    }
+
+    #[test]
+    fn key_name_to_keysym_rejects_multi_char_unknown() {
+        // The single-char fallback must not match arbitrary unknown
+        // strings: "abc" is 3 chars and isn't a named key.
+        assert_eq!(key_name_to_keysym("abc"), None);
+    }
+
+    #[test]
+    fn key_name_to_keysym_single_char_preserves_case() {
+        // The named-key arms case-fold via `to_lowercase()`, but the
+        // single-char fallback iterates the *original* string and
+        // returns `char_to_keysym(first)` unchanged. That means
+        // `"É"` and `"é"` resolve to *different* keysyms, matching
+        // how X11 itself distinguishes them. This is intentional —
+        // documenting it here so a future "always lowercase" tweak
+        // doesn't regress the case-sensitive single-char path.
+        assert_eq!(key_name_to_keysym("É"), Some(char_to_keysym('É')));
+        assert_eq!(key_name_to_keysym("é"), Some(char_to_keysym('é')));
+        assert_ne!(
+            key_name_to_keysym("É").unwrap(),
+            key_name_to_keysym("é").unwrap()
+        );
+        // ASCII letters: case-stable through the fallback for the
+        // same reason. `"A"` is U+0041, `"a"` is U+0061.
+        assert_eq!(key_name_to_keysym("A"), Some(char_to_keysym('A')));
+        assert_eq!(key_name_to_keysym("a"), Some(char_to_keysym('a')));
+        assert_ne!(
+            key_name_to_keysym("A").unwrap(),
+            key_name_to_keysym("a").unwrap()
+        );
     }
 
     #[test]

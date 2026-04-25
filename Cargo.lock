@@ -3014,6 +3014,7 @@ dependencies = [
  "async-trait",
  "libc",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "uuid",
@@ -3050,10 +3051,12 @@ name = "waydriver-input-mutter"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "serde",
  "tokio",
  "tokio-util",
  "waydriver",
  "waydriver-compositor-mutter",
+ "zbus",
 ]
 
 [[package]]

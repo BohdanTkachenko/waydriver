@@ -19,9 +19,11 @@ pub struct ManagedSession {
     pub session: Arc<Session>,
     pub report_dir: PathBuf,
     pub screenshot_counter: AtomicU32,
-    /// In-memory event log. Guards both the on-disk `events.jsonl` (append) and
-    /// the atomically-rewritten `events.js` so concurrent calls never interleave.
-    pub events: Mutex<Vec<serde_json::Value>>,
+    /// In-memory event log. Guards both the on-disk `events.jsonl`
+    /// (append) and the atomically-rewritten `events.js` so
+    /// concurrent calls never interleave. Bounded — see
+    /// [`report::EventLog`] for the cap and the rationale.
+    pub events: Mutex<report::EventLog>,
     /// When false, `log_event` is a no-op and the session skips writing
     /// `index.html` / `events.js` / `events.jsonl`.
     pub report_enabled: bool,

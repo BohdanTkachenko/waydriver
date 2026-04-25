@@ -8,10 +8,11 @@ use atspi::connection::AccessibilityConnection;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::atspi as atspi_client;
-use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend};
+use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend, PointerAxis, PointerButton};
 use crate::capture::VideoRecorder;
 use crate::error::{Error, Result};
 use crate::locator::Locator;
@@ -112,6 +113,18 @@ pub struct Session {
     /// waiters so they can rescan the buffer. Lines persist for the
     /// session's lifetime (no ring-buffer eviction yet).
     stdout: Arc<AppStdout>,
+    /// Handle to the background stdout reader so [`Session::kill`]
+    /// can abort it deterministically rather than waiting for the
+    /// child's stdout pipe to close. That pipe stays open whenever
+    /// a leaked grandchild has inherited it (browser launchers,
+    /// electron preloads, anything that double-forks), which would
+    /// otherwise pin the reader — and the `Arc<AppStdout>` it
+    /// closes over — for the lifetime of the waydriver process.
+    ///
+    /// `Option` so `kill` can `.take()` and call `abort()` without
+    /// leaving a stale handle behind; the reader also exits on its
+    /// cancellation token, which is the cooperative path.
+    stdout_reader: Option<JoinHandle<()>>,
 }
 
 impl Session {
@@ -140,30 +153,43 @@ impl Session {
         tracing::debug!(id, app_name = %cfg.app_name, "app spawned");
 
         let stdout = Arc::new(AppStdout::default());
-        if let Some(child_stdout) = app.stdout.take() {
+        // Local cancellation token cloned into the reader task so
+        // `Session::kill` can drop the task even if a leaked
+        // grandchild keeps the child stdout pipe open after the app
+        // exits. The same token is moved into the `Session` below.
+        let cancellation = CancellationToken::new();
+        let stdout_reader = app.stdout.take().map(|child_stdout| {
             let captured = stdout.clone();
             let id_for_task = id.clone();
+            let cancel_for_task = cancellation.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(child_stdout).lines();
                 loop {
-                    match reader.next_line().await {
-                        Ok(Some(line)) => {
-                            tracing::trace!(id = id_for_task, line = %line, "app stdout");
-                            {
-                                let mut guard = captured.lines.lock().unwrap();
-                                guard.push(line);
+                    tokio::select! {
+                        // Cooperative exit. `Session::kill` cancels
+                        // the token before aborting the join handle,
+                        // so a well-behaved reader exits here without
+                        // touching the abort path.
+                        _ = cancel_for_task.cancelled() => break,
+                        line = reader.next_line() => match line {
+                            Ok(Some(line)) => {
+                                tracing::trace!(id = id_for_task, line = %line, "app stdout");
+                                {
+                                    let mut guard = captured.lines.lock().unwrap();
+                                    guard.push(line);
+                                }
+                                captured.notify.notify_waiters();
                             }
-                            captured.notify.notify_waiters();
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            tracing::debug!(id = id_for_task, error = %e, "app stdout read error");
-                            break;
+                            Ok(None) => break,
+                            Err(e) => {
+                                tracing::debug!(id = id_for_task, error = %e, "app stdout read error");
+                                break;
+                            }
                         }
                     }
                 }
-            });
-        }
+            })
+        });
 
         let a11y_connection = atspi_client::connect_a11y(&dbus_address).await?;
         let (app_bus_name, app_path) = wait_for_app(&a11y_connection, &cfg.app_name).await?;
@@ -202,7 +228,7 @@ impl Session {
             app_path,
             a11y_connection: Some(a11y_connection),
             default_timeout_ns: AtomicU64::new(resolve_default_timeout().as_nanos() as u64),
-            cancellation: CancellationToken::new(),
+            cancellation,
             app,
             keepalive_stream: Some(keepalive_stream),
             video_recorder,
@@ -210,6 +236,7 @@ impl Session {
             capture,
             compositor,
             stdout,
+            stdout_reader,
         };
 
         Ok(session)
@@ -229,6 +256,21 @@ impl Session {
     /// 3. Stop the compositor.
     pub async fn kill(mut self) -> Result<()> {
         tracing::info!(id = self.id, "killing session");
+
+        // Signal the stdout reader to exit cooperatively before we
+        // SIGKILL the app. A leaked grandchild that inherited the
+        // app's stdout pipe would otherwise keep `next_line()`
+        // pending and pin the reader task — plus the
+        // `Arc<AppStdout>` it closes over — past the session's end.
+        self.cancellation.cancel();
+        if let Some(handle) = self.stdout_reader.take() {
+            // The cooperative path runs first via the token; the
+            // abort here is a hard fallback for the case where the
+            // reader is wedged inside a syscall that doesn't observe
+            // the select.
+            handle.abort();
+            let _ = handle.await;
+        }
 
         let _ = self.app.kill().await;
         let _ = self.app.wait().await;
@@ -281,7 +323,10 @@ impl Session {
             self.input.key_down(*m, &self.cancellation).await?;
         }
         // Press + release the target key while modifiers are held.
-        let target_result = self.input.press_keysym(parsed.key, &self.cancellation).await;
+        let target_result = self
+            .input
+            .press_keysym(parsed.key, &self.cancellation)
+            .await;
         // Release modifiers in reverse order, even if the target press
         // failed — leaving modifiers stuck down would break subsequent
         // keyboard input.
@@ -309,15 +354,15 @@ impl Session {
             .await
     }
 
-    /// Press and release a pointer button (Linux evdev code, e.g. BTN_LEFT = 0x110).
-    pub async fn pointer_button(&self, button: u32) -> Result<()> {
+    /// Press and release a pointer button.
+    pub async fn pointer_button(&self, button: PointerButton) -> Result<()> {
         self.input.pointer_button(button, &self.cancellation).await
     }
 
     /// Hold a pointer button down until a matching [`pointer_button_up`](Self::pointer_button_up)
     /// fires. Used to build drag gestures — press, move across intermediate
     /// coordinates, then release.
-    pub async fn pointer_button_down(&self, button: u32) -> Result<()> {
+    pub async fn pointer_button_down(&self, button: PointerButton) -> Result<()> {
         self.input
             .pointer_button_down(button, &self.cancellation)
             .await
@@ -325,7 +370,7 @@ impl Session {
 
     /// Release a pointer button previously pressed with
     /// [`pointer_button_down`](Self::pointer_button_down).
-    pub async fn pointer_button_up(&self, button: u32) -> Result<()> {
+    pub async fn pointer_button_up(&self, button: PointerButton) -> Result<()> {
         self.input
             .pointer_button_up(button, &self.cancellation)
             .await
@@ -353,10 +398,10 @@ impl Session {
         Ok(())
     }
 
-    /// Emit a discrete pointer-axis (wheel) event. `axis` is 0 for
-    /// vertical, 1 for horizontal. `steps` is the number of wheel
-    /// detents — positive scrolls down/right, negative scrolls up/left.
-    pub async fn pointer_axis_discrete(&self, axis: u32, steps: i32) -> Result<()> {
+    /// Emit a discrete pointer-axis (wheel) event. `axis` selects
+    /// vertical or horizontal; `steps` is the number of wheel detents
+    /// — positive scrolls down/right, negative scrolls up/left.
+    pub async fn pointer_axis_discrete(&self, axis: PointerAxis, steps: i32) -> Result<()> {
         self.input
             .pointer_axis_discrete(axis, steps, &self.cancellation)
             .await
@@ -613,6 +658,7 @@ impl Session {
             capture,
             compositor,
             stdout: Arc::new(AppStdout::default()),
+            stdout_reader: None,
         }
     }
 
@@ -635,6 +681,16 @@ impl Drop for Session {
         // app → keepalive_stream → video_recorder → input → capture →
         // compositor. A video_recorder dropped without explicit stop()
         // leaves a truncated WebM (no seekhead) — see VideoRecorder::Drop.
+        // Cancel the token so a still-running stdout reader exits
+        // cooperatively; abort the JoinHandle as a hard fallback for
+        // the leaked-grandchild case where the read syscall never
+        // observes the cancellation. Drop is sync so we can't await
+        // the abort — the runtime tears the task down on its next
+        // poll.
+        self.cancellation.cancel();
+        if let Some(handle) = self.stdout_reader.take() {
+            handle.abort();
+        }
         let _ = self.app.start_kill();
     }
 }
@@ -985,19 +1041,42 @@ mod tests {
             async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_relative(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_absolute(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_down(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_up(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_axis_discrete(
+                &self,
+                _: crate::backend::PointerAxis,
+                _: i32,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
         }
@@ -1059,19 +1138,42 @@ mod tests {
                 self.0.lock().unwrap().push(Event::Up(k));
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_relative(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_absolute(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_down(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_up(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_axis_discrete(
+                &self,
+                _: crate::backend::PointerAxis,
+                _: i32,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
         }
@@ -1176,19 +1278,42 @@ mod tests {
             async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_relative(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_absolute(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_down(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_up(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_axis_discrete(
+                &self,
+                _: crate::backend::PointerAxis,
+                _: i32,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
         }
@@ -1252,19 +1377,42 @@ mod tests {
             async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_relative(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_absolute(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_down(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_up(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_axis_discrete(
+                &self,
+                _: crate::backend::PointerAxis,
+                _: i32,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
         }
@@ -1323,10 +1471,7 @@ mod tests {
         // the cancel that the backend triggers.
         s.cancellation = token;
 
-        let err = s
-            .type_text("abcdefghijklmnopqrstuvwxyz")
-            .await
-            .unwrap_err();
+        let err = s.type_text("abcdefghijklmnopqrstuvwxyz").await.unwrap_err();
         assert!(
             matches!(err, Error::Cancelled),
             "expected Cancelled, got {err:?}"
@@ -1359,19 +1504,42 @@ mod tests {
             async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_relative(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_absolute(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_down(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_up(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_axis_discrete(
+                &self,
+                _: crate::backend::PointerAxis,
+                _: i32,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
         }
@@ -1463,19 +1631,42 @@ mod tests {
             async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_relative(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+            async fn pointer_motion_absolute(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_down(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_button_up(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
+            async fn pointer_axis_discrete(
+                &self,
+                _: crate::backend::PointerAxis,
+                _: i32,
+                _: &CancellationToken,
+            ) -> Result<()> {
                 Ok(())
             }
         }

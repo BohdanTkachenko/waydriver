@@ -23,7 +23,10 @@ pub mod locator;
 pub mod session;
 
 pub use atspi::Rect;
-pub use backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
+pub use backend::{
+    CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream, PointerAxis, PointerButton,
+    StreamToken,
+};
 pub use error::{Error, Result};
 pub use locator::{FillMode, Locator, SelectBy};
 pub use session::{Session, SessionConfig};

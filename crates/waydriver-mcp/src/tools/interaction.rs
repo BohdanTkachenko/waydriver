@@ -25,10 +25,39 @@ use waydriver::keysym::parse_chord;
 
 use crate::params::{
     ClickParams, DoubleClickParams, DragToParams, FillParams, FocusParams, HoverParams,
-    MovePointerParams, PointerClickParams, PressKeyParams, RightClickParams, SelectOptionParams,
-    SetTextParams, TypeTextParams,
+    MovePointerParams, PointerClickParams, PressKeyParams, RightClickParams, SelectOptionByParam,
+    SelectOptionParams, SetTextParams, TypeTextParams,
 };
 use crate::UiTestServer;
+
+/// Boilerplate body for the five isomorphic single-XPath locator tools
+/// (click/focus/hover/double_click/right_click). All follow the same
+/// shape — clone the xpath, route through `run_action`, call one method
+/// on the resolved `Locator`, and format a past-tense success message.
+/// Expressing it once as a macro keeps each tool method to a single
+/// line and removes the chance of one drifting from the others.
+macro_rules! single_xpath_action {
+    (
+        $self:ident, $params:ident,
+        action = $action:literal,
+        verb = $verb:literal,
+        call = $method:ident
+    ) => {{
+        let xpath = $params.xpath.clone();
+        $self.run_action(
+            &$params.session_id,
+            $action,
+            serde_json::json!({ "xpath": $params.xpath }),
+            |s| async move {
+                s.locate(&xpath)
+                    .$method()
+                    .await
+                    .map(|_| format!(concat!($verb, " {}"), xpath))
+            },
+        )
+        .await
+    }};
+}
 
 #[tool_router(router = interaction_router, vis = "pub(crate)")]
 impl UiTestServer {
@@ -43,14 +72,13 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<ClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "click",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move { s.locate(&xpath).click().await.map(|_| format!("Clicked {xpath}")) },
+        single_xpath_action!(
+            self,
+            params,
+            action = "click",
+            verb = "Clicked",
+            call = click
         )
-        .await
     }
 
     #[tool(
@@ -63,14 +91,13 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<FocusParams>,
     ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "focus",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move { s.locate(&xpath).focus().await.map(|_| format!("Focused {xpath}")) },
+        single_xpath_action!(
+            self,
+            params,
+            action = "focus",
+            verb = "Focused",
+            call = focus
         )
-        .await
     }
 
     #[tool(
@@ -81,14 +108,13 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<HoverParams>,
     ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "hover",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move { s.locate(&xpath).hover().await.map(|_| format!("Hovered {xpath}")) },
+        single_xpath_action!(
+            self,
+            params,
+            action = "hover",
+            verb = "Hovered",
+            call = hover
         )
-        .await
     }
 
     #[tool(
@@ -100,19 +126,13 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<DoubleClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "double_click",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move {
-                s.locate(&xpath)
-                    .double_click()
-                    .await
-                    .map(|_| format!("Double-clicked {xpath}"))
-            },
+        single_xpath_action!(
+            self,
+            params,
+            action = "double_click",
+            verb = "Double-clicked",
+            call = double_click
         )
-        .await
     }
 
     #[tool(
@@ -123,19 +143,13 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<RightClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "right_click",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move {
-                s.locate(&xpath)
-                    .right_click()
-                    .await
-                    .map(|_| format!("Right-clicked {xpath}"))
-            },
+        single_xpath_action!(
+            self,
+            params,
+            action = "right_click",
+            verb = "Right-clicked",
+            call = right_click
         )
-        .await
     }
 
     #[tool(
@@ -199,26 +213,23 @@ impl UiTestServer {
                        Prefer set_text when the target supports it (one D-Bus call); use \
                        fill as the compatibility fallback. \
                        `mode`: \"caret_nav\" (default; Ctrl+Home then Ctrl+Shift+End) or \
-                       \"select_all\" (Ctrl+A — faster when the app honors it)."
+                       \"select_all\" (Ctrl+A — faster when the app honors it). \
+                       `assume_focused`: skip the AT-SPI focus call and trust the caller to \
+                       have focused the widget already (via a prior click/focus). Required \
+                       for GTK4 text widgets that don't implement the Component interface \
+                       and would otherwise error with NotSupported."
     )]
     pub(crate) async fn fill(
         &self,
         Parameters(params): Parameters<FillParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Validate mode up front: it's a caller-input problem, not a
-        // runtime failure, so it shouldn't get logged as an action error.
-        let mode = match params.mode.as_deref() {
-            None | Some("caret_nav") => waydriver::FillMode::CaretNav,
-            Some("select_all") => waydriver::FillMode::SelectAll,
-            Some(other) => {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "invalid fill mode {other:?}; expected \"caret_nav\" or \"select_all\""
-                    ),
-                    None,
-                ));
-            }
-        };
+        // Mode validation has moved into the JSON Schema: `FillModeParam`
+        // is a serde-typed enum, so a request with an unknown string
+        // is rejected at deserialise time before this body ever runs.
+        // Default to the documented `caret_nav` when the caller omits
+        // the field.
+        let mode = params.mode.unwrap_or_default().to_waydriver();
+        let assume_focused = params.assume_focused;
 
         let xpath = params.xpath.clone();
         let text = params.text.clone();
@@ -229,12 +240,16 @@ impl UiTestServer {
                 "xpath": params.xpath,
                 "text": params.text,
                 "mode": params.mode,
+                "assume_focused": params.assume_focused,
             }),
             |s| async move {
-                s.locate(&xpath)
-                    .fill_with_opts(&text, mode)
-                    .await
-                    .map(|_| format!("Filled {xpath}"))
+                let locator = s.locate(&xpath);
+                let result = if assume_focused {
+                    locator.fill_assume_focused(&text, mode).await
+                } else {
+                    locator.fill_with_opts(&text, mode).await
+                };
+                result.map(|_| format!("Filled {xpath}"))
             },
         )
         .await
@@ -252,35 +267,29 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SelectOptionParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Parse by/value up front into an owned discriminant so the
-        // closure can reconstruct `SelectBy` (which borrows). Bad input
-        // here is caller error, not infrastructure failure.
+        // `by` is now a serde-typed enum (`SelectOptionByParam`), so an
+        // unknown discriminator is rejected at JSON-Schema validation.
+        // What's left is the index-string path: when by == Index, the
+        // accompanying `value` must parse as a non-negative integer.
+        // That's still caller error, not infra failure, so it returns
+        // `invalid_params` rather than running through `run_action`.
         enum ParsedBy {
             Label(String),
             Index(usize),
         }
-        let parsed = match params.by.as_str() {
-            "label" => ParsedBy::Label(params.value.clone()),
-            "index" => params
+        let parsed = match params.by {
+            SelectOptionByParam::Label => ParsedBy::Label(params.value.clone()),
+            SelectOptionByParam::Index => params
                 .value
                 .parse::<usize>()
                 .map(ParsedBy::Index)
                 .map_err(|e| {
-                    McpError::invalid_params(
-                        format!("invalid index {:?}: {e}", params.value),
-                        None,
-                    )
+                    McpError::invalid_params(format!("invalid index {:?}: {e}", params.value), None)
                 })?,
-            other => {
-                return Err(McpError::invalid_params(
-                    format!("invalid `by` {other:?}; expected \"label\" or \"index\""),
-                    None,
-                ));
-            }
         };
 
         let xpath = params.xpath.clone();
-        let by = params.by.clone();
+        let by = params.by;
         let value = params.value.clone();
         self.run_action(
             &params.session_id,
@@ -346,7 +355,11 @@ impl UiTestServer {
             &params.session_id,
             "press_key",
             serde_json::json!({ "key": params.key }),
-            |s| async move { s.press_chord(&key).await.map(|_| format!("Pressed '{key}'")) },
+            |s| async move {
+                s.press_chord(&key)
+                    .await
+                    .map(|_| format!("Pressed '{key}'"))
+            },
         )
         .await
     }
@@ -376,15 +389,23 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<PointerClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        let button = params.button.unwrap_or(0x110); // BTN_LEFT
+        // The MCP layer accepts an evdev `BTN_*` code as `u32` for
+        // backwards compatibility (`0x110` = BTN_LEFT is the
+        // documented default). `PointerButton::from_evdev_code` maps
+        // the three standard codes onto the named variants and falls
+        // through to `Other(code)` for the rest, so a future caller
+        // passing e.g. BTN_BACK (0x116) still works without us
+        // having to teach the JSON schema about every button.
+        let button_code = params.button.unwrap_or(0x110);
+        let button = waydriver::PointerButton::from_evdev_code(button_code);
         self.run_action(
             &params.session_id,
             "pointer_click",
-            serde_json::json!({ "button": button }),
+            serde_json::json!({ "button": button_code }),
             |s| async move {
                 s.pointer_button(button)
                     .await
-                    .map(|_| format!("Pointer button {button:#x} clicked"))
+                    .map(|_| format!("Pointer button {button_code:#x} clicked"))
             },
         )
         .await

@@ -11,6 +11,7 @@
 //! The `query` tool also lives here (well, its result-shaping function does)
 //! since [`render_matches`] is what the user-facing JSON looks like.
 
+use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt;
@@ -18,24 +19,108 @@ use tokio::sync::Mutex;
 
 use waydriver::atspi::ElementInfo;
 
-/// Append one event to `{report_dir}/{session_id}/events.jsonl` and rewrite
-/// `{report_dir}/{session_id}/events.js` atomically. Returns the assigned
-/// 1-based sequence number.
+/// Cap on the in-memory event ring. Bounds both `ManagedSession`
+/// memory growth and the size of the rewritten `events.js`. The
+/// durable `events.jsonl` is unaffected — older events stay there
+/// forever, the viewer just sees a sliding window of the most
+/// recent ones.
 ///
-/// `events` is the in-memory mirror of the on-disk log; the same lock guards
-/// both files so concurrent calls never interleave.
+/// 1024 picks a viewer-friendly window: at typical AI tool-call
+/// rates (a handful per minute) it covers hours of history; at
+/// pathological rates (every event being a separate call in a
+/// stress test) it still bounds the JS payload to a few MB.
+/// Tunable later if the viewer's render cost becomes the
+/// bottleneck.
+const MAX_IN_MEMORY_EVENTS: usize = 1024;
+
+/// Bounded mirror of the per-session event log.
+///
+/// Two responsibilities:
+///
+/// 1. **Bound resident memory.** [`MAX_IN_MEMORY_EVENTS`] caps how
+///    many events live in RAM regardless of session lifetime. Long
+///    AI sessions making thousands of tool calls don't grow this
+///    process's heap.
+/// 2. **Bound `events.js` rewrite cost.** That file is rewritten
+///    on every tool call by serialising the in-memory ring, so
+///    capping the ring caps the rewrite work at O(MAX) per call
+///    instead of O(N) in session length.
+///
+/// `total` is decoupled from `recent.len()` so each event's `seq`
+/// stamp keeps counting past the ring's eviction point — the
+/// on-disk `events.jsonl` is the source of truth and needs a
+/// strictly monotonic sequence number even after older entries
+/// have aged out of memory.
+pub struct EventLog {
+    total: u64,
+    recent: VecDeque<serde_json::Value>,
+}
+
+impl EventLog {
+    pub fn new() -> Self {
+        Self {
+            total: 0,
+            recent: VecDeque::new(),
+        }
+    }
+
+    /// True iff this session has logged no events at all (not just
+    /// none in the recent window). Tests assert this on a freshly
+    /// constructed session that has skipped writing.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Total events ever logged this session, including ones the
+    /// ring has already evicted. Stable across eviction so callers
+    /// can use it as the source for the next `seq`.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Push a new event into the ring, evicting the oldest entry
+    /// when the cap is reached, and bump the total counter.
+    fn push(&mut self, event: serde_json::Value) {
+        self.total += 1;
+        if self.recent.len() == MAX_IN_MEMORY_EVENTS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(event);
+    }
+}
+
+impl Default for EventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Append one event to `{report_dir}/{session_id}/events.jsonl` and
+/// rewrite `{report_dir}/{session_id}/events.js` atomically. Returns
+/// the assigned 1-based sequence number.
+///
+/// `events` is the in-memory mirror of the on-disk log; the same
+/// lock guards both files so concurrent calls never interleave. The
+/// jsonl is the durable source of truth (every event ever, kept
+/// forever); the in-memory ring and the js mirror only carry the
+/// last [`MAX_IN_MEMORY_EVENTS`] entries.
 #[allow(clippy::too_many_arguments)]
 pub async fn append_event(
     report_dir: &std::path::Path,
     session_id: &str,
-    events: &Mutex<Vec<serde_json::Value>>,
+    events: &Mutex<EventLog>,
     action: &'static str,
     params: serde_json::Value,
     outcome: Result<&str, &str>,
     screenshot: Option<&str>,
 ) -> std::io::Result<u32> {
     let mut guard = events.lock().await;
-    let seq = guard.len() as u32 + 1;
+    // `seq` is computed before the push so the value stamped on
+    // the event is the position of *this* call (1-indexed). u32 is
+    // ample headroom — at one event per millisecond the counter
+    // doesn't overflow for ~49 days of continuous logging.
+    let seq = guard.total() as u32 + 1;
     let ts_ms = now_ms();
     let (status, message) = match outcome {
         Ok(msg) => ("ok", msg),
@@ -66,13 +151,16 @@ pub async fn append_event(
     file.write_all(&line).await?;
     file.flush().await?;
 
-    // 2. Push into in-memory vec.
+    // 2. Push into in-memory ring (evicts the oldest entry once
+    // the cap is hit; total counter increments unconditionally).
     guard.push(event);
 
-    // 3. Rewrite events.js atomically (tempfile + rename on same filesystem).
-    // The viewer HTML swaps in a fresh <script src="events.js?v=..."> every 2s,
-    // which triggers window.__events_update with the full array.
-    let json_array = serde_json::to_string(&*guard)?;
+    // 3. Rewrite events.js atomically (tempfile + rename on same
+    // filesystem). The viewer HTML swaps in a fresh
+    // <script src="events.js?v=..."> every 2s, which triggers
+    // window.__events_update with the recent-window array.
+    let recent: Vec<&serde_json::Value> = guard.recent.iter().collect();
+    let json_array = serde_json::to_string(&recent)?;
     let js_body = format!("window.__events_update({json_array});\n");
     let tmp_path = session_dir.join(".events.js.tmp");
     tokio::fs::write(&tmp_path, js_body.as_bytes()).await?;
@@ -175,6 +263,37 @@ pub fn render_matches(xpath: &str, matches: &[ElementInfo]) -> serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_log_pushes_into_ring_and_bumps_total() {
+        let mut log = EventLog::new();
+        assert!(log.is_empty());
+        log.push(serde_json::json!({"a": 1}));
+        log.push(serde_json::json!({"a": 2}));
+        assert!(!log.is_empty());
+        assert_eq!(log.total(), 2);
+        assert_eq!(log.recent.len(), 2);
+    }
+
+    #[test]
+    fn event_log_evicts_oldest_when_ring_full_but_keeps_total() {
+        let mut log = EventLog::new();
+        for i in 0..(MAX_IN_MEMORY_EVENTS + 5) {
+            log.push(serde_json::json!({"i": i}));
+        }
+        // Total tracks every push, including evicted entries — this
+        // is what keeps `seq` stamps strictly monotonic across the
+        // session even after the ring rolls over.
+        assert_eq!(log.total(), (MAX_IN_MEMORY_EVENTS + 5) as u64);
+        // The ring stays bounded.
+        assert_eq!(log.recent.len(), MAX_IN_MEMORY_EVENTS);
+        // The first 5 pushes are gone; the oldest survivor is i=5.
+        assert_eq!(log.recent.front().unwrap()["i"], 5);
+        assert_eq!(
+            log.recent.back().unwrap()["i"],
+            (MAX_IN_MEMORY_EVENTS + 4) as i64
+        );
+    }
 
     fn info(role: &str, name: Option<&str>) -> ElementInfo {
         ElementInfo {

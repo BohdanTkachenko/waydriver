@@ -5,6 +5,76 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 
+/// Direction of a discrete (notched) pointer-wheel scroll.
+///
+/// Encoding-free: backends translate at their boundary. The mutter
+/// `NotifyPointerAxisDiscrete` D-Bus call wants `0` for vertical and
+/// `1` for horizontal; libei has its own enum; X11 uses pseudo-buttons
+/// 4-5/6-7. Callers and the MCP-layer JSON schema only see the named
+/// directions, so adding a third (e.g. zoom or pan) is a compatible
+/// extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerAxis {
+    /// Up/down — same direction a vertical mouse wheel uses.
+    Vertical,
+    /// Left/right — sideways scrolling on tilt-wheel mice or trackpads.
+    Horizontal,
+}
+
+/// Pointer button.
+///
+/// The three named variants cover every standard mouse; `Other(code)`
+/// is an escape hatch for everything else (back/forward, gaming-mouse
+/// extras, side buttons) carrying the Linux `BTN_*` evdev code as a
+/// raw `u32`. A typed enum at the trait boundary catches obvious
+/// bugs (passing a literal `0x110` everywhere instead of `BTN_LEFT`)
+/// at compile time and lets non-evdev backends translate centrally
+/// in their own [`evdev_code`](Self::evdev_code) consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerButton {
+    /// Primary mouse button (`BTN_LEFT`, `0x110`).
+    Left,
+    /// Wheel-press button (`BTN_MIDDLE`, `0x112`).
+    Middle,
+    /// Secondary / context-menu button (`BTN_RIGHT`, `0x111`).
+    Right,
+    /// Any other button, identified by its Linux evdev `BTN_*` code.
+    /// Backends that use a different transport are expected to
+    /// translate; callers that already have an evdev code in hand
+    /// (e.g. parsed from external input) can pass it straight through.
+    Other(u32),
+}
+
+impl PointerButton {
+    /// Return the Linux evdev `BTN_*` code for this button. Used by
+    /// backends whose transport speaks evdev directly (mutter's
+    /// RemoteDesktop, libei). Backends on other transports translate
+    /// in their own pattern-match.
+    pub fn evdev_code(self) -> u32 {
+        match self {
+            PointerButton::Left => 0x110,
+            PointerButton::Middle => 0x112,
+            PointerButton::Right => 0x111,
+            PointerButton::Other(code) => code,
+        }
+    }
+
+    /// Construct from a Linux evdev `BTN_*` code, mapping the three
+    /// standard buttons onto their named variants and falling back to
+    /// `Other(code)` for anything else. This is the boundary
+    /// inverse of [`evdev_code`](Self::evdev_code) and is what
+    /// callers receiving raw codes (MCP JSON, libinput pass-through)
+    /// should use.
+    pub fn from_evdev_code(code: u32) -> Self {
+        match code {
+            0x110 => PointerButton::Left,
+            0x112 => PointerButton::Middle,
+            0x111 => PointerButton::Right,
+            other => PointerButton::Other(other),
+        }
+    }
+}
+
 /// Lifecycle of a headless compositor instance. A backend owns its compositor's
 /// child processes (the compositor binary itself plus any supporting daemons
 /// like pipewire) and exposes the Wayland display name and runtime dir that
@@ -101,20 +171,28 @@ pub trait InputBackend: Send + Sync {
     ) -> Result<()>;
 
     /// Press a pointer button and hold it down until a corresponding
-    /// [`pointer_button_up`](Self::pointer_button_up) fires. `button` uses
-    /// Linux evdev codes (e.g. `BTN_LEFT` = 0x110). Used to build drag
-    /// gestures — press, move the pointer across intermediate coordinates,
-    /// then release.
-    async fn pointer_button_down(&self, button: u32, cancel: &CancellationToken) -> Result<()>;
+    /// [`pointer_button_up`](Self::pointer_button_up) fires. The
+    /// [`PointerButton`] enum carries either one of the three named
+    /// buttons or a raw Linux evdev `BTN_*` code via `Other(u32)`.
+    /// Used to build drag gestures — press, move the pointer across
+    /// intermediate coordinates, then release.
+    async fn pointer_button_down(
+        &self,
+        button: PointerButton,
+        cancel: &CancellationToken,
+    ) -> Result<()>;
 
     /// Release a pointer button that was previously pressed with
     /// [`pointer_button_down`](Self::pointer_button_down). Safe to call on
     /// a button that isn't held (behavior is implementation-defined, but
     /// must not panic).
-    async fn pointer_button_up(&self, button: u32, cancel: &CancellationToken) -> Result<()>;
+    async fn pointer_button_up(
+        &self,
+        button: PointerButton,
+        cancel: &CancellationToken,
+    ) -> Result<()>;
 
-    /// Press and release a pointer button. `button` uses Linux evdev codes
-    /// (e.g. `BTN_LEFT` = 0x110). Default impl composes
+    /// Press and release a pointer button. Default impl composes
     /// [`pointer_button_down`](Self::pointer_button_down) and
     /// [`pointer_button_up`](Self::pointer_button_up) with a short gap so
     /// the compositor distinguishes press from release; backends with a
@@ -125,25 +203,30 @@ pub trait InputBackend: Send + Sync {
     /// button held down in the compositor's state. Cancellation
     /// observed on the tail of `pointer_button_up` (or at the outer
     /// loop's next iteration) is the designed bail-point.
-    async fn pointer_button(&self, button: u32, cancel: &CancellationToken) -> Result<()> {
+    async fn pointer_button(
+        &self,
+        button: PointerButton,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
         self.pointer_button_down(button, cancel).await?;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         self.pointer_button_up(button, cancel).await
     }
 
     /// Emit a discrete pointer-axis (wheel) event. `axis` selects the
-    /// direction — `0` is vertical, `1` is horizontal — matching the
-    /// `org.gnome.Mutter.RemoteDesktop.Session.NotifyPointerAxisDiscrete`
-    /// convention. `steps` is the number of wheel detents; positive
-    /// scrolls down / right, negative scrolls up / left.
+    /// direction (`PointerAxis::Vertical` / `Horizontal`); `steps` is
+    /// the number of wheel detents; positive scrolls down / right,
+    /// negative scrolls up / left.
     ///
     /// Backends that don't support discrete wheel events may emulate
     /// via continuous axis deltas; callers shouldn't rely on step being
     /// exactly one wheel click's worth of travel, just on sign + rough
-    /// magnitude.
+    /// magnitude. Backends translate the enum into their transport's
+    /// native encoding (mutter's RemoteDesktop wants `0=vertical,
+    /// 1=horizontal`, libei has its own enum).
     async fn pointer_axis_discrete(
         &self,
-        axis: u32,
+        axis: PointerAxis,
         steps: i32,
         cancel: &CancellationToken,
     ) -> Result<()>;
@@ -162,6 +245,60 @@ pub async fn cancellable_tail(dur: std::time::Duration, cancel: &CancellationTok
     }
 }
 
+/// Backend-private state attached to a [`PipeWireStream`].
+///
+/// Each `CaptureBackend` impl needs to remember some per-stream
+/// resource — for mutter, that's the ScreenCast session's D-Bus
+/// object path; another backend might carry a libei session id, a
+/// wlr-screencopy frame buffer, or a wayland-protocol object. The
+/// public API doesn't care which: `stop_stream` is the only
+/// consumer and it always re-downcasts to whatever it stored.
+///
+/// Wrapping `Box<dyn Any + Send + Sync>` in a newtype rather than
+/// exposing `Any` directly: keeps the public field type stable
+/// across backend changes, routes construction through
+/// [`StreamToken::new`] so callers don't have to spell out the
+/// `Send + Sync + 'static` bound, and lets [`StreamToken::downcast`]
+/// surface a typed [`Error::Screenshot`](crate::Error::Screenshot)
+/// naming both the expected and stored types instead of an opaque
+/// `()` mismatch.
+pub struct StreamToken {
+    inner: Box<dyn std::any::Any + Send + Sync + 'static>,
+    /// `std::any::type_name::<T>()` captured at construction — `Any`
+    /// only exposes a `TypeId` after the fact (which renders as an
+    /// opaque hex blob), so we have to remember the source type name
+    /// here if we want the downcast error to be readable.
+    stored_type: &'static str,
+}
+
+impl StreamToken {
+    /// Construct from any backend-private value. The bound matches
+    /// `Box<dyn Any + Send + Sync + 'static>` so the resulting token
+    /// can cross await points and live inside an `Arc<Session>`.
+    pub fn new<T: std::any::Any + Send + Sync + 'static>(value: T) -> Self {
+        Self {
+            inner: Box::new(value),
+            stored_type: std::any::type_name::<T>(),
+        }
+    }
+
+    /// Recover the original concrete type. Returns
+    /// [`Error::Screenshot`](crate::Error::Screenshot) naming both
+    /// the requested `T` and the stored type when the cast fails,
+    /// so backend bugs (storing a libei id then trying to recover
+    /// a mutter object path) surface with actionable detail rather
+    /// than an opaque "downcast failed."
+    pub fn downcast<T: std::any::Any>(self) -> crate::error::Result<Box<T>> {
+        let stored = self.stored_type;
+        self.inner.downcast::<T>().map_err(|_| {
+            crate::error::Error::screenshot(format!(
+                "stream token type mismatch: expected {}, found {stored}",
+                std::any::type_name::<T>(),
+            ))
+        })
+    }
+}
+
 /// A live PipeWire stream the backend is keeping open on behalf of a caller.
 /// Callers must explicitly call `CaptureBackend::stop_stream` — dropping does
 /// not stop the stream.
@@ -169,9 +306,10 @@ pub struct PipeWireStream {
     /// PipeWire node id that a consumer (e.g. gst-launch pipewiresrc) can
     /// connect to.
     pub node_id: u32,
-    /// Opaque per-backend state (e.g. a ScreenCast session object path) that
-    /// `stop_stream` needs to tear down the stream.
-    pub token: Box<dyn std::any::Any + Send + Sync>,
+    /// Backend-private state (e.g. a ScreenCast session object path)
+    /// that `stop_stream` needs to tear down the stream. Construct via
+    /// [`StreamToken::new`]; recover via [`StreamToken::downcast`].
+    pub token: StreamToken,
 }
 
 /// Screen capture. Backends either return a PipeWire node id (the common path

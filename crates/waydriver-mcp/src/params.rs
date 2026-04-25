@@ -9,7 +9,7 @@
 //! the macro-expanded code, so we use plain `pub`.
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct StartSessionParams {
@@ -126,6 +126,39 @@ pub struct SetTextParams {
     pub text: String,
 }
 
+/// How to clear existing content before typing in `fill`.
+///
+/// Modelled as a real enum on the JSON Schema so the MCP layer
+/// rejects unknown values during `serde::Deserialize` instead of at a
+/// hand-rolled `match params.mode.as_deref()` check inside the tool
+/// body. Variants render to lower-snake-case strings (`"caret_nav"`,
+/// `"select_all"`), matching the documented protocol.
+#[derive(
+    Debug, Default, Deserialize, Serialize, schemars::JsonSchema, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FillModeParam {
+    /// `Ctrl+Home` then `Ctrl+Shift+End` — works on any single-line
+    /// or multi-line widget.
+    #[default]
+    CaretNav,
+    /// `Ctrl+A` — faster, but depends on the app honouring the
+    /// binding.
+    SelectAll,
+}
+
+impl FillModeParam {
+    /// Translate the wire-level enum into the library-level
+    /// [`waydriver::FillMode`]. Kept as a method so the mapping has a
+    /// single home — adding a third mode is one variant + one arm.
+    pub fn to_waydriver(self) -> waydriver::FillMode {
+        match self {
+            FillModeParam::CaretNav => waydriver::FillMode::CaretNav,
+            FillModeParam::SelectAll => waydriver::FillMode::SelectAll,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FillParams {
     /// Session ID
@@ -134,12 +167,48 @@ pub struct FillParams {
     pub xpath: String,
     /// Text to type into the element (replaces existing contents).
     pub text: String,
-    /// How to clear existing content before typing. `"caret_nav"`
-    /// (default) uses `Ctrl+Home` then `Ctrl+Shift+End` — works on any
-    /// single-line or multi-line widget. `"select_all"` uses `Ctrl+A`
-    /// — faster, but depends on the app honoring the binding.
+    /// How to clear existing content before typing.
     #[serde(default)]
-    pub mode: Option<String>,
+    pub mode: Option<FillModeParam>,
+    /// Skip the AT-SPI `grab_focus` call and assume the element is
+    /// already focused. Use when a prior `click`/`focus` has already
+    /// landed focus on the target — necessary for GTK4 text widgets
+    /// that don't expose the Component interface and would otherwise
+    /// error with `NotSupported`. Defaults to false: `fill` calls
+    /// `grab_focus` and propagates any error.
+    #[serde(default)]
+    pub assume_focused: bool,
+}
+
+/// Discriminator for [`SelectOptionParams::by`].
+///
+/// Modelled as an enum so unknown discriminators are rejected at
+/// JSON-Schema validation time instead of with a hand-rolled `match
+/// params.by.as_str()` inside the tool body. Variants render to
+/// lower-snake-case strings (`"label"`, `"index"`).
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectOptionByParam {
+    /// Match the option whose AT-SPI accessible *name* equals `value`.
+    Label,
+    /// Parse `value` as a 0-indexed integer and pass it straight to
+    /// `Selection::select_child`.
+    Index,
+}
+
+impl std::fmt::Display for SelectOptionByParam {
+    /// Snake-case wire form, matching the JSON discriminator. The
+    /// `select_option` tool emits its outcome message using this
+    /// form (e.g. `"Selected label=…"`) so MCP clients and log
+    /// scrapers can pattern-match on the same string the request
+    /// used.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SelectOptionByParam::Label => "label",
+            SelectOptionByParam::Index => "index",
+        };
+        f.write_str(s)
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -150,10 +219,10 @@ pub struct SelectOptionParams {
     /// implementing the AT-SPI Selection interface (combobox,
     /// dropdown, listbox, etc.).
     pub xpath: String,
-    /// Discriminator: `"label"` picks the child whose accessible
+    /// Discriminator. `"label"` picks the child whose accessible
     /// name matches `value`; `"index"` parses `value` as a 0-indexed
     /// integer and passes it to `Selection::select_child` directly.
-    pub by: String,
+    pub by: SelectOptionByParam,
     /// Either the accessible name to match (when `by == "label"`) or
     /// a decimal integer (when `by == "index"`).
     pub value: String,
@@ -250,4 +319,3 @@ mod tests {
         assert_eq!(params.video_bitrate, Some(5_000_000));
     }
 }
-

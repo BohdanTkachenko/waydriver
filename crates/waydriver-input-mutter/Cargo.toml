@@ -16,5 +16,7 @@ categories = ["development-tools::testing"]
 waydriver = { path = "../waydriver", version = "0.2.0" }
 waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter", version = "0.2.0" }
 async-trait.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+zbus.workspace = true

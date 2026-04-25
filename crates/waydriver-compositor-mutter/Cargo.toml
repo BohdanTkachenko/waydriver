@@ -16,6 +16,7 @@ categories = ["development-tools::testing"]
 waydriver = { path = "../waydriver", version = "0.2.0" }
 async-trait.workspace = true
 libc.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

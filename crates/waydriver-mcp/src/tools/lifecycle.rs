@@ -119,7 +119,12 @@ impl UiTestServer {
             .await
             .map_err(waydriver_to_mcp)?;
         let compositor_id = compositor.id().to_string();
-        let state = compositor.state();
+        // `state()` returns `Option` post-API-tightening — but we have
+        // just awaited a successful `start()`, so the state is
+        // guaranteed present here. `expect` documents the invariant.
+        let state = compositor
+            .state()
+            .expect("MutterCompositor::state must be Some immediately after start() succeeded");
         let input = MutterInput::new(state.clone());
         let capture = MutterCapture::new(state);
 
@@ -164,7 +169,7 @@ impl UiTestServer {
             session: Arc::new(session),
             report_dir: report_dir.clone(),
             screenshot_counter: AtomicU32::new(0),
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(crate::report::EventLog::new()),
             report_enabled,
             kill_lock: Arc::new(tokio::sync::RwLock::new(())),
         });

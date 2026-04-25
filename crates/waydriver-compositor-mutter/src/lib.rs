@@ -13,6 +13,8 @@
 //! enforces this by dropping input and capture trait objects before calling
 //! `compositor.stop().await`.
 
+mod error;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -20,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
 
-use waydriver::{CompositorRuntime, Error, Result};
+use waydriver::{CompositorRuntime, Result};
+
+use crate::error::MutterError;
 
 /// Default virtual-monitor geometry passed to mutter when the caller doesn't
 /// override it. Matches mutter's own implicit default.
@@ -32,32 +36,82 @@ const DEFAULT_RESOLUTION: &str = "1024x768";
 /// **Invariant:** while any `Arc<MutterState>` exists, the underlying D-Bus
 /// connection and the mutter child process must remain alive. See the
 /// module docs for details.
+///
+/// Fields are private — all access goes through the accessor methods
+/// below. Sibling crates (`waydriver-input-mutter`,
+/// `waydriver-capture-mutter`) that previously read fields directly
+/// now call `state.conn()`, `state.rd_session_path()`, etc. The
+/// shape of the underlying storage (e.g. how `active_stream_path` is
+/// guarded) is therefore an implementation detail that can change
+/// without breaking those callers — the contract lives entirely in
+/// the method signatures.
 pub struct MutterState {
+    conn: zbus::Connection,
+    rd_session_path: String,
+    rd_session_id: String,
+    rd_started: Arc<Mutex<bool>>,
+    runtime_dir: PathBuf,
+    active_stream_path: Arc<Mutex<Option<String>>>,
+}
+
+impl MutterState {
     /// Persistent connection to mutter's private D-Bus.
-    pub conn: zbus::Connection,
-    /// RemoteDesktop session path, used by input injection.
-    pub rd_session_path: String,
+    ///
+    /// Both sibling backends (`waydriver-input-mutter`,
+    /// `waydriver-capture-mutter`) issue all their RemoteDesktop and
+    /// ScreenCast method calls through this connection.
+    pub fn conn(&self) -> &zbus::Connection {
+        &self.conn
+    }
+
+    /// RemoteDesktop session object path. Used by
+    /// `waydriver-input-mutter` as the `path` argument on every
+    /// pointer / keyboard `Notify*` D-Bus call.
+    pub fn rd_session_path(&self) -> &str {
+        &self.rd_session_path
+    }
+
     /// RemoteDesktop session id, read from the `SessionId` property on
     /// the RD session. `waydriver-capture-mutter` passes this as the
-    /// `remote-desktop-session-id` option to `ScreenCast.CreateSession`
-    /// so mutter links the two; the link is required for
-    /// `NotifyPointerMotionAbsolute` to be accepted.
-    pub rd_session_id: String,
-    /// Whether `RemoteDesktop.Session.Start` has been called yet. Mutter
-    /// requires the RD session to be *unstarted* when linking a
-    /// ScreenCast session (`remote-desktop-session-id` only accepted
-    /// pre-Start), so `waydriver-capture-mutter` defers `RD.Start`
-    /// until after the first linked `ScreenCast.CreateSession` returns.
-    /// Guarded by `Mutex` to make the check-and-set race-free.
-    pub rd_started: Arc<Mutex<bool>>,
-    /// Per-session XDG_RUNTIME_DIR, used by capture to locate the PipeWire socket.
-    pub runtime_dir: PathBuf,
-    /// ScreenCast Stream object path of the currently active stream.
+    /// `remote-desktop-session-id` option to
+    /// `ScreenCast.CreateSession` so mutter links the two; the link is
+    /// required for `NotifyPointerMotionAbsolute` to be accepted.
+    pub fn rd_session_id(&self) -> &str {
+        &self.rd_session_id
+    }
+
+    /// Per-session `XDG_RUNTIME_DIR`. `waydriver-capture-mutter` joins
+    /// this with `pipewire-0` to locate the PipeWire socket.
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime_dir
+    }
+
+    /// Lock the "RD-started" flag.
+    ///
+    /// Acquires the underlying mutex and returns the guard so the
+    /// caller can perform a check-and-set under one critical section
+    /// (the capture backend defers `RD.Session.Start` until the first
+    /// linked `ScreenCast.CreateSession` succeeds — that's a load,
+    /// some D-Bus work, and a store; splitting the read and write
+    /// would race). `Error::Process` if the mutex is poisoned.
+    pub fn rd_started_lock(&self) -> Result<std::sync::MutexGuard<'_, bool>> {
+        self.rd_started
+            .lock()
+            .map_err(|_| waydriver::Error::process("rd_started mutex poisoned"))
+    }
+
+    /// Lock the active ScreenCast Stream object path.
+    ///
     /// Set by `waydriver-capture-mutter` in `start_stream`, cleared in
-    /// `stop_stream`. `waydriver-input-mutter` needs it to route
+    /// `stop_stream`. `waydriver-input-mutter` reads it to route
     /// `NotifyPointerMotionAbsolute` at the correct monitor. `None`
-    /// when no stream is open — absolute pointer motion will error.
-    pub active_stream_path: Arc<Mutex<Option<String>>>,
+    /// inside the guard means no stream is open — absolute pointer
+    /// motion will error.
+    pub fn active_stream_path_lock(&self) -> Result<std::sync::MutexGuard<'_, Option<String>>> {
+        self.active_stream_path
+            .lock()
+            .map_err(|_| waydriver::Error::process("active_stream_path mutex poisoned"))
+    }
 }
 
 /// Headless mutter instance.
@@ -97,17 +151,20 @@ impl MutterCompositor {
         }
     }
 
-    /// Returns the shared `Arc<MutterState>` for passing to sibling backends.
+    /// Returns the shared `Arc<MutterState>` for passing to sibling
+    /// backends, or `None` when called outside the started window.
     ///
-    /// # Panics
-    /// Panics if called before [`CompositorRuntime::start`] has completed, or
-    /// after [`CompositorRuntime::stop`]. Callers are expected to follow the
-    /// fixed sequence: `new()` → `start().await?` → `state()`.
-    pub fn state(&self) -> Arc<MutterState> {
-        self.state
-            .as_ref()
-            .expect("MutterCompositor::state() called before start() or after stop()")
-            .clone()
+    /// `None` is returned when:
+    /// - `start()` has not yet completed (or returned an error), or
+    /// - `stop()` has been called and dropped the state.
+    ///
+    /// Callers that have just awaited `start()?` know the state is
+    /// present — `expect()` or `?`-with-typed-error is appropriate
+    /// there. Returning `Option` instead of panicking keeps the API
+    /// honest about the lifecycle and lets callers detect "stopped"
+    /// without first matching on a panic.
+    pub fn state(&self) -> Option<Arc<MutterState>> {
+        self.state.clone()
     }
 }
 
@@ -117,9 +174,24 @@ impl Default for MutterCompositor {
     }
 }
 
-#[async_trait]
-impl CompositorRuntime for MutterCompositor {
-    async fn start(&mut self, resolution: Option<&str>) -> Result<()> {
+impl MutterCompositor {
+    /// Typed-error implementation of `start`. The trait method calls
+    /// this and converts the result via `From<MutterError>`.
+    ///
+    /// Steps (each fails with a specific `MutterError` variant):
+    /// 1. validate resolution,
+    /// 2. ensure the session runtime dir exists,
+    /// 3. spawn a private `dbus-daemon` and parse its address + PID,
+    /// 4. spawn `pipewire` + `wireplumber` on that bus,
+    /// 5. spawn headless `mutter --wayland`,
+    /// 6. wait for the Wayland socket,
+    /// 7. open a zbus connection, retry-create the RemoteDesktop session,
+    /// 8. read its `SessionId` property,
+    /// 9. publish the `Arc<MutterState>` for sibling backends.
+    async fn start_inner(
+        &mut self,
+        resolution: Option<&str>,
+    ) -> std::result::Result<(), MutterError> {
         let resolution = resolution.unwrap_or(DEFAULT_RESOLUTION);
         // Validate before we start spawning subprocesses — mutter silently
         // ignores bad --virtual-monitor values and falls back to its own
@@ -129,7 +201,16 @@ impl CompositorRuntime for MutterCompositor {
         tracing::info!(id = self.id, resolution, "starting mutter compositor");
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
-        let runtime_str = self.runtime_dir.to_str().unwrap().to_string();
+        // `runtime_dir` is built in `new()` from a UTF-8 String
+        // (XDG_RUNTIME_DIR or `/run/user/<uid>`) joined with a UTF-8
+        // ASCII session id, so the path is guaranteed valid UTF-8.
+        // `expect` documents that invariant rather than re-deriving
+        // it via the `to_str()` `Option`.
+        let runtime_str = self
+            .runtime_dir
+            .to_str()
+            .expect("invariant: runtime_dir built from UTF-8 inputs in new()")
+            .to_string();
 
         // Step 1: Private D-Bus for mutter (so its ScreenCast API doesn't conflict with host).
         let dbus_output = Command::new("dbus-launch")
@@ -137,10 +218,9 @@ impl CompositorRuntime for MutterCompositor {
             .output()
             .await?;
         if !dbus_output.status.success() {
-            return Err(Error::process(format!(
-                "dbus-launch failed: {}",
-                String::from_utf8_lossy(&dbus_output.stderr)
-            )));
+            return Err(MutterError::DbusLaunchFailed(
+                String::from_utf8_lossy(&dbus_output.stderr).into_owned(),
+            ));
         }
         let dbus_stdout = String::from_utf8_lossy(&dbus_output.stdout);
         self.mutter_dbus_address = parse_dbus_address(&dbus_stdout)?;
@@ -154,10 +234,19 @@ impl CompositorRuntime for MutterCompositor {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| Error::process_with("pipewire", e))?;
+            .map_err(|source| MutterError::Spawn {
+                process: "pipewire",
+                source,
+            })?;
         self.pipewire = Some(pipewire);
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Wait for pipewire's socket to appear before launching
+        // wireplumber. Polling for the socket file is the same
+        // readiness signal `wait_for_wayland_socket` uses for
+        // mutter: it's the actual handshake clients use, so any
+        // earlier signal would either be racier (process spawn) or
+        // just as expensive to probe.
+        wait_for_pipewire_socket(&runtime_str).await?;
 
         let wireplumber = Command::new("wireplumber")
             .env("DBUS_SESSION_BUS_ADDRESS", &self.mutter_dbus_address)
@@ -165,10 +254,21 @@ impl CompositorRuntime for MutterCompositor {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| Error::process_with("wireplumber", e))?;
+            .map_err(|source| MutterError::Spawn {
+                process: "wireplumber",
+                source,
+            })?;
         self.wireplumber = Some(wireplumber);
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // No bus-readiness signal poll for wireplumber: it's a
+        // session-policy daemon that doesn't register a stable D-Bus
+        // name we can probe, and its initialisation runs in parallel
+        // with mutter's own startup. The downstream
+        // `ScreenCast.CreateSession` retry loop in
+        // `waydriver-capture-mutter::start_stream` is what actually
+        // gates on wireplumber having joined the graph — putting a
+        // pessimistic sleep here as well would add startup latency
+        // without changing correctness.
         tracing::debug!(id = self.id, "PipeWire + WirePlumber started");
 
         // Step 3: mutter in headless Wayland mode (on its private D-Bus).
@@ -187,7 +287,10 @@ impl CompositorRuntime for MutterCompositor {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| Error::process_with("mutter", e))?;
+            .map_err(|source| MutterError::Spawn {
+                process: "mutter",
+                source,
+            })?;
         self.mutter = Some(mutter);
         tracing::debug!(id = self.id, wayland_display = %self.wayland_display, "mutter spawned");
 
@@ -200,11 +303,21 @@ impl CompositorRuntime for MutterCompositor {
             .mutter_dbus_address
             .as_str()
             .try_into()
-            .map_err(|e: zbus::Error| Error::process_with("invalid mutter dbus address", e))?;
-        let mutter_conn = zbus::connection::Builder::address(mutter_addr)?
+            .map_err(|source: zbus::Error| MutterError::DbusAddressInvalid {
+                addr: self.mutter_dbus_address.clone(),
+                source,
+            })?;
+        let mutter_conn = zbus::connection::Builder::address(mutter_addr)
+            .map_err(|source| MutterError::DbusConnect {
+                stage: "build connection builder",
+                source,
+            })?
             .build()
             .await
-            .map_err(|e| Error::process_with("connect to mutter dbus", e))?;
+            .map_err(|source| MutterError::DbusConnect {
+                stage: "connect",
+                source,
+            })?;
 
         // Wait for mutter to register its D-Bus services (may take a moment after socket appears)
         let mut rd_reply = None;
@@ -232,15 +345,18 @@ impl CompositorRuntime for MutterCompositor {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 Err(e) => {
-                    return Err(Error::process_with("RemoteDesktop CreateSession", e));
+                    return Err(MutterError::RemoteDesktopCreate(e));
                 }
             }
         }
-        let rd_reply = rd_reply.unwrap();
+        // The retry loop above either `break`s with `rd_reply = Some(_)`
+        // or returns `Err(...)` from the final attempt — `unwrap` here
+        // is unreachable by construction.
+        let rd_reply = rd_reply.expect("retry loop sets Some on break or returns Err");
         let rd_session_path: zbus::zvariant::OwnedObjectPath = rd_reply
             .body()
             .deserialize()
-            .map_err(|e| Error::process_with("parse RD session path", e))?;
+            .map_err(MutterError::RdSessionPathParse)?;
         // Intentionally do NOT call `RemoteDesktop.Session.Start` here.
         // Mutter only accepts `remote-desktop-session-id` on
         // `ScreenCast.CreateSession` when the RD session is not yet
@@ -260,16 +376,16 @@ impl CompositorRuntime for MutterCompositor {
                 &("org.gnome.Mutter.RemoteDesktop.Session", "SessionId"),
             )
             .await
-            .map_err(|e| Error::process_with("Get SessionId", e))?;
+            .map_err(MutterError::SessionIdGet)?;
         // `Get` returns a variant; deserialize as `OwnedValue` to detach
         // the string from the reply's body before the reply is dropped.
         let rd_session_id_body = rd_session_id_reply.body();
         let rd_session_id_variant: zbus::zvariant::OwnedValue = rd_session_id_body
             .deserialize()
-            .map_err(|e| Error::process_with("parse SessionId variant", e))?;
+            .map_err(MutterError::SessionIdVariantParse)?;
         let rd_session_id: String = rd_session_id_variant
             .try_into()
-            .map_err(|e: zbus::zvariant::Error| Error::process_with("SessionId not a string", e))?;
+            .map_err(MutterError::SessionIdNotString)?;
 
         let rd_session_path = rd_session_path.to_string();
         tracing::debug!(
@@ -290,17 +406,33 @@ impl CompositorRuntime for MutterCompositor {
 
         Ok(())
     }
+}
+
+#[async_trait]
+impl CompositorRuntime for MutterCompositor {
+    async fn start(&mut self, resolution: Option<&str>) -> Result<()> {
+        // Body uses the crate-local typed `MutterError`. The `?` at the
+        // end of `self.start_inner(...).await?` runs the
+        // `From<MutterError> for waydriver::Error` impl in `error.rs`,
+        // which is the single boundary at which the typed enum becomes
+        // the workspace's shared `waydriver::Error`.
+        Ok(self.start_inner(resolution).await?)
+    }
 
     async fn stop(&mut self) -> Result<()> {
         tracing::info!(id = self.id, "stopping mutter compositor");
 
-        // Stop RemoteDesktop session if still reachable.
+        // Stop RemoteDesktop session if still reachable. We could
+        // touch the private fields directly here (same crate), but
+        // routing through the public accessors keeps the contract
+        // visible and means a future change to the field layout
+        // doesn't need to update this site.
         if let Some(state) = &self.state {
             let _ = state
-                .conn
+                .conn()
                 .call_method(
                     Some("org.gnome.Mutter.RemoteDesktop"),
-                    state.rd_session_path.as_str(),
+                    state.rd_session_path(),
                     Some("org.gnome.Mutter.RemoteDesktop.Session"),
                     "Stop",
                     &(),
@@ -378,7 +510,7 @@ impl Drop for MutterCompositor {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn parse_dbus_address(output: &str) -> Result<String> {
+fn parse_dbus_address(output: &str) -> std::result::Result<String, MutterError> {
     for line in output.lines() {
         if let Some(rest) = line.strip_prefix("DBUS_SESSION_BUS_ADDRESS='") {
             if let Some(addr) = rest.strip_suffix("';") {
@@ -386,38 +518,41 @@ fn parse_dbus_address(output: &str) -> Result<String> {
             }
         }
     }
-    Err(Error::process(
-        "could not parse DBUS_SESSION_BUS_ADDRESS from dbus-launch",
-    ))
+    Err(MutterError::DbusOutputMissingField {
+        field: "DBUS_SESSION_BUS_ADDRESS",
+    })
 }
 
-fn parse_dbus_pid(output: &str) -> Result<u32> {
+fn parse_dbus_pid(output: &str) -> std::result::Result<u32, MutterError> {
     for line in output.lines() {
         if let Some(rest) = line.strip_prefix("DBUS_SESSION_BUS_PID=") {
             let pid_str = rest.trim_end_matches(';').trim();
-            return pid_str
-                .parse()
-                .map_err(|e| Error::process_with("invalid dbus PID", e));
+            return pid_str.parse().map_err(MutterError::DbusPidParse);
         }
     }
-    Err(Error::process(
-        "could not parse DBUS_SESSION_BUS_PID from dbus-launch",
-    ))
+    Err(MutterError::DbusOutputMissingField {
+        field: "DBUS_SESSION_BUS_PID",
+    })
 }
 
-fn parse_resolution(s: &str) -> Result<(u32, u32)> {
-    let (w, h) = s.split_once('x').ok_or_else(|| {
-        Error::process(format!("invalid resolution '{s}': expected WIDTHxHEIGHT"))
-    })?;
-    let parse = |part: &str| -> Result<u32> {
-        part.parse::<u32>().ok().filter(|n| *n > 0).ok_or_else(|| {
-            Error::process(format!("invalid resolution '{s}': expected WIDTHxHEIGHT"))
-        })
+fn parse_resolution(s: &str) -> std::result::Result<(u32, u32), MutterError> {
+    let invalid = || MutterError::ResolutionInvalid {
+        value: s.to_string(),
+    };
+    let (w, h) = s.split_once('x').ok_or_else(invalid)?;
+    let parse = |part: &str| -> std::result::Result<u32, MutterError> {
+        part.parse::<u32>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(invalid)
     };
     Ok((parse(w)?, parse(h)?))
 }
 
-async fn wait_for_wayland_socket(runtime_dir: &str, display: &str) -> Result<()> {
+async fn wait_for_wayland_socket(
+    runtime_dir: &str,
+    display: &str,
+) -> std::result::Result<(), MutterError> {
     let socket_path = PathBuf::from(runtime_dir).join(display);
     for _ in 0..50 {
         if socket_path.exists() {
@@ -425,10 +560,27 @@ async fn wait_for_wayland_socket(runtime_dir: &str, display: &str) -> Result<()>
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    Err(Error::Timeout(format!(
-        "wayland socket {} did not appear within 5s",
-        socket_path.display()
-    )))
+    Err(MutterError::WaylandSocketTimeout {
+        socket: socket_path.display().to_string(),
+    })
+}
+
+/// PipeWire creates `<runtime_dir>/pipewire-0` as soon as it's ready
+/// to accept client connections. Polling for that file replaces the
+/// previous unconditional `sleep(1s)` after spawning the pipewire
+/// process — same readiness model as
+/// [`wait_for_wayland_socket`].
+async fn wait_for_pipewire_socket(runtime_dir: &str) -> std::result::Result<(), MutterError> {
+    let socket_path = PathBuf::from(runtime_dir).join("pipewire-0");
+    for _ in 0..50 {
+        if socket_path.exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(MutterError::PipewireSocketTimeout {
+        socket: socket_path.display().to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -479,6 +631,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_wait_for_pipewire_socket_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().to_str().unwrap().to_string();
+        std::fs::File::create(dir.path().join("pipewire-0")).unwrap();
+        wait_for_pipewire_socket(&runtime_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_pipewire_socket_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().to_str().unwrap().to_string();
+        let err = wait_for_pipewire_socket(&runtime_dir).await.unwrap_err();
+        assert!(
+            matches!(err, MutterError::PipewireSocketTimeout { .. }),
+            "expected PipewireSocketTimeout, got: {err}"
+        );
+        // Public mapping: same Timeout bucket as the wayland one,
+        // so workspace callers matching `Error::Timeout(_)` (e.g.
+        // the e2e tests) keep working.
+        let public: waydriver::Error = err.into();
+        assert!(
+            matches!(public, waydriver::Error::Timeout(_)),
+            "expected waydriver::Error::Timeout, got: {public}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_wait_for_socket_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_dir = dir.path().to_str().unwrap().to_string();
@@ -487,8 +666,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Error::Timeout(_)),
-            "expected Timeout, got: {err}"
+            matches!(err, MutterError::WaylandSocketTimeout { .. }),
+            "expected WaylandSocketTimeout, got: {err}"
+        );
+        // And confirm the From<MutterError> -> waydriver::Error mapping
+        // still produces the public Timeout variant — workspace callers
+        // (notably the e2e tests) match on it.
+        let public: waydriver::Error = err.into();
+        assert!(
+            matches!(public, waydriver::Error::Timeout(_)),
+            "expected waydriver::Error::Timeout, got: {public}"
         );
     }
 
@@ -536,10 +723,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "before start")]
-    fn test_state_panics_before_start() {
+    fn test_state_returns_none_before_start() {
+        // `state()` previously panicked when called outside the started
+        // window. The current contract returns `None` so callers can
+        // detect the lifecycle without trapping a panic.
         let c = MutterCompositor::new();
-        let _ = c.state();
+        assert!(c.state().is_none());
     }
 
     #[test]
