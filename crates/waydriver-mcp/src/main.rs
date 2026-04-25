@@ -91,7 +91,7 @@ async fn seed_viewer(
 
 #[derive(Clone)]
 pub struct UiTestServer {
-    sessions: Arc<RwLock<HashMap<String, ManagedSession>>>,
+    sessions: Arc<RwLock<HashMap<String, Arc<ManagedSession>>>>,
     report_dir: PathBuf,
     default_resolution: String,
     default_record_video: bool,
@@ -100,7 +100,60 @@ pub struct UiTestServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// Scope handle held for the duration of a single tool call against one
+/// session. Bundles the session `Arc` with the drain-lock read guard so
+/// `kill_session` can wait for every in-flight tool to drop its ref
+/// *before* trying to unwrap the session.
+///
+/// **Drop-order is load-bearing.** Struct fields drop in declaration
+/// order, so `managed` (the `Arc<ManagedSession>`) drops *before*
+/// `_guard` (the read lock). That ordering guarantees that when
+/// `kill_session`'s `write_owned()` acquires the drain lock, the
+/// corresponding tool's `Arc<ManagedSession>` has already been dropped —
+/// so `Arc::try_unwrap` in `kill_session` deterministically succeeds.
+/// Reversing the fields breaks this invariant.
+struct InFlightSession {
+    managed: Arc<ManagedSession>,
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl std::ops::Deref for InFlightSession {
+    type Target = ManagedSession;
+    fn deref(&self) -> &ManagedSession {
+        &self.managed
+    }
+}
+
 impl UiTestServer {
+    /// Look up a session by id and acquire its drain lock in read mode.
+    /// The returned handle holds both the session `Arc` and the guard;
+    /// drop it to release the lock and let any pending `kill_session`
+    /// proceed.
+    async fn acquire(&self, session_id: &str) -> Result<InFlightSession, McpError> {
+        // Phase 1: take the map read lock just long enough to clone the
+        // session Arc out. After this scope exits, a concurrent
+        // `kill_session` can take the map write lock immediately — it
+        // will then wait on the per-session drain lock instead of the
+        // whole map.
+        let managed = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .cloned()
+                .ok_or_else(|| {
+                    McpError::invalid_params(format!("session not found: {session_id}"), None)
+                })?
+        };
+        // Phase 2: take the per-session drain lock in read mode. This is
+        // what `kill_session`'s `write_owned().await` waits on to learn
+        // that every in-flight tool has finished.
+        let guard = Arc::clone(&managed.kill_lock).read_owned().await;
+        Ok(InFlightSession {
+            managed,
+            _guard: guard,
+        })
+    }
+
     /// Boilerplate every action tool would otherwise repeat: look up the
     /// session, run a closure against its `Arc<Session>`, log the outcome
     /// to the per-session event log, and shape success/failure into a
@@ -112,13 +165,14 @@ impl UiTestServer {
     /// message and the MCP error so D-Bus / GStreamer / IO sources don't
     /// get flattened away by `to_string`.
     ///
-    /// **Locking note:** the read lock on `sessions` is held across
-    /// `work.await`. That matches every existing tool's behavior — a
-    /// concurrent `kill_session` (which takes a write lock) blocks until
-    /// every in-flight tool finishes. Improving that would require
-    /// switching `sessions` to `HashMap<String, Arc<ManagedSession>>` so
-    /// we could clone out the entry and drop the map lock; punted as a
-    /// separate change.
+    /// **Concurrency:** the map read lock is held only for the moment
+    /// it takes to clone out an `Arc<ManagedSession>`. Tool work runs
+    /// against the cloned `Arc` with the per-session drain lock held in
+    /// read mode — so tools on other sessions never block each other
+    /// and `kill_session` on other sessions is instant. A cancel on
+    /// *this* session (via `kill_session`) wakes auto-wait loops via
+    /// the session's `CancellationToken`, so even a stuck wait resolves
+    /// promptly as `Error::Cancelled`.
     async fn run_action<F, Fut>(
         &self,
         session_id: &str,
@@ -130,12 +184,8 @@ impl UiTestServer {
         F: FnOnce(Arc<waydriver::Session>) -> Fut,
         Fut: std::future::Future<Output = Result<String, waydriver::Error>>,
     {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {session_id}"), None)
-        })?;
-
-        let result = work(Arc::clone(&managed.session)).await;
+        let held = self.acquire(session_id).await?;
+        let result = work(Arc::clone(&held.session)).await;
 
         // Materialize a stringy view for log_event while still holding
         // the typed error, so we can route the typed error through
@@ -146,7 +196,7 @@ impl UiTestServer {
             Err(e) => Err(mcp_error::format_chain(e)),
         };
         let log_outcome = log_view.as_ref().map(String::as_str).map_err(String::as_str);
-        if let Err(e) = managed
+        if let Err(e) = held
             .log_event(session_id, action, log_params, log_outcome, None)
             .await
         {
@@ -257,13 +307,14 @@ impl UiTestServer {
             .await;
         }
 
-        let managed = ManagedSession {
+        let managed = Arc::new(ManagedSession {
             session: Arc::new(session),
             report_dir: report_dir.clone(),
             screenshot_counter: AtomicU32::new(0),
             events: Mutex::new(Vec::new()),
             report_enabled,
-        };
+            kill_lock: Arc::new(tokio::sync::RwLock::new(())),
+        });
 
         let start_msg = format!("Session started: id={id}, display={display}, app={app_name}");
         let log_params = serde_json::json!({
@@ -319,7 +370,11 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let managed = self
+        // Step 1: remove from the map so no new tool call can acquire
+        // this session. The map write lock is held only for the
+        // remove() call; in-flight tools already hold their own
+        // `Arc<ManagedSession>` clones and don't depend on the map.
+        let managed_arc = self
             .sessions
             .write()
             .await
@@ -328,8 +383,32 @@ impl UiTestServer {
                 McpError::invalid_params(format!("session not found: {}", params.session_id), None)
             })?;
 
-        // Destructure so `session.kill()` can move out without invalidating the
-        // remaining fields we still need for the final log event.
+        // Step 2: signal every in-flight tool on this session to bail.
+        // Long auto-wait loops observe the token and return
+        // `Error::Cancelled` in microseconds instead of waiting out
+        // their natural 30s-ish timeout.
+        managed_arc.session.cancel();
+
+        // Step 3: drain. Tools hold the per-session drain lock in read
+        // mode via `InFlightSession`; taking write mode waits for all
+        // of them to drop. Because `InFlightSession` declares
+        // `managed: Arc<ManagedSession>` before `_guard`, the Arc
+        // clone drops *before* the read guard releases, so by the time
+        // write_owned() resolves here we're the only holder of
+        // managed_arc and `Arc::try_unwrap` is guaranteed to succeed.
+        let _drain = Arc::clone(&managed_arc.kill_lock).write_owned().await;
+
+        let managed = Arc::try_unwrap(managed_arc).unwrap_or_else(|_| {
+            // Unreachable: the drain lock above guarantees we're the
+            // sole Arc holder. Panic rather than silently fall back to
+            // a weaker behavior — if this ever fires, the drop-order
+            // invariant on InFlightSession has been broken.
+            unreachable!("drain lock released while another Arc<ManagedSession> clone exists")
+        });
+
+        // Destructure so `session.kill()` can move out without
+        // invalidating the remaining fields we still need for the
+        // final log event.
         let ManagedSession {
             session,
             report_dir,
@@ -338,13 +417,13 @@ impl UiTestServer {
             ..
         } = managed;
 
-        // Unwrap Arc<Session> into owned Session. Any Locator cloned inside
-        // earlier tool calls is long dropped (they don't outlive their tool
-        // handler), and the write lock we held while removing the session
-        // prevents new tool calls from cloning the Arc.
+        // Arc<Session>: the drain lock above also ensures no tool is
+        // holding a session clone anymore, so this unwrap succeeds.
         let kill_result = match Arc::try_unwrap(session) {
             Ok(owned) => owned.kill().await.map_err(|e| e.to_string()),
-            Err(_) => Err("session is still referenced — cannot kill".to_string()),
+            Err(_) => unreachable!(
+                "post-drain Arc<Session> still referenced — tool leaked a clone past its scope"
+            ),
         };
         let success_msg = format!("Session {} killed", params.session_id);
         let outcome = kill_result
@@ -790,16 +869,14 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-        let session = &managed.session;
+        // take_screenshot doesn't fit run_action because log_event needs
+        // the screenshot filename (for the viewer thumbnail). Use the
+        // same acquire() primitive so we still get cancel/drain semantics.
+        let held = self.acquire(&params.session_id).await?;
 
         let outcome: Result<PathBuf, String> = async {
-            let png_bytes = session.take_screenshot().await.map_err(|e| e.to_string())?;
-            managed
-                .persist_screenshot(&params.session_id, &png_bytes)
+            let png_bytes = held.session.take_screenshot().await.map_err(|e| e.to_string())?;
+            held.persist_screenshot(&params.session_id, &png_bytes)
                 .await
                 .map_err(|e| format!("persist screenshot: {e}"))
         }
@@ -814,7 +891,7 @@ impl UiTestServer {
             (None, Err(e)) => Err(e.as_str()),
             (None, Ok(_)) => unreachable!(),
         };
-        if let Err(e) = managed
+        if let Err(e) = held
             .log_event(
                 &params.session_id,
                 "take_screenshot",
@@ -894,6 +971,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use tempfile::TempDir;
@@ -1026,13 +1104,14 @@ mod tests {
         let report_dir = srv.report_dir.clone();
         srv.sessions.write().await.insert(
             id.into(),
-            ManagedSession {
+            Arc::new(ManagedSession {
                 session: Arc::new(session),
                 report_dir,
                 screenshot_counter: AtomicU32::new(0),
                 events: Mutex::new(Vec::new()),
                 report_enabled,
-            },
+                kill_lock: Arc::new(tokio::sync::RwLock::new(())),
+            }),
         );
     }
 
@@ -1338,6 +1417,7 @@ mod tests {
             screenshot_counter: AtomicU32::new(0),
             events: Mutex::new(Vec::new()),
             report_enabled: true,
+            kill_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -1753,5 +1833,154 @@ mod tests {
         assert!(msg.contains("write png"), "missing operation: {msg}");
         assert!(msg.contains("disk full"), "missing source: {msg}");
         assert!(msg.contains(" | "), "missing chain separator: {msg}");
+    }
+
+    // ── Cooperative cancellation ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_action_bails_fast_when_session_cancelled_mid_work() {
+        // A tool whose closure is stuck in a long sleep should be
+        // interrupted as soon as the session's cancellation token trips —
+        // it exits via the token-aware select in its own body (or, for
+        // real tools, via poll_with_retry). Here we prove the wiring:
+        // the closure yields to the token, and run_action returns
+        // quickly with Err(Cancelled-derived).
+        let s = server();
+        insert_test_session(&s, "sid", "app", "wayland-x").await;
+
+        // Get a handle to the session's token so the spawned task can
+        // signal cancellation after a delay.
+        let token = {
+            let sessions = s.sessions.read().await;
+            sessions.get("sid").unwrap().session.cancellation_token().clone()
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let err = s
+            .run_action("sid", "slow", serde_json::json!({}), move |sess| async move {
+                // Race the token against a long sleep, same pattern
+                // poll_with_retry uses internally.
+                tokio::select! {
+                    _ = sess.cancellation_token().cancelled() => {
+                        Err(waydriver::Error::Cancelled)
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                        Ok("slept 30s".to_string())
+                    }
+                }
+            })
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(err.message.contains("cancelled"), "got: {}", err.message);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "run_action should return promptly on cancel; elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_session_interrupts_in_flight_tool_call() {
+        // The whole point of the cooperative-cancellation refactor:
+        // calling kill_session on a session with an in-flight tool
+        // should *interrupt* the tool (via the cancellation token) AND
+        // then deterministically unwrap the session for teardown —
+        // end-to-end, in milliseconds, not the 30s natural timeout.
+        let tmp = TempDir::new().unwrap();
+        let s = UiTestServer::new(
+            tmp.path().to_path_buf(),
+            "1024x768".into(),
+            false,
+            2_000_000,
+        );
+        insert_test_session(&s, "sid", "app", "wayland-x").await;
+
+        // Spawn a tool that would otherwise sleep for 30s. It races
+        // the cancellation token against its sleep, same as real tools
+        // do via poll_with_retry.
+        let s_for_tool = s.clone();
+        let tool = tokio::spawn(async move {
+            s_for_tool
+                .run_action("sid", "slow", serde_json::json!({}), |sess| async move {
+                    tokio::select! {
+                        _ = sess.cancellation_token().cancelled() => {
+                            Err(waydriver::Error::Cancelled)
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            Ok("slept 30s".to_string())
+                        }
+                    }
+                })
+                .await
+        });
+
+        // Give the tool a moment to get past acquire() and into its
+        // work so kill really races against an in-flight call, not a
+        // not-yet-started one.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let start = std::time::Instant::now();
+        let kill_result = s.kill_session(session_id("sid")).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(content_text(&kill_result).contains("killed"));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "kill_session must not wait for the tool's natural timeout; elapsed = {elapsed:?}"
+        );
+
+        // The tool itself should have seen the cancellation and returned
+        // an error (it was told to bail).
+        let tool_outcome = tool.await.unwrap();
+        assert!(tool_outcome.is_err(), "tool should surface cancellation");
+
+        // Session is fully removed from the map.
+        assert!(s.sessions.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tools_on_different_sessions_do_not_block_each_other() {
+        // With the per-session drain lock, a slow tool on session A
+        // must not delay a tool on session B. The old map-wide RwLock
+        // would have serialized them.
+        let s = server();
+        insert_test_session(&s, "a", "app", "wayland-a").await;
+        insert_test_session(&s, "b", "app", "wayland-b").await;
+
+        let s_for_a = s.clone();
+        let slow = tokio::spawn(async move {
+            s_for_a
+                .run_action("a", "slow", serde_json::json!({}), |_sess| async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Ok("done".to_string())
+                })
+                .await
+        });
+
+        // Give slow a moment to acquire its session.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let start = std::time::Instant::now();
+        let fast = s
+            .run_action("b", "fast", serde_json::json!({}), |_sess| async move {
+                Ok::<_, waydriver::Error>("quick".to_string())
+            })
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(content_text(&fast), "quick");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "tool on session B blocked on session A's work; elapsed = {elapsed:?}"
+        );
+
+        // Cleanup so the slow task doesn't leak past the test.
+        slow.await.unwrap().unwrap();
     }
 }

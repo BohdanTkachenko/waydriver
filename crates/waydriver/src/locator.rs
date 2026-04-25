@@ -860,9 +860,12 @@ impl Locator {
         Fut: Future<Output = Result<Option<T>>>,
     {
         let xpath = self.xpath.clone();
-        poll_with_retry(self.effective_timeout(), &xpath, || async {
-            pred(self.inspect_all().await?).await
-        })
+        poll_with_retry(
+            self.effective_timeout(),
+            &xpath,
+            self.session.cancellation_token(),
+            || async { pred(self.inspect_all().await?).await },
+        )
         .await
     }
 
@@ -1067,9 +1070,12 @@ impl Locator {
     /// and `AmbiguousSelector`.
     async fn wait_for_existing(&self) -> Result<ElementInfo> {
         let xpath = self.xpath.clone();
-        poll_with_retry(self.effective_timeout(), &xpath, || async {
-            Ok(Some(self.resolve_once_info().await?))
-        })
+        poll_with_retry(
+            self.effective_timeout(),
+            &xpath,
+            self.session.cancellation_token(),
+            || async { Ok(Some(self.resolve_once_info().await?)) },
+        )
         .await
     }
 
@@ -1079,15 +1085,20 @@ impl Locator {
     /// differ on which they report (GTK → Sensitive, Qt → Enabled).
     async fn wait_for_actionable(&self) -> Result<ElementInfo> {
         let xpath = self.xpath.clone();
-        poll_with_retry(self.effective_timeout(), &xpath, || async {
-            let info = self.resolve_once_info().await?;
-            let showing = info.states.iter().any(|s| s == "showing");
-            if showing && is_enabled_in(&info.states) {
-                Ok(Some(info))
-            } else {
-                Ok(None)
-            }
-        })
+        poll_with_retry(
+            self.effective_timeout(),
+            &xpath,
+            self.session.cancellation_token(),
+            || async {
+                let info = self.resolve_once_info().await?;
+                let showing = info.states.iter().any(|s| s == "showing");
+                if showing && is_enabled_in(&info.states) {
+                    Ok(Some(info))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
         .await
     }
 
@@ -1097,16 +1108,21 @@ impl Locator {
     /// focus without accepting activation.
     async fn wait_for_focusable(&self) -> Result<ElementInfo> {
         let xpath = self.xpath.clone();
-        poll_with_retry(self.effective_timeout(), &xpath, || async {
-            let info = self.resolve_once_info().await?;
-            let showing = info.states.iter().any(|s| s == "showing");
-            let focusable = info.states.iter().any(|s| s == "focusable");
-            if showing && focusable {
-                Ok(Some(info))
-            } else {
-                Ok(None)
-            }
-        })
+        poll_with_retry(
+            self.effective_timeout(),
+            &xpath,
+            self.session.cancellation_token(),
+            || async {
+                let info = self.resolve_once_info().await?;
+                let showing = info.states.iter().any(|s| s == "showing");
+                let focusable = info.states.iter().any(|s| s == "focusable");
+                if showing && focusable {
+                    Ok(Some(info))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
         .await
     }
 }
@@ -1195,7 +1211,8 @@ fn select_exactly_one(xpath: &str, count: usize) -> Result<()> {
 }
 
 /// Poll `f` with exponential backoff until it returns `Ok(Some(T))`, a
-/// non-retriable error, or the `timeout` deadline elapses.
+/// non-retriable error, the `timeout` deadline elapses, or `cancel` is
+/// triggered.
 ///
 /// Retriable errors ([`Error::ElementNotFound`], [`Error::ElementStale`]) are
 /// swallowed and retried. Fatal errors ([`Error::InvalidSelector`],
@@ -1206,9 +1223,17 @@ fn select_exactly_one(xpath: &str, count: usize) -> Result<()> {
 /// On timeout where the predicate returned `Ok(None)` (element exists but
 /// some state isn't satisfied), a [`Error::Timeout`] is returned with the
 /// xpath context.
+///
+/// Cancellation is checked at two points: before running the predicate
+/// (so we never start a fresh D-Bus round-trip on a dead session) and as
+/// the backoff sleep (so a cancel arriving mid-sleep resolves in micros
+/// instead of waiting out the delay). An observed cancel produces
+/// [`Error::Cancelled`] rather than a timeout, so callers can
+/// distinguish "kill was requested" from "the widget never appeared."
 pub(crate) async fn poll_with_retry<T, F, Fut>(
     timeout: Duration,
     xpath: &str,
+    cancel: &tokio_util::sync::CancellationToken,
     mut f: F,
 ) -> Result<T>
 where
@@ -1224,6 +1249,10 @@ where
     let mut last_err: Option<Error> = None;
     let mut attempts: u32 = 0;
     loop {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+
         attempts += 1;
         match f().await {
             Ok(Some(v)) => return Ok(v),
@@ -1250,7 +1279,13 @@ where
             }));
         }
 
-        tokio::time::sleep(delay).await;
+        // Race the backoff sleep against cancellation so a kill arriving
+        // mid-sleep wakes us in microseconds. Without this we'd spend up
+        // to MAX_POLL_DELAY sleeping obliviously.
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            _ = tokio::time::sleep(delay) => {}
+        }
         delay = (delay * 2).min(MAX_POLL_DELAY);
     }
 }
@@ -1661,19 +1696,83 @@ mod tests {
 
     // ── poll_with_retry ────────────────────────────────────────────────────
 
+    /// A fresh (non-cancelled) token for tests that exercise
+    /// `poll_with_retry` without involving cancellation semantics.
+    fn noncancel() -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    #[tokio::test]
+    async fn poll_returns_cancelled_when_token_tripped_before_first_attempt() {
+        // Cancelling before the first predicate call must short-circuit —
+        // we should never make a D-Bus round-trip against a dead session.
+        let tok = tokio_util::sync::CancellationToken::new();
+        tok.cancel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_cloned = attempts.clone();
+        let result: Result<i32, Error> =
+            poll_with_retry(Duration::from_secs(5), "//X", &tok, move || {
+                let a = attempts_cloned.clone();
+                async move {
+                    a.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(42))
+                }
+            })
+            .await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "predicate must not run after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_returns_cancelled_when_token_trips_during_backoff_sleep() {
+        // The main point of wiring cancellation into the backoff sleep:
+        // a cancel arriving while we're waiting out the delay should wake
+        // us immediately (micros), not keep us sleeping until the next
+        // scheduled attempt.
+        let tok = tokio_util::sync::CancellationToken::new();
+        let tok_for_spawn = tok.clone();
+        tokio::spawn(async move {
+            // Long enough that we're guaranteed to be in the backoff
+            // sleep (INITIAL_POLL_DELAY = 50ms), short enough that the
+            // test finishes quickly.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tok_for_spawn.cancel();
+        });
+        let start = std::time::Instant::now();
+        // Timeout 5s so we know any quick return came from cancellation,
+        // not from hitting the deadline.
+        let result: Result<i32, Error> =
+            poll_with_retry(Duration::from_secs(5), "//X", &tok, || async {
+                Err::<Option<i32>, _>(Error::ElementNotFound { xpath: "//X".into() })
+            })
+            .await;
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(Error::Cancelled)), "got {result:?}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel should wake the sleep promptly; elapsed = {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn poll_returns_value_on_first_try() {
+        let tok = noncancel();
         let result: Result<i32, Error> =
-            poll_with_retry(Duration::from_secs(5), "x", || async { Ok(Some(42)) }).await;
+            poll_with_retry(Duration::from_secs(5), "x", &tok, || async { Ok(Some(42)) }).await;
         assert_eq!(result.unwrap(), 42);
     }
 
     #[tokio::test]
     async fn poll_succeeds_after_retries() {
+        let tok = noncancel();
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_cloned = attempts.clone();
         let result: Result<&'static str, Error> =
-            poll_with_retry(Duration::from_secs(5), "x", move || {
+            poll_with_retry(Duration::from_secs(5), "x", &tok, move || {
                 let a = attempts_cloned.clone();
                 async move {
                     let n = a.fetch_add(1, Ordering::SeqCst);
@@ -1691,8 +1790,9 @@ mod tests {
 
     #[tokio::test]
     async fn poll_surfaces_last_retriable_error_on_timeout() {
+        let tok = noncancel();
         let result: Result<&'static str, Error> =
-            poll_with_retry(Duration::from_millis(50), "//Missing", || async {
+            poll_with_retry(Duration::from_millis(50), "//Missing", &tok, || async {
                 Err::<Option<&'static str>, _>(Error::ElementNotFound {
                     xpath: "//Missing".into(),
                 })
@@ -1710,8 +1810,9 @@ mod tests {
         // No retriable error — predicate just kept observing "element
         // present but state not satisfied." That should produce a Timeout
         // error, not some stale cached retriable error.
+        let tok = noncancel();
         let result: Result<i32, Error> =
-            poll_with_retry(Duration::from_millis(50), "//Pending", || async {
+            poll_with_retry(Duration::from_millis(50), "//Pending", &tok, || async {
                 Ok::<Option<i32>, Error>(None)
             })
             .await;
@@ -1727,10 +1828,11 @@ mod tests {
 
     #[tokio::test]
     async fn poll_bails_immediately_on_non_retriable_error() {
+        let tok = noncancel();
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_cloned = attempts.clone();
         let result: Result<&'static str, Error> =
-            poll_with_retry(Duration::from_secs(5), "//Bad", move || {
+            poll_with_retry(Duration::from_secs(5), "//Bad", &tok, move || {
                 let a = attempts_cloned.clone();
                 async move {
                     a.fetch_add(1, Ordering::SeqCst);
@@ -1749,10 +1851,11 @@ mod tests {
 
     #[tokio::test]
     async fn poll_ambiguous_selector_is_not_retriable() {
+        let tok = noncancel();
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_cloned = attempts.clone();
         let result: Result<&'static str, Error> =
-            poll_with_retry(Duration::from_secs(5), "//PushButton", move || {
+            poll_with_retry(Duration::from_secs(5), "//PushButton", &tok, move || {
                 let a = attempts_cloned.clone();
                 async move {
                     a.fetch_add(1, Ordering::SeqCst);
@@ -1774,10 +1877,11 @@ mod tests {
     async fn poll_zero_timeout_is_single_shot() {
         // Duration::ZERO → try once, if failing surface the error without
         // any sleep. Useful for negative assertions.
+        let tok = noncancel();
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_cloned = attempts.clone();
         let start = std::time::Instant::now();
-        let _: Result<i32, Error> = poll_with_retry(Duration::ZERO, "//X", move || {
+        let _: Result<i32, Error> = poll_with_retry(Duration::ZERO, "//X", &tok, move || {
             let a = attempts_cloned.clone();
             async move {
                 a.fetch_add(1, Ordering::SeqCst);

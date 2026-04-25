@@ -48,6 +48,14 @@ pub enum Error {
     #[error("timeout: {0}")]
     Timeout(String),
 
+    /// The session's cancellation token was triggered while this
+    /// operation was in flight. Typically means `kill_session` was
+    /// called on an MCP session with in-flight tool calls — the tool
+    /// bails out of any auto-wait loop so kill can proceed without
+    /// waiting for the natural timeout.
+    #[error("operation cancelled")]
+    Cancelled,
+
     /// Subprocess / IPC / mutex-poisoning failure. See [`Error::Atspi`] for
     /// the field semantics; construct via [`Error::process`] /
     /// [`Error::process_with`].

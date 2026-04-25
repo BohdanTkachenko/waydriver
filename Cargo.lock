@@ -2989,6 +2989,7 @@ dependencies = [
  "sxd-xpath",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "zbus",
 ]

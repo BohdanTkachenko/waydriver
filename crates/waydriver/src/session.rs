@@ -8,6 +8,7 @@ use atspi::connection::AccessibilityConnection;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::atspi as atspi_client;
 use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend};
@@ -82,6 +83,12 @@ pub struct Session {
     /// [`set_default_timeout`] can mutate it behind an `Arc<Session>`
     /// without requiring interior-mutability gymnastics on every field.
     default_timeout_ns: AtomicU64,
+    /// Cooperative cancellation signal. Long-running auto-wait loops in
+    /// [`Locator`] race this against their backoff sleep so a caller
+    /// (typically `kill_session` in the MCP layer) can bail out of a
+    /// stuck wait in milliseconds instead of waiting for the natural
+    /// timeout. Cloning is cheap — internally an `Arc<AtomicBool>`.
+    cancellation: CancellationToken,
     // Field declaration order matches the required shutdown sequence (app before
     // input/capture before compositor). The Drop impl sends SIGKILL to the app;
     // implicit field drops then release input/capture Arc refs before the
@@ -195,6 +202,7 @@ impl Session {
             app_path,
             a11y_connection: Some(a11y_connection),
             default_timeout_ns: AtomicU64::new(resolve_default_timeout().as_nanos() as u64),
+            cancellation: CancellationToken::new(),
             app,
             keepalive_stream: Some(keepalive_stream),
             video_recorder,
@@ -358,6 +366,23 @@ impl Session {
     pub fn set_default_timeout(&self, timeout: Duration) {
         self.default_timeout_ns
             .store(timeout.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Cancellation token observed by long-running auto-wait loops in
+    /// [`Locator`]. Returned as a reference because the internal handle
+    /// is already cheap to clone (`Arc<AtomicBool>` under the hood);
+    /// callers that need to stash a copy can call `.clone()` on the
+    /// returned ref.
+    pub fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Trigger the session's cancellation token. Idempotent — cancelling
+    /// an already-cancelled token is a no-op. After calling this, any
+    /// in-flight auto-wait will resolve promptly with [`Error::Cancelled`]
+    /// so the caller can shut the session down cleanly.
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
     }
 
     /// Snapshot of every stdout line the app process has printed so far.
@@ -541,6 +566,7 @@ impl Session {
             app_path: String::new(),
             a11y_connection: None,
             default_timeout_ns: AtomicU64::new(FALLBACK_DEFAULT_TIMEOUT.as_nanos() as u64),
+            cancellation: CancellationToken::new(),
             app,
             keepalive_stream: None,
             video_recorder: None,

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use waydriver::Session;
 
@@ -25,6 +25,14 @@ pub struct ManagedSession {
     /// When false, `log_event` is a no-op and the session skips writing
     /// `index.html` / `events.js` / `events.jsonl`.
     pub report_enabled: bool,
+    /// Per-session drain lock. Tool calls hold this in read mode
+    /// (`kill_lock.clone().read_owned()`) for the full duration of their
+    /// work, including `log_event`. `kill_session` acquires write mode
+    /// to wait for all in-flight tools to release before tearing down
+    /// the session, so `Arc::try_unwrap(session)` deterministically
+    /// succeeds. The `Arc` wrapper is required because
+    /// `RwLock::clone().read_owned()` needs `Arc<RwLock<_>>`.
+    pub kill_lock: Arc<RwLock<()>>,
 }
 
 impl ManagedSession {
