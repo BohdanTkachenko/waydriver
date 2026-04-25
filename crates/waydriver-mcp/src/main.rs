@@ -1,101 +1,34 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use clap::Parser;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::transport::stdio;
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
-
-use waydriver::keysym::parse_chord;
-use waydriver::{CompositorRuntime, Session, SessionConfig};
-use waydriver_capture_mutter::MutterCapture;
-use waydriver_compositor_mutter::MutterCompositor;
-use waydriver_input_mutter::MutterInput;
+use rmcp::{tool_handler, ErrorData as McpError, ServerHandler, ServiceExt};
 
 mod cli;
 mod mcp_error;
 mod params;
 mod report;
 mod session;
+mod tools;
 
-use cli::{resolve_report_dir, resolve_resolution, Cli};
+use cli::Cli;
 use mcp_error::waydriver_to_mcp;
-use params::{
-    ClickParams, DoubleClickParams, DragToParams, FillParams, FocusParams, HoverParams,
-    MovePointerParams, PointerClickParams, PressKeyParams, QueryParams, ReadTextParams,
-    RightClickParams, SelectOptionParams, SessionIdParams, SetTextParams, StartSessionParams,
-    TypeTextParams,
-};
-use report::{append_event, now_ms, render_index_html, render_matches};
 use session::ManagedSession;
-
-// ── start_session helpers ───────────────────────────────────────────────────
-
-/// Resolve the WebM output path for a recording-enabled session and ensure
-/// its parent directory exists before GStreamer's `filesink` opens it.
-///
-/// Returns `None` when `record_video` is `false`. Directory-creation
-/// failures are warned-and-continued — they typically clear up before
-/// `Session::start` runs the recording, and a hard-fail here would
-/// abort the session over a soft, recoverable IO error.
-async fn resolve_video_output(
-    record_video: bool,
-    report_dir: &std::path::Path,
-    compositor_id: &str,
-) -> Option<PathBuf> {
-    if !record_video {
-        return None;
-    }
-    let session_dir = report_dir.join(compositor_id);
-    if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
-        tracing::warn!(error = %e, "create session report dir failed (pre-record)");
-    }
-    Some(session_dir.join(format!("{compositor_id}.webm")))
-}
-
-/// Seed `{report_dir}/{session_id}/index.html` with the viewer shell so
-/// the first event always lands on an existing file. Caller decides
-/// whether reporting is enabled; this helper assumes it is.
-///
-/// All errors are warned-and-continued: the report viewer is a
-/// best-effort artifact, and refusing to start a session because
-/// `index.html` couldn't be written would punish the user for a
-/// disk-state problem they care less about than getting their app
-/// running.
-async fn seed_viewer(
-    report_dir: &std::path::Path,
-    session_id: &str,
-    app_name: &str,
-    started_at_ms: u64,
-    video_path: Option<&std::path::Path>,
-) {
-    let session_dir = report_dir.join(session_id);
-    if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
-        tracing::warn!(error = %e, "create session report dir failed");
-    }
-    let video_file = video_path
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str());
-    let html = render_index_html(session_id, app_name, started_at_ms, video_file);
-    if let Err(e) = tokio::fs::write(session_dir.join("index.html"), html).await {
-        tracing::warn!(error = %e, "write index.html failed");
-    }
-}
 
 // ── Server ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct UiTestServer {
-    sessions: Arc<RwLock<HashMap<String, Arc<ManagedSession>>>>,
-    report_dir: PathBuf,
-    default_resolution: String,
-    default_record_video: bool,
-    default_video_bitrate: u32,
+    pub(crate) sessions: Arc<RwLock<HashMap<String, Arc<ManagedSession>>>>,
+    pub(crate) report_dir: PathBuf,
+    pub(crate) default_resolution: String,
+    pub(crate) default_record_video: bool,
+    pub(crate) default_video_bitrate: u32,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -112,7 +45,7 @@ pub struct UiTestServer {
 /// corresponding tool's `Arc<ManagedSession>` has already been dropped —
 /// so `Arc::try_unwrap` in `kill_session` deterministically succeeds.
 /// Reversing the fields breaks this invariant.
-struct InFlightSession {
+pub(crate) struct InFlightSession {
     managed: Arc<ManagedSession>,
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
@@ -129,7 +62,7 @@ impl UiTestServer {
     /// The returned handle holds both the session `Arc` and the guard;
     /// drop it to release the lock and let any pending `kill_session`
     /// proceed.
-    async fn acquire(&self, session_id: &str) -> Result<InFlightSession, McpError> {
+    pub(crate) async fn acquire(&self, session_id: &str) -> Result<InFlightSession, McpError> {
         // Phase 1: take the map read lock just long enough to clone the
         // session Arc out. After this scope exits, a concurrent
         // `kill_session` can take the map write lock immediately — it
@@ -173,7 +106,7 @@ impl UiTestServer {
     /// *this* session (via `kill_session`) wakes auto-wait loops via
     /// the session's `CancellationToken`, so even a stuck wait resolves
     /// promptly as `Error::Cancelled`.
-    async fn run_action<F, Fut>(
+    pub(crate) async fn run_action<F, Fut>(
         &self,
         session_id: &str,
         action: &'static str,
@@ -208,710 +141,42 @@ impl UiTestServer {
     }
 }
 
-#[tool_router]
 impl UiTestServer {
+    /// Build a fresh `UiTestServer` with an empty session map and a
+    /// composed `ToolRouter` merged from every per-concern router.
+    ///
+    /// Each `tools::<concern>` module exposes a
+    /// `#[tool_router(router = <concern>_router)]` constructor; we sum
+    /// them here into the single `tool_router` field the
+    /// `#[tool_handler]` below dispatches against. Adding a new tool
+    /// group is: new module + new `+ Self::<group>_router()` line.
     pub fn new(
         report_dir: PathBuf,
         default_resolution: String,
         default_record_video: bool,
         default_video_bitrate: u32,
     ) -> Self {
+        let tool_router = Self::lifecycle_router()
+            + Self::inspection_router()
+            + Self::interaction_router()
+            + Self::capture_router();
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             report_dir,
             default_resolution,
             default_record_video,
             default_video_bitrate,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
-    }
-
-    #[tool(
-        description = "Start a headless Wayland session with mutter and launch an application. \
-                       On success, the response includes a `report=file://...` line with the URL \
-                       of the session's live viewer HTML — surface that URL directly to the user \
-                       so they can watch the run in a browser. Pass `report: false` to skip \
-                       writing the viewer and event log; the `report=` line is then omitted."
-    )]
-    async fn start_session(
-        &self,
-        Parameters(params): Parameters<StartSessionParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let command = params.command.clone();
-        let args = params.args.clone();
-        let cwd = params.cwd.clone();
-        let app_name = params
-            .app_name
-            .clone()
-            .unwrap_or_else(|| params.command.clone());
-
-        let resolution = resolve_resolution(&self.default_resolution, params.resolution.as_deref());
-
-        let report_dir = resolve_report_dir(&self.report_dir, params.report_dir.as_deref());
-        let report_enabled = params.report;
-        // Recording is tied to the report: the WebM lives alongside the
-        // viewer HTML and events. Explicit opt-out via `record_video: false`
-        // disables it even when reports are on.
-        let record_video =
-            report_enabled && params.record_video.unwrap_or(self.default_record_video);
-        let resolved_bitrate = params.video_bitrate.unwrap_or(self.default_video_bitrate);
-
-        // Construct and pre-start the mutter compositor so we can pull its
-        // shared Arc<MutterState> out before erasing to trait objects. Input
-        // and capture are thin wrappers around that Arc, so they get cloned
-        // references to the same D-Bus connection.
-        let mut compositor = MutterCompositor::new();
-        compositor
-            .start(Some(&resolution))
-            .await
-            .map_err(waydriver_to_mcp)?;
-        let compositor_id = compositor.id().to_string();
-        let state = compositor.state();
-        let input = MutterInput::new(state.clone());
-        let capture = MutterCapture::new(state);
-
-        let video_path = resolve_video_output(record_video, &report_dir, &compositor_id).await;
-
-        let session = Session::start(
-            Box::new(compositor),
-            Box::new(input),
-            Box::new(capture),
-            SessionConfig {
-                command: params.command,
-                args: params.args,
-                cwd: params.cwd,
-                app_name: app_name.clone(),
-                video_output: video_path.clone(),
-                video_bitrate: Some(resolved_bitrate),
-                video_fps: None,
-            },
-        )
-        .await
-        .map_err(waydriver_to_mcp)?;
-
-        let id = session.id.clone();
-        let display = session.wayland_display().to_string();
-
-        let started_at_ms = now_ms();
-
-        // Seed the per-session dir + viewer shell before we insert so the
-        // first event always lands on an existing index.html.
-        if report_enabled {
-            seed_viewer(
-                &report_dir,
-                &id,
-                &app_name,
-                started_at_ms,
-                video_path.as_deref(),
-            )
-            .await;
-        }
-
-        let managed = Arc::new(ManagedSession {
-            session: Arc::new(session),
-            report_dir: report_dir.clone(),
-            screenshot_counter: AtomicU32::new(0),
-            events: Mutex::new(Vec::new()),
-            report_enabled,
-            kill_lock: Arc::new(tokio::sync::RwLock::new(())),
-        });
-
-        let start_msg = format!("Session started: id={id}, display={display}, app={app_name}");
-        let log_params = serde_json::json!({
-            "command": command,
-            "args": args,
-            "cwd": cwd,
-            "app_name": app_name,
-            "resolution": resolution,
-        });
-        if let Err(e) = managed
-            .log_event(&id, "start_session", log_params, Ok(&start_msg), None)
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(start_session) failed");
-        }
-
-        self.sessions.write().await.insert(id.clone(), managed);
-
-        let text = if report_enabled {
-            let url = format!("file://{}/{id}/index.html", report_dir.display());
-            format!("{start_msg}\nreport={url}")
-        } else {
-            start_msg
-        };
-        Ok(CallToolResult::success(vec![Content::text(text)]))
-    }
-
-    #[tool(description = "List all active test sessions")]
-    async fn list_sessions(&self) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        if sessions.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No active sessions",
-            )]));
-        }
-
-        let mut lines = Vec::new();
-        for (id, m) in sessions.iter() {
-            lines.push(format!(
-                "- {} (app={}, display={})",
-                id,
-                m.session.app_name,
-                m.session.wayland_display()
-            ));
-        }
-        Ok(CallToolResult::success(vec![Content::text(
-            lines.join("\n"),
-        )]))
-    }
-
-    #[tool(description = "Kill a test session and clean up all processes")]
-    async fn kill_session(
-        &self,
-        Parameters(params): Parameters<SessionIdParams>,
-    ) -> Result<CallToolResult, McpError> {
-        // Step 1: remove from the map so no new tool call can acquire
-        // this session. The map write lock is held only for the
-        // remove() call; in-flight tools already hold their own
-        // `Arc<ManagedSession>` clones and don't depend on the map.
-        let managed_arc = self
-            .sessions
-            .write()
-            .await
-            .remove(&params.session_id)
-            .ok_or_else(|| {
-                McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-            })?;
-
-        // Step 2: signal every in-flight tool on this session to bail.
-        // Long auto-wait loops observe the token and return
-        // `Error::Cancelled` in microseconds instead of waiting out
-        // their natural 30s-ish timeout.
-        managed_arc.session.cancel();
-
-        // Step 3: drain. Tools hold the per-session drain lock in read
-        // mode via `InFlightSession`; taking write mode waits for all
-        // of them to drop. Because `InFlightSession` declares
-        // `managed: Arc<ManagedSession>` before `_guard`, the Arc
-        // clone drops *before* the read guard releases, so by the time
-        // write_owned() resolves here we're the only holder of
-        // managed_arc and `Arc::try_unwrap` is guaranteed to succeed.
-        let _drain = Arc::clone(&managed_arc.kill_lock).write_owned().await;
-
-        let managed = Arc::try_unwrap(managed_arc).unwrap_or_else(|_| {
-            // Unreachable: the drain lock above guarantees we're the
-            // sole Arc holder. Panic rather than silently fall back to
-            // a weaker behavior — if this ever fires, the drop-order
-            // invariant on InFlightSession has been broken.
-            unreachable!("drain lock released while another Arc<ManagedSession> clone exists")
-        });
-
-        // Destructure so `session.kill()` can move out without
-        // invalidating the remaining fields we still need for the
-        // final log event.
-        let ManagedSession {
-            session,
-            report_dir,
-            events,
-            report_enabled,
-            ..
-        } = managed;
-
-        // Arc<Session>: the drain lock above also ensures no tool is
-        // holding a session clone anymore, so this unwrap succeeds.
-        let kill_result = match Arc::try_unwrap(session) {
-            Ok(owned) => owned.kill().await.map_err(|e| e.to_string()),
-            Err(_) => unreachable!(
-                "post-drain Arc<Session> still referenced — tool leaked a clone past its scope"
-            ),
-        };
-        let success_msg = format!("Session {} killed", params.session_id);
-        let outcome = kill_result
-            .as_ref()
-            .map(|_| success_msg.as_str())
-            .map_err(|e| e.as_str());
-        if report_enabled {
-            if let Err(e) = append_event(
-                &report_dir,
-                &params.session_id,
-                &events,
-                "kill_session",
-                serde_json::json!({}),
-                outcome,
-                None,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "log_event(kill_session) failed");
-            }
-        }
-
-        kill_result.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(success_msg)]))
-    }
-
-    #[tool(
-        description = "Dump the accessibility tree of the application UI as XML. Use this to \
-                       discover selector-ready role names, attributes, and element hierarchy \
-                       before writing XPath queries for `query` or `click`."
-    )]
-    async fn dump_tree(
-        &self,
-        Parameters(params): Parameters<SessionIdParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.run_action(
-            &params.session_id,
-            "dump_tree",
-            serde_json::json!({}),
-            |s| async move { s.dump_tree().await },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Query the accessibility tree with an XPath selector. Returns a JSON \
-                       array of matches; each element carries a pinned `xpath` that can be \
-                       passed back to `click` / `set_text` / `read_text` to target that \
-                       specific ordinal match. Names are not unique, so prefer more specific \
-                       selectors (role + attribute) over pure name matches."
-    )]
-    async fn query(
-        &self,
-        Parameters(params): Parameters<QueryParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "query",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move {
-                let matches = s.locate(&xpath).inspect_all().await?;
-                // serde_json failure on a value we just constructed is
-                // essentially impossible, but a typed error is cheaper
-                // than a panic — wrap it as an infra failure.
-                serde_json::to_string_pretty(&render_matches(&xpath, &matches))
-                    .map_err(|e| waydriver::Error::process_with("serialize query result", e))
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Click a UI element selected by XPath. The selector must resolve to \
-                       exactly one element; if it matches multiple, use `query` first and \
-                       pass the pinned `xpath` back, or refine the selector."
-    )]
-    async fn click(
-        &self,
-        Parameters(params): Parameters<ClickParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "click",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move { s.locate(&xpath).click().await.map(|_| format!("Clicked {xpath}")) },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Give keyboard focus to the element selected by XPath. The selector must \
-                       resolve to exactly one focusable element. Use this before sending \
-                       keyboard input via `type_text` or `press_key` when you need the input \
-                       to land on a specific widget."
-    )]
-    async fn focus(
-        &self,
-        Parameters(params): Parameters<FocusParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "focus",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move { s.locate(&xpath).focus().await.map(|_| format!("Focused {xpath}")) },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Move the pointer to the centre of the element selected by XPath without \
-                       clicking. Use to reveal hover-only UI like tooltips or slide-out menus."
-    )]
-    async fn hover(
-        &self,
-        Parameters(params): Parameters<HoverParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "hover",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move { s.locate(&xpath).hover().await.map(|_| format!("Hovered {xpath}")) },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Double-click the element selected by XPath with the primary mouse button. \
-                       Synthesizes two rapid pointer clicks at the element's centre so toolkits \
-                       see a real double-click (unlike `click`, which routes through AT-SPI)."
-    )]
-    async fn double_click(
-        &self,
-        Parameters(params): Parameters<DoubleClickParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "double_click",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move {
-                s.locate(&xpath)
-                    .double_click()
-                    .await
-                    .map(|_| format!("Double-clicked {xpath}"))
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Right-click the element selected by XPath, typically opening the widget's \
-                       context menu."
-    )]
-    async fn right_click(
-        &self,
-        Parameters(params): Parameters<RightClickParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "right_click",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move {
-                s.locate(&xpath)
-                    .right_click()
-                    .await
-                    .map(|_| format!("Right-clicked {xpath}"))
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Drag the element selected by `source_xpath` onto the element selected by \
-                       `target_xpath` with the primary mouse button held. Both selectors must \
-                       resolve to exactly one element."
-    )]
-    async fn drag_to(
-        &self,
-        Parameters(params): Parameters<DragToParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let source_xpath = params.source_xpath.clone();
-        let target_xpath = params.target_xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "drag_to",
-            serde_json::json!({
-                "source_xpath": params.source_xpath,
-                "target_xpath": params.target_xpath,
-            }),
-            |s| async move {
-                let source = s.locate(&source_xpath);
-                let target = s.locate(&target_xpath);
-                source
-                    .drag_to(&target)
-                    .await
-                    .map(|_| format!("Dragged {source_xpath} to {target_xpath}"))
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Replace the editable-text contents of an element selected by XPath. \
-                       Target must implement the EditableText AT-SPI interface."
-    )]
-    async fn set_text(
-        &self,
-        Parameters(params): Parameters<SetTextParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        let text = params.text.clone();
-        self.run_action(
-            &params.session_id,
-            "set_text",
-            serde_json::json!({ "xpath": params.xpath, "text": params.text }),
-            |s| async move {
-                s.locate(&xpath)
-                    .set_text(&text)
-                    .await
-                    .map(|_| format!("Set text on {xpath}"))
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Replace text contents by simulating keyboard input: focus the element, \
-                       clear existing content, then type. Works on any standard text widget \
-                       — including GtkTextView and others that don't implement EditableText. \
-                       Prefer set_text when the target supports it (one D-Bus call); use \
-                       fill as the compatibility fallback. \
-                       `mode`: \"caret_nav\" (default; Ctrl+Home then Ctrl+Shift+End) or \
-                       \"select_all\" (Ctrl+A — faster when the app honors it)."
-    )]
-    async fn fill(
-        &self,
-        Parameters(params): Parameters<FillParams>,
-    ) -> Result<CallToolResult, McpError> {
-        // Validate mode up front: it's a caller-input problem, not a
-        // runtime failure, so it shouldn't get logged as an action error.
-        let mode = match params.mode.as_deref() {
-            None | Some("caret_nav") => waydriver::FillMode::CaretNav,
-            Some("select_all") => waydriver::FillMode::SelectAll,
-            Some(other) => {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "invalid fill mode {other:?}; expected \"caret_nav\" or \"select_all\""
-                    ),
-                    None,
-                ));
-            }
-        };
-
-        let xpath = params.xpath.clone();
-        let text = params.text.clone();
-        self.run_action(
-            &params.session_id,
-            "fill",
-            serde_json::json!({
-                "xpath": params.xpath,
-                "text": params.text,
-                "mode": params.mode,
-            }),
-            |s| async move {
-                s.locate(&xpath)
-                    .fill_with_opts(&text, mode)
-                    .await
-                    .map(|_| format!("Filled {xpath}"))
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Pick an option in a combobox, dropdown, or other AT-SPI Selection \
-                       container. Calls Selection::select_child on the located element — much \
-                       faster and less flaky than clicking the widget open and clicking the \
-                       item. `by`: \"label\" (matches the option's accessible name) or \
-                       \"index\" (parses `value` as a 0-indexed integer). Container must \
-                       implement the Selection interface."
-    )]
-    async fn select_option(
-        &self,
-        Parameters(params): Parameters<SelectOptionParams>,
-    ) -> Result<CallToolResult, McpError> {
-        // Parse by/value up front into an owned discriminant so the
-        // closure can reconstruct `SelectBy` (which borrows). Bad input
-        // here is caller error, not infrastructure failure.
-        enum ParsedBy {
-            Label(String),
-            Index(usize),
-        }
-        let parsed = match params.by.as_str() {
-            "label" => ParsedBy::Label(params.value.clone()),
-            "index" => params.value.parse::<usize>().map(ParsedBy::Index).map_err(|e| {
-                McpError::invalid_params(
-                    format!("invalid index {:?}: {e}", params.value),
-                    None,
-                )
-            })?,
-            other => {
-                return Err(McpError::invalid_params(
-                    format!("invalid `by` {other:?}; expected \"label\" or \"index\""),
-                    None,
-                ));
-            }
-        };
-
-        let xpath = params.xpath.clone();
-        let by = params.by.clone();
-        let value = params.value.clone();
-        self.run_action(
-            &params.session_id,
-            "select_option",
-            serde_json::json!({
-                "xpath": params.xpath,
-                "by": params.by,
-                "value": params.value,
-            }),
-            |s| async move {
-                let selector = match &parsed {
-                    ParsedBy::Label(name) => waydriver::SelectBy::Label(name.as_str()),
-                    ParsedBy::Index(i) => waydriver::SelectBy::Index(*i),
-                };
-                s.locate(&xpath)
-                    .select_option(selector)
-                    .await
-                    .map(|_| format!("Selected {by}={value:?} on {xpath}"))
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Read the text contents of an element selected by XPath. Target must \
-                       implement the Text AT-SPI interface."
-    )]
-    async fn read_text(
-        &self,
-        Parameters(params): Parameters<ReadTextParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let xpath = params.xpath.clone();
-        self.run_action(
-            &params.session_id,
-            "read_text",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move { s.locate(&xpath).text().await },
-        )
-        .await
-    }
-
-    #[tool(description = "Type text into the currently focused element via keyboard input")]
-    async fn type_text(
-        &self,
-        Parameters(params): Parameters<TypeTextParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let text = params.text.clone();
-        self.run_action(
-            &params.session_id,
-            "type_text",
-            serde_json::json!({ "text": params.text }),
-            |s| async move { s.type_text(&text).await.map(|_| format!("Typed '{text}'")) },
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Press a keyboard key or chord. Accepts either a single-key name \
-                       ('Return', 'Tab', 'a') or a modifier combo ('Ctrl+A', 'Shift+Tab', \
-                       'Ctrl+Shift+Alt+F1'). Modifier aliases: Ctrl=Control, Super=Meta=Win=Cmd. \
-                       Separator can be '+' or '-'. Case-insensitive."
-    )]
-    async fn press_key(
-        &self,
-        Parameters(params): Parameters<PressKeyParams>,
-    ) -> Result<CallToolResult, McpError> {
-        // Validate the chord string up front so an unparseable input
-        // surfaces as invalid_params (caller error), not internal_error.
-        // press_chord would also reject it but with a less specific code.
-        if parse_chord(&params.key).is_none() {
-            return Err(McpError::invalid_params(
-                format!("unknown key: {}", params.key),
-                None,
-            ));
-        }
-
-        let key = params.key.clone();
-        self.run_action(
-            &params.session_id,
-            "press_key",
-            serde_json::json!({ "key": params.key }),
-            |s| async move { s.press_chord(&key).await.map(|_| format!("Pressed '{key}'")) },
-        )
-        .await
-    }
-
-    #[tool(description = "Move the pointer by a relative offset in logical pixels")]
-    async fn move_pointer(
-        &self,
-        Parameters(params): Parameters<MovePointerParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let dx = params.dx;
-        let dy = params.dy;
-        self.run_action(
-            &params.session_id,
-            "move_pointer",
-            serde_json::json!({ "dx": params.dx, "dy": params.dy }),
-            |s| async move {
-                s.pointer_motion_relative(dx, dy)
-                    .await
-                    .map(|_| format!("Pointer moved by ({dx}, {dy})"))
-            },
-        )
-        .await
-    }
-
-    #[tool(description = "Press and release a pointer button (defaults to left click)")]
-    async fn pointer_click(
-        &self,
-        Parameters(params): Parameters<PointerClickParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let button = params.button.unwrap_or(0x110); // BTN_LEFT
-        self.run_action(
-            &params.session_id,
-            "pointer_click",
-            serde_json::json!({ "button": button }),
-            |s| async move {
-                s.pointer_button(button)
-                    .await
-                    .map(|_| format!("Pointer button {button:#x} clicked"))
-            },
-        )
-        .await
-    }
-
-    #[tool(description = "Take a screenshot of the session and return the file path")]
-    async fn take_screenshot(
-        &self,
-        Parameters(params): Parameters<SessionIdParams>,
-    ) -> Result<CallToolResult, McpError> {
-        // take_screenshot doesn't fit run_action because log_event needs
-        // the screenshot filename (for the viewer thumbnail). Use the
-        // same acquire() primitive so we still get cancel/drain semantics.
-        let held = self.acquire(&params.session_id).await?;
-
-        let outcome: Result<PathBuf, String> = async {
-            let png_bytes = held.session.take_screenshot().await.map_err(|e| e.to_string())?;
-            held.persist_screenshot(&params.session_id, &png_bytes)
-                .await
-                .map_err(|e| format!("persist screenshot: {e}"))
-        }
-        .await;
-        let ok_display = outcome.as_ref().ok().map(|p| p.display().to_string());
-        let screenshot_name = outcome
-            .as_ref()
-            .ok()
-            .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string));
-        let log_outcome = match (&ok_display, &outcome) {
-            (Some(s), _) => Ok(s.as_str()),
-            (None, Err(e)) => Err(e.as_str()),
-            (None, Ok(_)) => unreachable!(),
-        };
-        if let Err(e) = held
-            .log_event(
-                &params.session_id,
-                "take_screenshot",
-                serde_json::json!({}),
-                log_outcome,
-                screenshot_name.as_deref(),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(take_screenshot) failed");
-        }
-
-        let path = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(
-            path.display().to_string(),
-        )]))
     }
 }
 
-#[tool_handler]
+// Default `#[tool_handler]` in rmcp 1.4 expands to `Self::tool_router()` —
+// i.e. it expects a single generated function. We split the router across
+// five `#[tool_router(router = <concern>_router)]` impls in `tools::*` and
+// merge them in `UiTestServer::new`, so point the handler at the merged
+// field instead.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for UiTestServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -970,12 +235,22 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use rmcp::handler::server::wrapper::Parameters;
     use tempfile::TempDir;
+    use tokio::sync::Mutex;
     use waydriver::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
+    use waydriver::Session;
+
+    use crate::params::{
+        ClickParams, FocusParams, MovePointerParams, PointerClickParams, PressKeyParams,
+        QueryParams, ReadTextParams, SelectOptionParams, SessionIdParams, SetTextParams,
+        TypeTextParams,
+    };
+    use crate::tools::lifecycle::{resolve_video_output, seed_viewer};
 
     fn server() -> UiTestServer {
         UiTestServer::new(
