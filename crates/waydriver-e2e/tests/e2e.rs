@@ -831,7 +831,7 @@ async fn fixture_select_option_errors_on_non_selection_widget() -> anyhow::Resul
     // fails with NotSupported (also mapped to Error::Atspi). Both are
     // fine — the caller just needs a readable error.
     assert!(
-        matches!(err, Error::Atspi(_) | Error::ElementStale { .. }),
+        matches!(err, Error::Atspi { .. } | Error::ElementStale { .. }),
         "expected Atspi-flavored error, got {err:?}"
     );
 

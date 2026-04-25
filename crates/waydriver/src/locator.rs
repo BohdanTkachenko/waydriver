@@ -330,7 +330,7 @@ impl Locator {
     pub async fn bounds(&self) -> Result<crate::atspi::Rect> {
         let info = self.wait_for_existing().await?;
         info.bounds.ok_or_else(|| {
-            Error::Atspi(format!(
+            Error::atspi(format!(
                 "no bounds available for {} — element doesn't implement Component or isn't laid out",
                 self.xpath
             ))
@@ -485,7 +485,7 @@ impl Locator {
         };
 
         let index_i32 = i32::try_from(index).map_err(|_| {
-            Error::Atspi(format!(
+            Error::atspi(format!(
                 "select_option: index {index} too large to fit AT-SPI's i32 child index"
             ))
         })?;
@@ -542,20 +542,20 @@ impl Locator {
 
         let info = self.wait_for_existing().await?;
         let Some(elem_bounds) = info.bounds else {
-            return Err(Error::Atspi(format!(
+            return Err(Error::atspi(format!(
                 "no bounds available for {} — can't scroll without Component extents",
                 self.xpath
             )));
         };
 
         let Some(scrollable) = self.find_scrollable_ancestor().await? else {
-            return Err(Error::Atspi(format!(
+            return Err(Error::atspi(format!(
                 "no scrollable ancestor for {} — element isn't inside a ScrollPane/Viewport",
                 self.xpath
             )));
         };
         let Some(scroll_bounds) = scrollable.bounds else {
-            return Err(Error::Atspi(format!(
+            return Err(Error::atspi(format!(
                 "scrollable ancestor for {} has no bounds — toolkit doesn't expose Component on it",
                 self.xpath
             )));
@@ -674,7 +674,7 @@ impl Locator {
             }
         }
 
-        Err(Error::Atspi(format!(
+        Err(Error::atspi(format!(
             "scroll_into_view exhausted {MAX_WHEEL_TICKS} wheel ticks for {} — toolkit \
              likely ignored synthesized axis events",
             self.xpath
@@ -766,7 +766,7 @@ impl Locator {
     async fn wait_and_center(&self) -> Result<(f64, f64)> {
         let info = self.wait_for_actionable().await?;
         let bounds = info.bounds.ok_or_else(|| {
-            Error::Atspi(format!(
+            Error::atspi(format!(
                 "no bounds for {} — pointer actions need Component extents",
                 self.xpath
             ))
@@ -1032,7 +1032,7 @@ impl Locator {
         self.session
             .a11y_connection
             .as_ref()
-            .ok_or_else(|| Error::Atspi("session has no AT-SPI connection".into()))
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))
     }
 
     /// Effective timeout for this locator: the per-locator override if set,
@@ -1154,7 +1154,7 @@ fn child_index_for_label(children: &[ElementInfo], label: &str, xpath: &str) -> 
         .enumerate()
         .filter(|(_, c)| c.name.as_deref() == Some(label));
     let Some((first_idx, _)) = hits.next() else {
-        return Err(Error::Atspi(format!(
+        return Err(Error::atspi(format!(
             "select_option: no child with accessible name {label:?} under {xpath}"
         )));
     };
@@ -1540,7 +1540,7 @@ mod tests {
         // surface that as an Atspi error rather than panicking.
         let s = test_session();
         let err = s.locate("//PushButton").click().await.unwrap_err();
-        assert!(matches!(err, Error::Atspi(_)));
+        assert!(matches!(err, Error::Atspi { .. }));
         assert!(err.to_string().contains("no AT-SPI connection"));
     }
 
@@ -1591,7 +1591,7 @@ mod tests {
             .wait_until(|_| true)
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Atspi(_)));
+        assert!(matches!(err, Error::Atspi { .. }));
         assert!(err.to_string().contains("no AT-SPI connection"));
     }
 
@@ -1604,7 +1604,7 @@ mod tests {
             .wait_until_async(|_| async { true })
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Atspi(_)));
+        assert!(matches!(err, Error::Atspi { .. }));
     }
 
     #[tokio::test]
@@ -1616,7 +1616,7 @@ mod tests {
             .wait_for(|_| async { Ok(Some(42)) })
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Atspi(_)));
+        assert!(matches!(err, Error::Atspi { .. }));
     }
 
     #[tokio::test]
@@ -1635,14 +1635,14 @@ mod tests {
             .wait_for(|_| async { Ok::<Option<&'static str>, Error>(Some("sentinel")) })
             .await;
         // a11y-missing error comes first from the inspect_all call.
-        assert!(matches!(result.unwrap_err(), Error::Atspi(_)));
+        assert!(matches!(result.unwrap_err(), Error::Atspi { .. }));
     }
 
     #[tokio::test]
     async fn session_dump_tree_without_a11y_errors_cleanly() {
         let s = test_session();
         let err = s.dump_tree().await.unwrap_err();
-        assert!(matches!(err, Error::Atspi(_)));
+        assert!(matches!(err, Error::Atspi { .. }));
         assert!(err.to_string().contains("no AT-SPI connection"));
     }
 
@@ -1912,11 +1912,14 @@ mod tests {
         let children = children_from(COMBO_XML, "//ComboBox");
         let err = super::child_index_for_label(&children, "Jumbo", "//ComboBox").unwrap_err();
         match err {
-            Error::Atspi(msg) => {
-                assert!(msg.contains("Jumbo"), "error should name the label: {msg}");
+            Error::Atspi { message, .. } => {
                 assert!(
-                    msg.contains("//ComboBox"),
-                    "error should name the container: {msg}"
+                    message.contains("Jumbo"),
+                    "error should name the label: {message}"
+                );
+                assert!(
+                    message.contains("//ComboBox"),
+                    "error should name the container: {message}"
                 );
             }
             other => panic!("expected Atspi error, got {other:?}"),
@@ -1953,7 +1956,7 @@ mod tests {
         let children = children_from(xml, "//ComboBox");
         assert!(children.is_empty());
         let err = super::child_index_for_label(&children, "anything", "//ComboBox").unwrap_err();
-        assert!(matches!(err, Error::Atspi(_)));
+        assert!(matches!(err, Error::Atspi { .. }));
     }
 
     #[test]
@@ -1972,7 +1975,7 @@ mod tests {
             xpath: "x".into(),
             reason: "r".into(),
         }));
-        assert!(!is_retriable(&Error::Atspi("boom".into())));
+        assert!(!is_retriable(&Error::atspi("boom")));
         assert!(!is_retriable(&Error::Timeout("nope".into())));
     }
 

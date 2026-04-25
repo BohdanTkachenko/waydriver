@@ -23,7 +23,7 @@ static GRAB_PNG_LOCK: Mutex<()> = Mutex::new(());
 /// sessions don't race on these process-wide env vars.
 fn validate_pipewire_socket(path: &Path) -> Result<&Path> {
     path.parent().ok_or_else(|| {
-        Error::Screenshot(format!(
+        Error::screenshot(format!(
             "pipewire socket path has no parent: {}",
             path.display()
         ))
@@ -52,15 +52,15 @@ pub async fn grab_png(node_id: u32, pipewire_socket: &Path) -> Result<Vec<u8>> {
     // GStreamer pipeline ops are blocking — run on a blocking thread.
     tokio::task::spawn_blocking(move || grab_png_sync(node_id, &socket, &runtime))
         .await
-        .map_err(|e| Error::Screenshot(format!("spawn_blocking failed: {e}")))?
+        .map_err(|e| Error::screenshot_with("spawn_blocking failed", e))?
 }
 
 fn grab_png_sync(node_id: u32, pipewire_socket: &Path, runtime_dir: &Path) -> Result<Vec<u8>> {
     let _guard = GRAB_PNG_LOCK
         .lock()
-        .map_err(|e| Error::Screenshot(format!("grab_png lock poisoned: {e}")))?;
+        .map_err(|e| Error::screenshot(format!("grab_png lock poisoned: {e}")))?;
 
-    gst::init().map_err(|e| Error::Screenshot(format!("gstreamer init failed: {e}")))?;
+    gst::init().map_err(|e| Error::screenshot_with("gstreamer init failed", e))?;
 
     // pipewiresrc reads these from the environment. Safe because GRAB_PNG_LOCK
     // serializes all callers — no concurrent set_var/get_var on these keys.
@@ -72,41 +72,41 @@ fn grab_png_sync(node_id: u32, pipewire_socket: &Path, runtime_dir: &Path) -> Re
     let pipeline_str = build_pipeline_str(node_id);
 
     let pipeline = gst::parse::launch(&pipeline_str)
-        .map_err(|e| Error::Screenshot(format!("pipeline parse failed: {e}")))?;
+        .map_err(|e| Error::screenshot_with("pipeline parse failed", e))?;
 
     let pipeline = pipeline
         .dynamic_cast::<gst::Pipeline>()
-        .map_err(|_| Error::Screenshot("parsed element is not a Pipeline".into()))?;
+        .map_err(|_| Error::screenshot("parsed element is not a Pipeline"))?;
 
     let sink = pipeline
         .by_name("sink")
-        .ok_or_else(|| Error::Screenshot("appsink not found in pipeline".into()))?;
+        .ok_or_else(|| Error::screenshot("appsink not found in pipeline"))?;
     let appsink = sink
         .dynamic_cast::<AppSink>()
-        .map_err(|_| Error::Screenshot("element 'sink' is not an AppSink".into()))?;
+        .map_err(|_| Error::screenshot("element 'sink' is not an AppSink"))?;
 
     pipeline
         .set_state(gst::State::Playing)
-        .map_err(|e| Error::Screenshot(format!("failed to start pipeline: {e}")))?;
+        .map_err(|e| Error::screenshot_with("failed to start pipeline", e))?;
 
     // Pull a sample with a timeout.
     let sample = appsink
         .try_pull_sample(gst::ClockTime::from_seconds(10))
-        .ok_or_else(|| Error::Screenshot("timed out waiting for PNG frame".into()))?;
+        .ok_or_else(|| Error::screenshot("timed out waiting for PNG frame"))?;
 
     let buffer = sample
         .buffer()
-        .ok_or_else(|| Error::Screenshot("sample has no buffer".into()))?;
+        .ok_or_else(|| Error::screenshot("sample has no buffer"))?;
 
     let map = buffer
         .map_readable()
-        .map_err(|e| Error::Screenshot(format!("failed to map buffer: {e}")))?;
+        .map_err(|e| Error::screenshot_with("failed to map buffer", e))?;
 
     let png_bytes = map.as_slice().to_vec();
 
     pipeline
         .set_state(gst::State::Null)
-        .map_err(|e| Error::Screenshot(format!("failed to stop pipeline: {e}")))?;
+        .map_err(|e| Error::screenshot_with("failed to stop pipeline", e))?;
 
     tracing::info!(bytes = png_bytes.len(), "screenshot captured");
     Ok(png_bytes)
@@ -209,7 +209,7 @@ impl VideoRecorder {
             start_recording_sync(node_id, &socket, &runtime, output, bitrate, fps)
         })
         .await
-        .map_err(|e| Error::Screenshot(format!("spawn_blocking failed: {e}")))?
+        .map_err(|e| Error::screenshot_with("spawn_blocking failed", e))?
     }
 
     /// Send EOS, wait for the muxer to flush cues, then set the pipeline to
@@ -218,10 +218,10 @@ impl VideoRecorder {
         let pipeline = self
             .pipeline
             .take()
-            .ok_or_else(|| Error::Screenshot("recording already stopped".into()))?;
+            .ok_or_else(|| Error::screenshot("recording already stopped"))?;
         tokio::task::spawn_blocking(move || stop_recording_sync(&pipeline))
             .await
-            .map_err(|e| Error::Screenshot(format!("spawn_blocking failed: {e}")))?
+            .map_err(|e| Error::screenshot_with("spawn_blocking failed", e))?
     }
 
     /// Path the WebM is being written to.
@@ -253,9 +253,9 @@ fn start_recording_sync(
 ) -> Result<VideoRecorder> {
     let _guard = GRAB_PNG_LOCK
         .lock()
-        .map_err(|e| Error::Screenshot(format!("grab_png lock poisoned: {e}")))?;
+        .map_err(|e| Error::screenshot(format!("grab_png lock poisoned: {e}")))?;
 
-    gst::init().map_err(|e| Error::Screenshot(format!("gstreamer init failed: {e}")))?;
+    gst::init().map_err(|e| Error::screenshot_with("gstreamer init failed", e))?;
 
     // pipewiresrc reads these from the environment during state-transition to
     // READY. The GRAB_PNG_LOCK guard serializes us with screenshot grabs.
@@ -267,14 +267,14 @@ fn start_recording_sync(
     let pipeline_str = build_recording_pipeline_str(node_id, &output_path, bitrate, fps);
 
     let pipeline = gst::parse::launch(&pipeline_str)
-        .map_err(|e| Error::Screenshot(format!("recording pipeline parse failed: {e}")))?;
+        .map_err(|e| Error::screenshot_with("recording pipeline parse failed", e))?;
     let pipeline = pipeline
         .dynamic_cast::<gst::Pipeline>()
-        .map_err(|_| Error::Screenshot("parsed element is not a Pipeline".into()))?;
+        .map_err(|_| Error::screenshot("parsed element is not a Pipeline"))?;
 
     pipeline
         .set_state(gst::State::Playing)
-        .map_err(|e| Error::Screenshot(format!("failed to start recording pipeline: {e}")))?;
+        .map_err(|e| Error::screenshot_with("failed to start recording pipeline", e))?;
 
     tracing::info!(path = %output_path.display(), node_id, "video recording started");
 
@@ -292,7 +292,7 @@ fn stop_recording_sync(pipeline: &gst::Pipeline) -> Result<()> {
 
     let bus = pipeline
         .bus()
-        .ok_or_else(|| Error::Screenshot("recording pipeline has no bus".into()))?;
+        .ok_or_else(|| Error::screenshot("recording pipeline has no bus"))?;
 
     // Wait up to 10s for the EOS to propagate through the encoder + muxer.
     let timeout = gst::ClockTime::from_seconds(10);
@@ -301,7 +301,7 @@ fn stop_recording_sync(pipeline: &gst::Pipeline) -> Result<()> {
     {
         if let gst::MessageView::Error(err) = msg.view() {
             let _ = pipeline.set_state(gst::State::Null);
-            return Err(Error::Screenshot(format!(
+            return Err(Error::screenshot(format!(
                 "recording pipeline error before EOS: {} ({:?})",
                 err.error(),
                 err.debug()
@@ -313,7 +313,7 @@ fn stop_recording_sync(pipeline: &gst::Pipeline) -> Result<()> {
 
     pipeline
         .set_state(gst::State::Null)
-        .map_err(|e| Error::Screenshot(format!("failed to stop recording pipeline: {e}")))?;
+        .map_err(|e| Error::screenshot_with("failed to stop recording pipeline", e))?;
 
     tracing::info!("video recording stopped");
     Ok(())

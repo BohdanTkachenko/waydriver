@@ -193,7 +193,7 @@ async fn build_collection<'a>(
 pub async fn connect_a11y(dbus_address: &str) -> Result<AccessibilityConnection> {
     let session_addr: zbus::address::Address = dbus_address
         .try_into()
-        .map_err(|e: zbus::Error| Error::Atspi(format!("invalid dbus address: {e}")))?;
+        .map_err(|e: zbus::Error| Error::atspi_with("invalid dbus address", e))?;
     let session_conn = zbus::connection::Builder::address(session_addr)?
         .build()
         .await?;
@@ -204,10 +204,10 @@ pub async fn connect_a11y(dbus_address: &str) -> Result<AccessibilityConnection>
     let a11y_addr: zbus::address::Address = a11y_addr_str
         .as_str()
         .try_into()
-        .map_err(|e: zbus::Error| Error::Atspi(format!("invalid a11y bus address: {e}")))?;
+        .map_err(|e: zbus::Error| Error::atspi_with("invalid a11y bus address", e))?;
     let a11y_conn = AccessibilityConnection::from_address(a11y_addr)
         .await
-        .map_err(|e| Error::Atspi(format!("failed to connect to a11y bus: {e}")))?;
+        .map_err(|e| Error::atspi_with("failed to connect to a11y bus", e))?;
 
     Ok(a11y_conn)
 }
@@ -220,7 +220,7 @@ pub async fn get_registry_root(conn: &AccessibilityConnection) -> Result<Accessi
         "/org/a11y/atspi/accessible/root",
     )
     .await
-    .map_err(|e| Error::Atspi(format!("failed to get registry root: {e}")))
+    .map_err(|e| Error::atspi_with("failed to get registry root", e))
 }
 
 // ── Role normalization ──────────────────────────────────────────────────────
@@ -337,7 +337,7 @@ pub async fn snapshot_tree(
 ) -> Result<String> {
     let app_root = build_accessible(conn.connection(), app_bus_name, app_path)
         .await
-        .map_err(|e| Error::Atspi(format!("failed to get app root: {e}")))?;
+        .map_err(|e| Error::atspi_with("failed to get app root", e))?;
 
     let mut output = String::new();
     output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -491,7 +491,7 @@ fn is_state_attr(key: &str) -> bool {
 /// matching elements, in document order.
 pub fn evaluate_xpath(xml: &str, xpath: &str) -> Result<Vec<(String, String)>> {
     let package = parser::parse(xml)
-        .map_err(|e| Error::Atspi(format!("failed to parse snapshot XML: {e}")))?;
+        .map_err(|e| Error::atspi_with("failed to parse snapshot XML", e))?;
     let doc = package.as_document();
 
     let factory = Factory::new();
@@ -541,7 +541,7 @@ pub fn evaluate_xpath(xml: &str, xpath: &str) -> Result<Vec<(String, String)>> {
 /// for each matched element, in document order.
 pub fn evaluate_xpath_detailed(xml: &str, xpath: &str) -> Result<Vec<ElementInfo>> {
     let package = parser::parse(xml)
-        .map_err(|e| Error::Atspi(format!("failed to parse snapshot XML: {e}")))?;
+        .map_err(|e| Error::atspi_with("failed to parse snapshot XML", e))?;
     let doc = package.as_document();
 
     let factory = Factory::new();
@@ -630,7 +630,7 @@ fn map_action_err(xpath: &str, bus: &str, path: &str, err: zbus::Error) -> Error
             };
         }
     }
-    Error::Atspi(err.to_string())
+    Error::atspi_with("dbus", err)
 }
 
 /// Classify a D-Bus error-name string as indicating the element is gone.
@@ -667,7 +667,7 @@ pub async fn do_action_on(
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
 
     if !success {
-        return Err(Error::Atspi(format!(
+        return Err(Error::atspi(format!(
             "do_action(0) returned false on {bus}{path} — element may not support activation"
         )));
     }
@@ -776,7 +776,7 @@ pub async fn grab_focus_on(
         .await
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
     if !ok {
-        return Err(Error::Atspi(format!(
+        return Err(Error::atspi(format!(
             "grab_focus returned false on {bus}{path} — element not focusable"
         )));
     }
@@ -799,7 +799,7 @@ pub async fn set_text_on(
         .await
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
     if !ok {
-        return Err(Error::Atspi(format!(
+        return Err(Error::atspi(format!(
             "set_text_contents returned false on {bus}{path} — element rejected input"
         )));
     }
@@ -830,7 +830,7 @@ pub async fn select_child_on(
         .await
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
     if !ok {
-        return Err(Error::Atspi(format!(
+        return Err(Error::atspi(format!(
             "select_child({index}) returned false on {bus}{path} — element \
              may not implement the Selection interface or the index is out \
              of range"

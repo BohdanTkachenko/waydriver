@@ -51,11 +51,11 @@ impl CaptureBackend for MutterCapture {
                 &(create_opts,),
             )
             .await
-            .map_err(|e| Error::Screenshot(format!("CreateSession: {e}")))?;
+            .map_err(|e| Error::screenshot_with("CreateSession", e))?;
         let session_path: OwnedObjectPath = reply
             .body()
             .deserialize()
-            .map_err(|e| Error::Screenshot(format!("parse session path: {e}")))?;
+            .map_err(|e| Error::screenshot_with("parse session path", e))?;
 
         // Step 2: RecordMonitor on the session.
         let reply = conn
@@ -67,30 +67,30 @@ impl CaptureBackend for MutterCapture {
                 &("", empty_opts),
             )
             .await
-            .map_err(|e| Error::Screenshot(format!("RecordMonitor: {e}")))?;
+            .map_err(|e| Error::screenshot_with("RecordMonitor", e))?;
         let stream_path: OwnedObjectPath = reply
             .body()
             .deserialize()
-            .map_err(|e| Error::Screenshot(format!("parse stream path: {e}")))?;
+            .map_err(|e| Error::screenshot_with("parse stream path", e))?;
 
         // Step 3: Subscribe to PipeWireStreamAdded BEFORE starting.
         // This ordering is load-bearing — mutter emits the signal synchronously
         // during `Session.Start`, so a late subscribe misses it.
         let stream_proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(conn)
             .destination("org.gnome.Mutter.ScreenCast")
-            .map_err(|e| Error::Screenshot(format!("proxy destination: {e}")))?
+            .map_err(|e| Error::screenshot_with("proxy destination", e))?
             .path(stream_path.as_str())
-            .map_err(|e| Error::Screenshot(format!("proxy path: {e}")))?
+            .map_err(|e| Error::screenshot_with("proxy path", e))?
             .interface("org.gnome.Mutter.ScreenCast.Stream")
-            .map_err(|e| Error::Screenshot(format!("proxy interface: {e}")))?
+            .map_err(|e| Error::screenshot_with("proxy interface", e))?
             .build()
             .await
-            .map_err(|e| Error::Screenshot(format!("build stream proxy: {e}")))?;
+            .map_err(|e| Error::screenshot_with("build stream proxy", e))?;
 
         let mut signal_stream = stream_proxy
             .receive_signal("PipeWireStreamAdded")
             .await
-            .map_err(|e| Error::Screenshot(format!("receive_signal: {e}")))?;
+            .map_err(|e| Error::screenshot_with("receive_signal", e))?;
 
         // Step 4: Start the ScreenCast session — via either the SC
         // interface (standalone) or the linked RD session. When the SC
@@ -106,7 +106,7 @@ impl CaptureBackend for MutterCapture {
                 .state
                 .rd_started
                 .lock()
-                .expect("rd_started mutex poisoned");
+                .map_err(|_| Error::process("rd_started mutex poisoned"))?;
             if *guard {
                 false
             } else {
@@ -123,7 +123,7 @@ impl CaptureBackend for MutterCapture {
                 &(),
             )
             .await
-            .map_err(|e| Error::Screenshot(format!("RemoteDesktop Start: {e}")))?;
+            .map_err(|e| Error::screenshot_with("RemoteDesktop Start", e))?;
         } else {
             conn.call_method(
                 Some("org.gnome.Mutter.ScreenCast"),
@@ -133,7 +133,7 @@ impl CaptureBackend for MutterCapture {
                 &(),
             )
             .await
-            .map_err(|e| Error::Screenshot(format!("Start: {e}")))?;
+            .map_err(|e| Error::screenshot_with("Start", e))?;
         }
 
         // Step 5: Wait for PipeWireStreamAdded signal to get the node id.
@@ -141,14 +141,14 @@ impl CaptureBackend for MutterCapture {
             let signal = signal_stream
                 .next()
                 .await
-                .ok_or_else(|| Error::Screenshot("signal stream ended".to_string()))?;
+                .ok_or_else(|| Error::screenshot("signal stream ended"))?;
             signal
                 .body()
                 .deserialize::<u32>()
-                .map_err(|e| Error::Screenshot(format!("parse node_id: {e}")))
+                .map_err(|e| Error::screenshot_with("parse node_id", e))
         })
         .await
-        .map_err(|_| Error::Screenshot("timeout waiting for PipeWireStreamAdded".to_string()))??;
+        .map_err(|_| Error::screenshot("timeout waiting for PipeWireStreamAdded"))??;
 
         tracing::debug!(node_id, "got PipeWire node id for screenshot");
 
@@ -158,7 +158,8 @@ impl CaptureBackend for MutterCapture {
             .state
             .active_stream_path
             .lock()
-            .expect("active_stream_path mutex poisoned") = Some(stream_path.to_string());
+            .map_err(|_| Error::process("active_stream_path mutex poisoned"))? =
+            Some(stream_path.to_string());
 
         Ok(PipeWireStream {
             node_id,
@@ -168,7 +169,7 @@ impl CaptureBackend for MutterCapture {
 
     async fn stop_stream(&self, stream: PipeWireStream) -> Result<()> {
         let session_path = stream.token.downcast::<OwnedObjectPath>().map_err(|_| {
-            Error::Screenshot("stop_stream: token was not an OwnedObjectPath".into())
+            Error::screenshot("stop_stream: token was not an OwnedObjectPath")
         })?;
         let _ = self
             .state
@@ -185,7 +186,7 @@ impl CaptureBackend for MutterCapture {
             .state
             .active_stream_path
             .lock()
-            .expect("active_stream_path mutex poisoned") = None;
+            .map_err(|_| Error::process("active_stream_path mutex poisoned"))? = None;
         Ok(())
     }
 

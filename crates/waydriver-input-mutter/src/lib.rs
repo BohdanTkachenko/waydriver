@@ -48,7 +48,7 @@ impl InputBackend for MutterInput {
                 &(keysym, true),
             )
             .await
-            .map_err(|e| Error::Process(format!("NotifyKeyboardKeysym press: {e}")))?;
+            .map_err(|e| Error::process_with("NotifyKeyboardKeysym press", e))?;
         Ok(())
     }
 
@@ -63,7 +63,7 @@ impl InputBackend for MutterInput {
                 &(keysym, false),
             )
             .await
-            .map_err(|e| Error::Process(format!("NotifyKeyboardKeysym release: {e}")))?;
+            .map_err(|e| Error::process_with("NotifyKeyboardKeysym release", e))?;
         Ok(())
     }
 
@@ -78,7 +78,7 @@ impl InputBackend for MutterInput {
                 &(dx, dy),
             )
             .await
-            .map_err(|e| Error::Process(format!("NotifyPointerMotionRelative: {e}")))?;
+            .map_err(|e| Error::process_with("NotifyPointerMotionRelative", e))?;
         Ok(())
     }
 
@@ -87,12 +87,10 @@ impl InputBackend for MutterInput {
             .state
             .active_stream_path
             .lock()
-            .expect("active_stream_path mutex poisoned")
+            .map_err(|_| Error::process("active_stream_path mutex poisoned"))?
             .clone()
             .ok_or_else(|| {
-                Error::Process(
-                    "no active ScreenCast stream; absolute pointer motion needs one".into(),
-                )
+                Error::process("no active ScreenCast stream; absolute pointer motion needs one")
             })?;
         self.state
             .conn
@@ -104,14 +102,14 @@ impl InputBackend for MutterInput {
                 &(stream.as_str(), x, y),
             )
             .await
-            .map_err(|e| Error::Process(format!("NotifyPointerMotionAbsolute: {e}")))?;
+            .map_err(|e| Error::process_with("NotifyPointerMotionAbsolute", e))?;
         Ok(())
     }
 
     async fn pointer_button_down(&self, button: u32) -> Result<()> {
         let button: i32 = button
             .try_into()
-            .map_err(|_| Error::Process(format!("button code {button} exceeds i32::MAX")))?;
+            .map_err(|_| Error::process(format!("button code {button} exceeds i32::MAX")))?;
         self.state
             .conn
             .call_method(
@@ -122,14 +120,14 @@ impl InputBackend for MutterInput {
                 &(button, true),
             )
             .await
-            .map_err(|e| Error::Process(format!("NotifyPointerButton press: {e}")))?;
+            .map_err(|e| Error::process_with("NotifyPointerButton press", e))?;
         Ok(())
     }
 
     async fn pointer_button_up(&self, button: u32) -> Result<()> {
         let button: i32 = button
             .try_into()
-            .map_err(|_| Error::Process(format!("button code {button} exceeds i32::MAX")))?;
+            .map_err(|_| Error::process(format!("button code {button} exceeds i32::MAX")))?;
         self.state
             .conn
             .call_method(
@@ -140,7 +138,7 @@ impl InputBackend for MutterInput {
                 &(button, false),
             )
             .await
-            .map_err(|e| Error::Process(format!("NotifyPointerButton release: {e}")))?;
+            .map_err(|e| Error::process_with("NotifyPointerButton release", e))?;
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         Ok(())
     }
@@ -156,7 +154,7 @@ impl InputBackend for MutterInput {
                 &(axis, steps),
             )
             .await
-            .map_err(|e| Error::Process(format!("NotifyPointerAxisDiscrete: {e}")))?;
+            .map_err(|e| Error::process_with("NotifyPointerAxisDiscrete", e))?;
         // Give GTK a beat to process the wheel event before the next call.
         // Same rationale as the tail sleep in pointer_button — back-to-back
         // axis events from a scroll loop can otherwise stack up faster than

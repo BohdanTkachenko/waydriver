@@ -137,7 +137,7 @@ impl CompositorRuntime for MutterCompositor {
             .output()
             .await?;
         if !dbus_output.status.success() {
-            return Err(Error::Process(format!(
+            return Err(Error::process(format!(
                 "dbus-launch failed: {}",
                 String::from_utf8_lossy(&dbus_output.stderr)
             )));
@@ -154,7 +154,7 @@ impl CompositorRuntime for MutterCompositor {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| Error::Process(format!("pipewire: {e}")))?;
+            .map_err(|e| Error::process_with("pipewire", e))?;
         self.pipewire = Some(pipewire);
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -165,7 +165,7 @@ impl CompositorRuntime for MutterCompositor {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| Error::Process(format!("wireplumber: {e}")))?;
+            .map_err(|e| Error::process_with("wireplumber", e))?;
         self.wireplumber = Some(wireplumber);
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -187,7 +187,7 @@ impl CompositorRuntime for MutterCompositor {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| Error::Process(format!("mutter: {e}")))?;
+            .map_err(|e| Error::process_with("mutter", e))?;
         self.mutter = Some(mutter);
         tracing::debug!(id = self.id, wayland_display = %self.wayland_display, "mutter spawned");
 
@@ -200,13 +200,11 @@ impl CompositorRuntime for MutterCompositor {
             .mutter_dbus_address
             .as_str()
             .try_into()
-            .map_err(|e: zbus::Error| {
-                Error::Process(format!("invalid mutter dbus address: {e}"))
-            })?;
+            .map_err(|e: zbus::Error| Error::process_with("invalid mutter dbus address", e))?;
         let mutter_conn = zbus::connection::Builder::address(mutter_addr)?
             .build()
             .await
-            .map_err(|e| Error::Process(format!("connect to mutter dbus: {e}")))?;
+            .map_err(|e| Error::process_with("connect to mutter dbus", e))?;
 
         // Wait for mutter to register its D-Bus services (may take a moment after socket appears)
         let mut rd_reply = None;
@@ -234,7 +232,7 @@ impl CompositorRuntime for MutterCompositor {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 Err(e) => {
-                    return Err(Error::Process(format!("RemoteDesktop CreateSession: {e}")));
+                    return Err(Error::process_with("RemoteDesktop CreateSession", e));
                 }
             }
         }
@@ -242,7 +240,7 @@ impl CompositorRuntime for MutterCompositor {
         let rd_session_path: zbus::zvariant::OwnedObjectPath = rd_reply
             .body()
             .deserialize()
-            .map_err(|e| Error::Process(format!("parse RD session path: {e}")))?;
+            .map_err(|e| Error::process_with("parse RD session path", e))?;
         // Intentionally do NOT call `RemoteDesktop.Session.Start` here.
         // Mutter only accepts `remote-desktop-session-id` on
         // `ScreenCast.CreateSession` when the RD session is not yet
@@ -262,16 +260,16 @@ impl CompositorRuntime for MutterCompositor {
                 &("org.gnome.Mutter.RemoteDesktop.Session", "SessionId"),
             )
             .await
-            .map_err(|e| Error::Process(format!("Get SessionId: {e}")))?;
+            .map_err(|e| Error::process_with("Get SessionId", e))?;
         // `Get` returns a variant; deserialize as `OwnedValue` to detach
         // the string from the reply's body before the reply is dropped.
         let rd_session_id_body = rd_session_id_reply.body();
         let rd_session_id_variant: zbus::zvariant::OwnedValue = rd_session_id_body
             .deserialize()
-            .map_err(|e| Error::Process(format!("parse SessionId variant: {e}")))?;
+            .map_err(|e| Error::process_with("parse SessionId variant", e))?;
         let rd_session_id: String = rd_session_id_variant
             .try_into()
-            .map_err(|e| Error::Process(format!("SessionId not a string: {e}")))?;
+            .map_err(|e: zbus::zvariant::Error| Error::process_with("SessionId not a string", e))?;
 
         let rd_session_path = rd_session_path.to_string();
         tracing::debug!(
@@ -388,8 +386,8 @@ fn parse_dbus_address(output: &str) -> Result<String> {
             }
         }
     }
-    Err(Error::Process(
-        "could not parse DBUS_SESSION_BUS_ADDRESS from dbus-launch".to_string(),
+    Err(Error::process(
+        "could not parse DBUS_SESSION_BUS_ADDRESS from dbus-launch",
     ))
 }
 
@@ -399,21 +397,21 @@ fn parse_dbus_pid(output: &str) -> Result<u32> {
             let pid_str = rest.trim_end_matches(';').trim();
             return pid_str
                 .parse()
-                .map_err(|e| Error::Process(format!("invalid dbus PID: {e}")));
+                .map_err(|e| Error::process_with("invalid dbus PID", e));
         }
     }
-    Err(Error::Process(
-        "could not parse DBUS_SESSION_BUS_PID from dbus-launch".to_string(),
+    Err(Error::process(
+        "could not parse DBUS_SESSION_BUS_PID from dbus-launch",
     ))
 }
 
 fn parse_resolution(s: &str) -> Result<(u32, u32)> {
     let (w, h) = s.split_once('x').ok_or_else(|| {
-        Error::Process(format!("invalid resolution '{s}': expected WIDTHxHEIGHT"))
+        Error::process(format!("invalid resolution '{s}': expected WIDTHxHEIGHT"))
     })?;
     let parse = |part: &str| -> Result<u32> {
         part.parse::<u32>().ok().filter(|n| *n > 0).ok_or_else(|| {
-            Error::Process(format!("invalid resolution '{s}': expected WIDTHxHEIGHT"))
+            Error::process(format!("invalid resolution '{s}': expected WIDTHxHEIGHT"))
         })
     };
     Ok((parse(w)?, parse(h)?))

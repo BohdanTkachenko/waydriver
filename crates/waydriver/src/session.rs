@@ -260,7 +260,7 @@ impl Session {
     /// Returns an error if the chord can't be parsed.
     pub async fn press_chord(&self, chord: &str) -> Result<()> {
         let parsed = crate::keysym::parse_chord(chord)
-            .ok_or_else(|| Error::Process(format!("invalid chord: {chord:?}")))?;
+            .ok_or_else(|| Error::process(format!("invalid chord: {chord:?}")))?;
         // Press all modifiers in order.
         for m in &parsed.modifiers {
             self.input.key_down(*m).await?;
@@ -337,7 +337,7 @@ impl Session {
         let stream = self
             .keepalive_stream
             .as_ref()
-            .ok_or_else(|| Error::Screenshot("no keepalive stream".into()))?;
+            .ok_or_else(|| Error::screenshot("no keepalive stream"))?;
         self.capture.grab_screenshot(stream).await
     }
 
@@ -448,7 +448,7 @@ impl Session {
         let a11y = self
             .a11y_connection
             .as_ref()
-            .ok_or_else(|| Error::Atspi("session has no AT-SPI connection".into()))?;
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
         atspi_client::snapshot_tree(a11y, &self.app_bus_name, &self.app_path).await
     }
 }
@@ -630,7 +630,7 @@ fn spawn_app(
         cmd.current_dir(dir);
     }
     cmd.spawn()
-        .map_err(|e| Error::Process(format!("app '{}': {e}", cfg.command)))
+        .map_err(|e| Error::process_with(format!("app '{}'", cfg.command), e))
 }
 
 fn normalize_app_name(name: &str) -> String {
@@ -1151,7 +1151,7 @@ mod tests {
 
         let err = s.press_chord("Hyper+Nope").await.unwrap_err();
         assert!(
-            matches!(err, Error::Process(ref m) if m.contains("invalid chord")),
+            matches!(err, Error::Process { ref message, .. } if message.contains("invalid chord")),
             "expected process:invalid chord, got {err:?}"
         );
     }
