@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>waydriver session __SID__</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  html { font-family: 'Inter', system-ui, sans-serif; }
+  code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+  .thumb { max-width: 220px; border-radius: 6px; border: 1px solid #e5e7eb; display: block; margin-top: 8px; }
+  details > summary { cursor: pointer; color: #475569; font-size: 13px; }
+  details[open] > summary { margin-bottom: 4px; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+<header class="sticky top-0 z-10 bg-white/95 backdrop-blur border-b border-slate-200 shadow-sm">
+  <div class="max-w-5xl mx-auto px-6 py-4 flex items-center gap-6">
+    <div class="flex-1 min-w-0">
+      <h1 class="text-lg font-semibold truncate">
+        <span class="text-slate-500 mr-2">waydriver</span>
+        <span class="mono">__SID__</span>
+      </h1>
+      <div class="text-sm text-slate-600 mt-0.5">
+        app: <span class="font-medium text-slate-800">__APP__</span>
+        · started: <span id="started-at">—</span>
+        · <span id="event-count">0</span> events
+      </div>
+    </div>
+  </div>
+</header>
+<main class="max-w-5xl mx-auto px-6 py-6">
+  __VIDEO_BLOCK__
+  <div id="notice"></div>
+  <ol id="events" class="space-y-3"></ol>
+  <div id="empty" class="hidden text-center py-12 text-slate-400 text-sm">No events yet. Waiting for the first tool call…</div>
+</main>
+<script>
+const STARTED_AT_MS = __STARTED_AT_MS__;
+const SESSION_ID = __SID_JSON__;
+const PILL_CLASS = {
+  start_session:   'bg-slate-200 text-slate-800',
+  kill_session:    'bg-slate-200 text-slate-800',
+  take_screenshot: 'bg-indigo-100 text-indigo-800',
+  click:           'bg-blue-100 text-blue-800',
+  focus:           'bg-blue-100 text-blue-800',
+  set_text:        'bg-blue-100 text-blue-800',
+  read_text:       'bg-blue-100 text-blue-800',
+  type_text:       'bg-blue-100 text-blue-800',
+  press_key:       'bg-blue-100 text-blue-800',
+  move_pointer:    'bg-blue-100 text-blue-800',
+  pointer_click:   'bg-blue-100 text-blue-800',
+  dump_tree:       'bg-gray-100 text-gray-700',
+  query:           'bg-gray-100 text-gray-700',
+};
+
+function fmtTime(ms) {
+  const d = new Date(ms);
+  return d.toLocaleTimeString(undefined, { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
+
+function el(tag, attrs, children) {
+  const e = document.createElement(tag);
+  if (attrs) for (const k in attrs) {
+    if (k === 'class') e.className = attrs[k];
+    else if (k === 'text') e.textContent = attrs[k];
+    else e.setAttribute(k, attrs[k]);
+  }
+  if (children) for (const c of children) e.appendChild(c);
+  return e;
+}
+
+function renderParams(params) {
+  const entries = Object.entries(params || {}).filter(([_, v]) => v !== null && v !== undefined && v !== '');
+  if (!entries.length) return null;
+  const dl = el('dl', { class: 'grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm mt-1' });
+  for (const [k, v] of entries) {
+    dl.appendChild(el('dt', { class: 'text-slate-500', text: k }));
+    const dd = el('dd', { class: 'mono text-slate-800 break-all' });
+    dd.textContent = typeof v === 'string' ? v : JSON.stringify(v);
+    dl.appendChild(dd);
+  }
+  return dl;
+}
+
+function renderMessage(msg) {
+  if (!msg) return null;
+  if (msg.length <= 160) return el('p', { class: 'mono text-sm text-slate-700 mt-2 whitespace-pre-wrap break-words', text: msg });
+  const details = el('details', { class: 'mt-2' });
+  details.appendChild(el('summary', { text: `Show full output (${msg.length} chars)` }));
+  details.appendChild(el('pre', { class: 'mono text-xs text-slate-700 bg-slate-100 rounded p-3 mt-1 whitespace-pre-wrap break-words', text: msg }));
+  return details;
+}
+
+function renderEvent(ev) {
+  const pillClass = PILL_CLASS[ev.action] || 'bg-slate-100 text-slate-700';
+  const statusClass = ev.status === 'ok' ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700';
+  const card = el('li', { class: 'bg-white rounded-lg border border-slate-200 shadow-sm p-4 flex gap-4' });
+
+  const left = el('div', { class: 'w-20 shrink-0 text-right' });
+  left.appendChild(el('div', { class: 'text-xs text-slate-400', text: '#' + ev.seq }));
+  left.appendChild(el('div', { class: 'mono text-xs text-slate-600 mt-0.5', text: fmtTime(ev.ts_ms) }));
+  card.appendChild(left);
+
+  const body = el('div', { class: 'flex-1 min-w-0' });
+  const head = el('div', { class: 'flex items-center gap-2 flex-wrap' });
+  head.appendChild(el('span', { class: 'pill ' + pillClass, text: ev.action }));
+  head.appendChild(el('span', { class: 'pill ' + statusClass, text: ev.status }));
+  body.appendChild(head);
+
+  const params = renderParams(ev.params);
+  if (params) body.appendChild(params);
+
+  const message = renderMessage(ev.message);
+  if (message) body.appendChild(message);
+
+  if (ev.screenshot) {
+    const a = el('a', { href: ev.screenshot, target: '_blank', rel: 'noopener' });
+    a.appendChild(el('img', { src: ev.screenshot, loading: 'lazy', alt: 'screenshot', class: 'thumb' }));
+    body.appendChild(a);
+  }
+
+  card.appendChild(body);
+  return card;
+}
+
+// Append-only render: we only ever add new events. This preserves user UI
+// state (e.g. expanded <details> for inspect_ui output) across the 2-second
+// refreshes. events.js is reloaded via the <script src> swap trick below —
+// fetch() is blocked over file:// by Chrome, but <script src> is not.
+let rendered = 0;
+window.__events_update = function(events) {
+  const ol = document.getElementById('events');
+  if (events.length < rendered) {
+    ol.replaceChildren();
+    rendered = 0;
+  }
+  for (let i = rendered; i < events.length; i++) {
+    ol.appendChild(renderEvent(events[i]));
+  }
+  rendered = events.length;
+  document.getElementById('event-count').textContent = rendered;
+  document.getElementById('empty').classList.toggle('hidden', rendered > 0);
+  document.getElementById('notice').innerHTML = '';
+};
+
+function reload() {
+  const s = document.createElement('script');
+  s.src = 'events.js?v=' + Date.now();
+  s.onload = () => s.remove();
+  s.onerror = () => {
+    s.remove();
+    document.getElementById('notice').innerHTML = '<div class="bg-rose-50 border border-rose-300 rounded-md p-4 text-sm text-rose-900 mb-4"><div class="font-semibold mb-1">Failed to load <code class="mono">events.js</code></div><div>waydriver-mcp writes this file alongside <code class="mono">index.html</code> on every tool call. If the session directory was moved or only <code class="mono">index.html</code> was copied, reopen the full directory; otherwise the server may no longer be running.</div></div>';
+  };
+  document.body.appendChild(s);
+}
+
+document.getElementById('started-at').textContent = new Date(STARTED_AT_MS).toLocaleString();
+reload();
+setInterval(reload, 2000);
+</script>
+</body>
+</html>

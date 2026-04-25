@@ -1,599 +1,93 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 use clap::Parser;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::schemars;
 use rmcp::transport::stdio;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
-use serde::Deserialize;
 
-use waydriver::atspi::ElementInfo;
 use waydriver::keysym::parse_chord;
 use waydriver::{CompositorRuntime, Session, SessionConfig};
 use waydriver_capture_mutter::MutterCapture;
 use waydriver_compositor_mutter::MutterCompositor;
 use waydriver_input_mutter::MutterInput;
 
-// ── Parameter types ─────────────────────────────────────────────────────────
+mod cli;
+mod mcp_error;
+mod params;
+mod report;
+mod session;
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct StartSessionParams {
-    /// Command to launch (e.g. "gnome-calculator")
-    pub command: String,
-    /// Arguments for the command
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Working directory
-    pub cwd: Option<String>,
-    /// Application name for AT-SPI lookup (defaults to command name)
-    pub app_name: Option<String>,
-    /// Override report output directory for this session (replaces the server default).
-    /// Reports include screenshots today; video recordings and HTML summaries planned.
-    pub report_dir: Option<String>,
-    /// Whether to generate the live HTML viewer and event log for this session.
-    /// Defaults to true. When false, `index.html` / `events.js` / `events.jsonl`
-    /// are not written and the `report=file://...` line is omitted from the
-    /// start_session response. Screenshots still persist under `report_dir`.
-    #[serde(default = "default_report_enabled")]
-    pub report: bool,
-    /// Virtual display size as "WIDTHxHEIGHT" (e.g. "1920x1080"). When unset,
-    /// falls back to the server's --resolution flag (default "1024x768").
-    pub resolution: Option<String>,
-    /// Record a continuous WebM video of the session under
-    /// `{report_dir}/{session_id}/{session_id}.webm`. When unset, falls back
-    /// to the server's `--record-video` / `--no-record-video` flag (default
-    /// on). Requires `report: true` — recording is written alongside the
-    /// other report files.
-    pub record_video: Option<bool>,
-    /// VP8 target bitrate in bits/sec for the recording. Only used when
-    /// recording is enabled. When unset, falls back to the server's
-    /// `--video-bitrate` flag (default 2_000_000 ≈ 2 Mbps). Higher = sharper
-    /// text, bigger file.
-    pub video_bitrate: Option<u32>,
-}
+use cli::{resolve_report_dir, resolve_resolution, Cli};
+use mcp_error::waydriver_to_mcp;
+use params::{
+    ClickParams, DoubleClickParams, DragToParams, FillParams, FocusParams, HoverParams,
+    MovePointerParams, PointerClickParams, PressKeyParams, QueryParams, ReadTextParams,
+    RightClickParams, SelectOptionParams, SessionIdParams, SetTextParams, StartSessionParams,
+    TypeTextParams,
+};
+use report::{append_event, now_ms, render_index_html, render_matches};
+use session::ManagedSession;
 
-fn default_report_enabled() -> bool {
-    true
-}
+// ── start_session helpers ───────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SessionIdParams {
-    /// Session ID returned by start_session
-    pub session_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct QueryParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector evaluated against the accessibility tree snapshot
-    /// (e.g. `//PushButton[@name='OK']`, `//Dialog[@name='Confirm']//PushButton`).
-    pub xpath: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ClickParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector; must resolve to exactly one element at click time.
-    pub xpath: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct FocusParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector; must resolve to exactly one focusable element.
-    pub xpath: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct HoverParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector; must resolve to exactly one element at hover time.
-    pub xpath: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DoubleClickParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector; must resolve to exactly one element.
-    pub xpath: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RightClickParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector; must resolve to exactly one element.
-    pub xpath: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DragToParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector for the drag source; must resolve to exactly one element.
-    pub source_xpath: String,
-    /// XPath selector for the drop target; must resolve to exactly one element.
-    pub target_xpath: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SetTextParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector; must resolve to exactly one editable-text element.
-    pub xpath: String,
-    /// Text to write to the element (replaces existing contents).
-    pub text: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct FillParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector; must resolve to exactly one text-accepting element.
-    pub xpath: String,
-    /// Text to type into the element (replaces existing contents).
-    pub text: String,
-    /// How to clear existing content before typing. `"caret_nav"`
-    /// (default) uses `Ctrl+Home` then `Ctrl+Shift+End` — works on any
-    /// single-line or multi-line widget. `"select_all"` uses `Ctrl+A`
-    /// — faster, but depends on the app honoring the binding.
-    #[serde(default)]
-    pub mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SelectOptionParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector; must resolve to exactly one container
-    /// implementing the AT-SPI Selection interface (combobox,
-    /// dropdown, listbox, etc.).
-    pub xpath: String,
-    /// Discriminator: `"label"` picks the child whose accessible
-    /// name matches `value`; `"index"` parses `value` as a 0-indexed
-    /// integer and passes it to `Selection::select_child` directly.
-    pub by: String,
-    /// Either the accessible name to match (when `by == "label"`) or
-    /// a decimal integer (when `by == "index"`).
-    pub value: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ReadTextParams {
-    /// Session ID
-    pub session_id: String,
-    /// XPath selector; must resolve to exactly one element supporting the Text interface.
-    pub xpath: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct TypeTextParams {
-    /// Session ID
-    pub session_id: String,
-    /// Text to type
-    pub text: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PressKeyParams {
-    /// Session ID
-    pub session_id: String,
-    /// Key name: "Return", "Tab", "Escape", "a", "1", etc.
-    pub key: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MovePointerParams {
-    /// Session ID
-    pub session_id: String,
-    /// Horizontal offset in logical pixels (positive = right)
-    pub dx: f64,
-    /// Vertical offset in logical pixels (positive = down)
-    pub dy: f64,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PointerClickParams {
-    /// Session ID
-    pub session_id: String,
-    /// Linux evdev button code (default: 0x110 = BTN_LEFT)
-    pub button: Option<u32>,
-}
-
-// ── Server ──────────────────────────────────────────────────────────────────
-
-pub struct ManagedSession {
-    pub session: Arc<Session>,
-    pub report_dir: PathBuf,
-    pub screenshot_counter: AtomicU32,
-    /// In-memory event log. Guards both the on-disk `events.jsonl` (append) and
-    /// the atomically-rewritten `events.js` so concurrent calls never interleave.
-    pub events: Mutex<Vec<serde_json::Value>>,
-    pub started_at_ms: u64,
-    pub app_name: String,
-    /// When false, `log_event` is a no-op and the session skips writing
-    /// `index.html` / `events.js` / `events.jsonl`.
-    pub report_enabled: bool,
-}
-
-impl ManagedSession {
-    /// Write screenshot bytes under `{report_dir}/{session_id}/{session_id}-{n}.png`,
-    /// creating the directory if needed. Increments the per-session counter.
-    pub async fn persist_screenshot(
-        &self,
-        session_id: &str,
-        png_bytes: &[u8],
-    ) -> std::io::Result<PathBuf> {
-        let count = self.screenshot_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let dir = self.report_dir.join(session_id);
-        tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join(format!("{session_id}-{count}.png"));
-        tokio::fs::write(&path, png_bytes).await?;
-        Ok(path)
-    }
-
-    /// Record a tool call. Appends one JSON line to `{report_dir}/{session_id}/events.jsonl`
-    /// and rewrites `{report_dir}/{session_id}/events.js` atomically. Returns the
-    /// assigned sequence number.
-    pub async fn log_event(
-        &self,
-        session_id: &str,
-        action: &'static str,
-        params: serde_json::Value,
-        outcome: Result<&str, &str>,
-        screenshot: Option<&str>,
-    ) -> std::io::Result<u32> {
-        if !self.report_enabled {
-            return Ok(0);
-        }
-        append_event(
-            &self.report_dir,
-            session_id,
-            &self.events,
-            action,
-            params,
-            outcome,
-            screenshot,
-        )
-        .await
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn append_event(
+/// Resolve the WebM output path for a recording-enabled session and ensure
+/// its parent directory exists before GStreamer's `filesink` opens it.
+///
+/// Returns `None` when `record_video` is `false`. Directory-creation
+/// failures are warned-and-continued — they typically clear up before
+/// `Session::start` runs the recording, and a hard-fail here would
+/// abort the session over a soft, recoverable IO error.
+async fn resolve_video_output(
+    record_video: bool,
     report_dir: &std::path::Path,
-    session_id: &str,
-    events: &Mutex<Vec<serde_json::Value>>,
-    action: &'static str,
-    params: serde_json::Value,
-    outcome: Result<&str, &str>,
-    screenshot: Option<&str>,
-) -> std::io::Result<u32> {
-    let mut guard = events.lock().await;
-    let seq = guard.len() as u32 + 1;
-    let ts_ms = now_ms();
-    let (status, message) = match outcome {
-        Ok(msg) => ("ok", msg),
-        Err(msg) => ("err", msg),
-    };
-    let mut event = serde_json::json!({
-        "seq": seq,
-        "ts_ms": ts_ms,
-        "action": action,
-        "params": params,
-        "status": status,
-        "message": message,
-    });
-    if let Some(name) = screenshot {
-        event["screenshot"] = serde_json::Value::String(name.to_string());
+    compositor_id: &str,
+) -> Option<PathBuf> {
+    if !record_video {
+        return None;
     }
-
-    // 1. Append to events.jsonl (durable source of truth).
-    let mut line = serde_json::to_vec(&event)?;
-    line.push(b'\n');
-    let session_dir = report_dir.join(session_id);
-    let jsonl_path = session_dir.join("events.jsonl");
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&jsonl_path)
-        .await?;
-    file.write_all(&line).await?;
-    file.flush().await?;
-
-    // 2. Push into in-memory vec.
-    guard.push(event);
-
-    // 3. Rewrite events.js atomically (tempfile + rename on same filesystem).
-    // The viewer HTML swaps in a fresh <script src="events.js?v=..."> every 2s,
-    // which triggers window.__events_update with the full array.
-    let json_array = serde_json::to_string(&*guard)?;
-    let js_body = format!("window.__events_update({json_array});\n");
-    let tmp_path = session_dir.join(".events.js.tmp");
-    tokio::fs::write(&tmp_path, js_body.as_bytes()).await?;
-    tokio::fs::rename(&tmp_path, session_dir.join("events.js")).await?;
-
-    Ok(seq)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
+    let session_dir = report_dir.join(compositor_id);
+    if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
+        tracing::warn!(error = %e, "create session report dir failed (pre-record)");
     }
-    out
+    Some(session_dir.join(format!("{compositor_id}.webm")))
 }
 
-/// Render the static viewer shell written once per session. The shell fetches
-/// `events.jsonl` at load time (and on an interval) and renders each entry as
-/// a styled card. If `video_file` is `Some`, a `<video>` element is embedded
-/// at the top of the page pointing at that filename (relative to the session
-/// dir).
-pub fn render_index_html(
+/// Seed `{report_dir}/{session_id}/index.html` with the viewer shell so
+/// the first event always lands on an existing file. Caller decides
+/// whether reporting is enabled; this helper assumes it is.
+///
+/// All errors are warned-and-continued: the report viewer is a
+/// best-effort artifact, and refusing to start a session because
+/// `index.html` couldn't be written would punish the user for a
+/// disk-state problem they care less about than getting their app
+/// running.
+async fn seed_viewer(
+    report_dir: &std::path::Path,
     session_id: &str,
     app_name: &str,
     started_at_ms: u64,
-    video_file: Option<&str>,
-) -> String {
-    let sid = html_escape(session_id);
-    let app = html_escape(app_name);
-    let video_block = match video_file {
-        Some(name) => format!(
-            r#"<video controls preload="metadata" class="w-full rounded-lg border border-slate-200 shadow-sm bg-black mb-6" src="{}"></video>"#,
-            html_escape(name)
-        ),
-        None => String::new(),
-    };
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>waydriver session {sid}</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  html {{ font-family: 'Inter', system-ui, sans-serif; }}
-  code, pre, .mono {{ font-family: 'JetBrains Mono', ui-monospace, monospace; }}
-  .pill {{ display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }}
-  .thumb {{ max-width: 220px; border-radius: 6px; border: 1px solid #e5e7eb; display: block; margin-top: 8px; }}
-  details > summary {{ cursor: pointer; color: #475569; font-size: 13px; }}
-  details[open] > summary {{ margin-bottom: 4px; }}
-</style>
-</head>
-<body class="bg-slate-50 text-slate-800">
-<header class="sticky top-0 z-10 bg-white/95 backdrop-blur border-b border-slate-200 shadow-sm">
-  <div class="max-w-5xl mx-auto px-6 py-4 flex items-center gap-6">
-    <div class="flex-1 min-w-0">
-      <h1 class="text-lg font-semibold truncate">
-        <span class="text-slate-500 mr-2">waydriver</span>
-        <span class="mono">{sid}</span>
-      </h1>
-      <div class="text-sm text-slate-600 mt-0.5">
-        app: <span class="font-medium text-slate-800">{app}</span>
-        · started: <span id="started-at">—</span>
-        · <span id="event-count">0</span> events
-      </div>
-    </div>
-  </div>
-</header>
-<main class="max-w-5xl mx-auto px-6 py-6">
-  {video_block}
-  <div id="notice"></div>
-  <ol id="events" class="space-y-3"></ol>
-  <div id="empty" class="hidden text-center py-12 text-slate-400 text-sm">No events yet. Waiting for the first tool call…</div>
-</main>
-<script>
-const STARTED_AT_MS = {started_at_ms};
-const SESSION_ID = {sid_json};
-const PILL_CLASS = {{
-  start_session:   'bg-slate-200 text-slate-800',
-  kill_session:    'bg-slate-200 text-slate-800',
-  take_screenshot: 'bg-indigo-100 text-indigo-800',
-  click:           'bg-blue-100 text-blue-800',
-  focus:           'bg-blue-100 text-blue-800',
-  set_text:        'bg-blue-100 text-blue-800',
-  read_text:       'bg-blue-100 text-blue-800',
-  type_text:       'bg-blue-100 text-blue-800',
-  press_key:       'bg-blue-100 text-blue-800',
-  move_pointer:    'bg-blue-100 text-blue-800',
-  pointer_click:   'bg-blue-100 text-blue-800',
-  dump_tree:       'bg-gray-100 text-gray-700',
-  query:           'bg-gray-100 text-gray-700',
-}};
-
-function fmtTime(ms) {{
-  const d = new Date(ms);
-  return d.toLocaleTimeString(undefined, {{ hour12: false }}) + '.' + String(d.getMilliseconds()).padStart(3, '0');
-}}
-
-function el(tag, attrs, children) {{
-  const e = document.createElement(tag);
-  if (attrs) for (const k in attrs) {{
-    if (k === 'class') e.className = attrs[k];
-    else if (k === 'text') e.textContent = attrs[k];
-    else e.setAttribute(k, attrs[k]);
-  }}
-  if (children) for (const c of children) e.appendChild(c);
-  return e;
-}}
-
-function renderParams(params) {{
-  const entries = Object.entries(params || {{}}).filter(([_, v]) => v !== null && v !== undefined && v !== '');
-  if (!entries.length) return null;
-  const dl = el('dl', {{ class: 'grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm mt-1' }});
-  for (const [k, v] of entries) {{
-    dl.appendChild(el('dt', {{ class: 'text-slate-500', text: k }}));
-    const dd = el('dd', {{ class: 'mono text-slate-800 break-all' }});
-    dd.textContent = typeof v === 'string' ? v : JSON.stringify(v);
-    dl.appendChild(dd);
-  }}
-  return dl;
-}}
-
-function renderMessage(msg) {{
-  if (!msg) return null;
-  if (msg.length <= 160) return el('p', {{ class: 'mono text-sm text-slate-700 mt-2 whitespace-pre-wrap break-words', text: msg }});
-  const details = el('details', {{ class: 'mt-2' }});
-  details.appendChild(el('summary', {{ text: `Show full output (${{msg.length}} chars)` }}));
-  details.appendChild(el('pre', {{ class: 'mono text-xs text-slate-700 bg-slate-100 rounded p-3 mt-1 whitespace-pre-wrap break-words', text: msg }}));
-  return details;
-}}
-
-function renderEvent(ev) {{
-  const pillClass = PILL_CLASS[ev.action] || 'bg-slate-100 text-slate-700';
-  const statusClass = ev.status === 'ok' ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700';
-  const card = el('li', {{ class: 'bg-white rounded-lg border border-slate-200 shadow-sm p-4 flex gap-4' }});
-
-  const left = el('div', {{ class: 'w-20 shrink-0 text-right' }});
-  left.appendChild(el('div', {{ class: 'text-xs text-slate-400', text: '#' + ev.seq }}));
-  left.appendChild(el('div', {{ class: 'mono text-xs text-slate-600 mt-0.5', text: fmtTime(ev.ts_ms) }}));
-  card.appendChild(left);
-
-  const body = el('div', {{ class: 'flex-1 min-w-0' }});
-  const head = el('div', {{ class: 'flex items-center gap-2 flex-wrap' }});
-  head.appendChild(el('span', {{ class: 'pill ' + pillClass, text: ev.action }}));
-  head.appendChild(el('span', {{ class: 'pill ' + statusClass, text: ev.status }}));
-  body.appendChild(head);
-
-  const params = renderParams(ev.params);
-  if (params) body.appendChild(params);
-
-  const message = renderMessage(ev.message);
-  if (message) body.appendChild(message);
-
-  if (ev.screenshot) {{
-    const a = el('a', {{ href: ev.screenshot, target: '_blank', rel: 'noopener' }});
-    a.appendChild(el('img', {{ src: ev.screenshot, loading: 'lazy', alt: 'screenshot', class: 'thumb' }}));
-    body.appendChild(a);
-  }}
-
-  card.appendChild(body);
-  return card;
-}}
-
-// Append-only render: we only ever add new events. This preserves user UI
-// state (e.g. expanded <details> for inspect_ui output) across the 2-second
-// refreshes. events.js is reloaded via the <script src> swap trick below —
-// fetch() is blocked over file:// by Chrome, but <script src> is not.
-let rendered = 0;
-window.__events_update = function(events) {{
-  const ol = document.getElementById('events');
-  if (events.length < rendered) {{
-    ol.replaceChildren();
-    rendered = 0;
-  }}
-  for (let i = rendered; i < events.length; i++) {{
-    ol.appendChild(renderEvent(events[i]));
-  }}
-  rendered = events.length;
-  document.getElementById('event-count').textContent = rendered;
-  document.getElementById('empty').classList.toggle('hidden', rendered > 0);
-  document.getElementById('notice').innerHTML = '';
-}};
-
-function reload() {{
-  const s = document.createElement('script');
-  s.src = 'events.js?v=' + Date.now();
-  s.onload = () => s.remove();
-  s.onerror = () => {{
-    s.remove();
-    document.getElementById('notice').innerHTML = '<div class="bg-rose-50 border border-rose-300 rounded-md p-4 text-sm text-rose-900 mb-4"><div class="font-semibold mb-1">Failed to load <code class="mono">events.js</code></div><div>waydriver-mcp writes this file alongside <code class="mono">index.html</code> on every tool call. If the session directory was moved or only <code class="mono">index.html</code> was copied, reopen the full directory; otherwise the server may no longer be running.</div></div>';
-  }};
-  document.body.appendChild(s);
-}}
-
-document.getElementById('started-at').textContent = new Date(STARTED_AT_MS).toLocaleString();
-reload();
-setInterval(reload, 2000);
-</script>
-</body>
-</html>
-"#,
-        sid = sid,
-        app = app,
-        started_at_ms = started_at_ms,
-        sid_json = serde_json::Value::String(session_id.to_string()),
-        video_block = video_block,
-    )
+    video_path: Option<&std::path::Path>,
+) {
+    let session_dir = report_dir.join(session_id);
+    if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
+        tracing::warn!(error = %e, "create session report dir failed");
+    }
+    let video_file = video_path
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    let html = render_index_html(session_id, app_name, started_at_ms, video_file);
+    if let Err(e) = tokio::fs::write(session_dir.join("index.html"), html).await {
+        tracing::warn!(error = %e, "write index.html failed");
+    }
 }
 
-/// Serialize the matches from `Locator::inspect_all` into the JSON array
-/// returned by the `query` tool. Each entry carries a pinned XPath that
-/// targets that specific ordinal match on future tool calls.
-fn render_matches(xpath: &str, matches: &[ElementInfo]) -> serde_json::Value {
-    let arr: Vec<serde_json::Value> = matches
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let pinned = format!("({xpath})[{}]", i + 1);
-            let mut obj = serde_json::json!({
-                "xpath": pinned,
-                "role": m.role,
-                "name": m.name,
-                "attributes": m.attributes,
-                "states": m.states,
-            });
-            if let Some(raw) = &m.role_raw {
-                obj["role_raw"] = serde_json::Value::String(raw.clone());
-            }
-            if let Some(b) = m.bounds {
-                obj["bounds"] = serde_json::json!({
-                    "x": b.x,
-                    "y": b.y,
-                    "width": b.width,
-                    "height": b.height,
-                });
-            }
-            obj
-        })
-        .collect();
-    serde_json::Value::Array(arr)
-}
-
-/// Resolve the effective report dir for a new session: per-session override
-/// if provided, else the server's base dir.
-fn resolve_report_dir(base: &std::path::Path, override_: Option<&str>) -> PathBuf {
-    override_
-        .map(PathBuf::from)
-        .unwrap_or_else(|| base.to_path_buf())
-}
-
-/// Resolve the effective virtual-display resolution for a new session:
-/// per-session override if provided, else the server's default.
-fn resolve_resolution(default: &str, override_: Option<&str>) -> String {
-    override_.unwrap_or(default).to_string()
-}
+// ── Server ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct UiTestServer {
@@ -604,6 +98,64 @@ pub struct UiTestServer {
     default_video_bitrate: u32,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+}
+
+impl UiTestServer {
+    /// Boilerplate every action tool would otherwise repeat: look up the
+    /// session, run a closure against its `Arc<Session>`, log the outcome
+    /// to the per-session event log, and shape success/failure into a
+    /// `CallToolResult` / `McpError`.
+    ///
+    /// The closure returns `Result<String, waydriver::Error>` — the
+    /// success string becomes the MCP text response and the event-log
+    /// `message`; the typed error is chain-walked into both the log
+    /// message and the MCP error so D-Bus / GStreamer / IO sources don't
+    /// get flattened away by `to_string`.
+    ///
+    /// **Locking note:** the read lock on `sessions` is held across
+    /// `work.await`. That matches every existing tool's behavior — a
+    /// concurrent `kill_session` (which takes a write lock) blocks until
+    /// every in-flight tool finishes. Improving that would require
+    /// switching `sessions` to `HashMap<String, Arc<ManagedSession>>` so
+    /// we could clone out the entry and drop the map lock; punted as a
+    /// separate change.
+    async fn run_action<F, Fut>(
+        &self,
+        session_id: &str,
+        action: &'static str,
+        log_params: serde_json::Value,
+        work: F,
+    ) -> Result<CallToolResult, McpError>
+    where
+        F: FnOnce(Arc<waydriver::Session>) -> Fut,
+        Fut: std::future::Future<Output = Result<String, waydriver::Error>>,
+    {
+        let sessions = self.sessions.read().await;
+        let managed = sessions.get(session_id).ok_or_else(|| {
+            McpError::invalid_params(format!("session not found: {session_id}"), None)
+        })?;
+
+        let result = work(Arc::clone(&managed.session)).await;
+
+        // Materialize a stringy view for log_event while still holding
+        // the typed error, so we can route the typed error through
+        // waydriver_to_mcp below (which discriminates locator-shape
+        // errors to invalid_params instead of internal_error).
+        let log_view: Result<String, String> = match &result {
+            Ok(msg) => Ok(msg.clone()),
+            Err(e) => Err(mcp_error::format_chain(e)),
+        };
+        let log_outcome = log_view.as_ref().map(String::as_str).map_err(String::as_str);
+        if let Err(e) = managed
+            .log_event(session_id, action, log_params, log_outcome, None)
+            .await
+        {
+            tracing::warn!(error = %e, %action, "log_event failed");
+        }
+
+        let success = result.map_err(waydriver_to_mcp)?;
+        Ok(CallToolResult::success(vec![Content::text(success)]))
+    }
 }
 
 #[tool_router]
@@ -654,19 +206,6 @@ impl UiTestServer {
             report_enabled && params.record_video.unwrap_or(self.default_record_video);
         let resolved_bitrate = params.video_bitrate.unwrap_or(self.default_video_bitrate);
 
-        // Compositor spawn already needs the per-session dir to exist for the
-        // runtime socket; we also pre-create the report dir here so the
-        // GStreamer filesink has an existing target when recording starts.
-        let video_output = if record_video {
-            let session_dir = report_dir.clone();
-            // Actual session id isn't known until after MutterCompositor::new,
-            // but MutterCompositor generates ids deterministically below — we
-            // compute the path after compositor.state() gives us an id.
-            Some(session_dir)
-        } else {
-            None
-        };
-
         // Construct and pre-start the mutter compositor so we can pull its
         // shared Arc<MutterState> out before erasing to trait objects. Input
         // and capture are thin wrappers around that Arc, so they get cloned
@@ -675,25 +214,13 @@ impl UiTestServer {
         compositor
             .start(Some(&resolution))
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(waydriver_to_mcp)?;
         let compositor_id = compositor.id().to_string();
         let state = compositor.state();
         let input = MutterInput::new(state.clone());
         let capture = MutterCapture::new(state);
 
-        // Resolve the final WebM path + ensure the session dir exists before
-        // GStreamer's filesink opens it. The session dir is also where
-        // screenshots and events land, so we'd create it anyway below — doing
-        // it up front means recording starts on an existing path.
-        let video_path = if let Some(base) = &video_output {
-            let session_dir = base.join(&compositor_id);
-            if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
-                tracing::warn!(error = %e, "create session report dir failed (pre-record)");
-            }
-            Some(session_dir.join(format!("{compositor_id}.webm")))
-        } else {
-            None
-        };
+        let video_path = resolve_video_output(record_video, &report_dir, &compositor_id).await;
 
         let session = Session::start(
             Box::new(compositor),
@@ -710,28 +237,24 @@ impl UiTestServer {
             },
         )
         .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        .map_err(waydriver_to_mcp)?;
 
         let id = session.id.clone();
         let display = session.wayland_display().to_string();
 
         let started_at_ms = now_ms();
 
-        // Seed the per-session dir + viewer shell before we insert so that the
+        // Seed the per-session dir + viewer shell before we insert so the
         // first event always lands on an existing index.html.
         if report_enabled {
-            let session_dir = report_dir.join(&id);
-            if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
-                tracing::warn!(error = %e, "create session report dir failed");
-            }
-            let video_file = video_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str());
-            let html = render_index_html(&id, &app_name, started_at_ms, video_file);
-            if let Err(e) = tokio::fs::write(session_dir.join("index.html"), html).await {
-                tracing::warn!(error = %e, "write index.html failed");
-            }
+            seed_viewer(
+                &report_dir,
+                &id,
+                &app_name,
+                started_at_ms,
+                video_path.as_deref(),
+            )
+            .await;
         }
 
         let managed = ManagedSession {
@@ -739,8 +262,6 @@ impl UiTestServer {
             report_dir: report_dir.clone(),
             screenshot_counter: AtomicU32::new(0),
             events: Mutex::new(Vec::new()),
-            started_at_ms,
-            app_name: app_name.clone(),
             report_enabled,
         };
 
@@ -859,29 +380,13 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
-        let outcome: Result<String, String> =
-            managed.session.dump_tree().await.map_err(|e| e.to_string());
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "dump_tree",
-                serde_json::json!({}),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(dump_tree) failed");
-        }
-
-        let tree = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(tree)]))
+        self.run_action(
+            &params.session_id,
+            "dump_tree",
+            serde_json::json!({}),
+            |s| async move { s.dump_tree().await },
+        )
+        .await
     }
 
     #[tool(
@@ -895,40 +400,21 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
         let xpath = params.xpath.clone();
-        let outcome: Result<String, String> = async {
-            let matches = managed
-                .session
-                .locate(&xpath)
-                .inspect_all()
-                .await
-                .map_err(|e| e.to_string())?;
-            let json = serde_json::to_string_pretty(&render_matches(&xpath, &matches))
-                .map_err(|e| e.to_string())?;
-            Ok(json)
-        }
-        .await;
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "query",
-                serde_json::json!({ "xpath": params.xpath }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(query) failed");
-        }
-
-        let body = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        self.run_action(
+            &params.session_id,
+            "query",
+            serde_json::json!({ "xpath": params.xpath }),
+            |s| async move {
+                let matches = s.locate(&xpath).inspect_all().await?;
+                // serde_json failure on a value we just constructed is
+                // essentially impossible, but a typed error is cheaper
+                // than a panic — wrap it as an infra failure.
+                serde_json::to_string_pretty(&render_matches(&xpath, &matches))
+                    .map_err(|e| waydriver::Error::process_with("serialize query result", e))
+            },
+        )
+        .await
     }
 
     #[tool(
@@ -940,32 +426,14 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<ClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
         let xpath = params.xpath.clone();
-        let outcome: Result<String, String> = match managed.session.locate(&xpath).click().await {
-            Ok(()) => Ok(format!("Clicked {xpath}")),
-            Err(e) => Err(e.to_string()),
-        };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "click",
-                serde_json::json!({ "xpath": params.xpath }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(click) failed");
-        }
-
-        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        self.run_action(
+            &params.session_id,
+            "click",
+            serde_json::json!({ "xpath": params.xpath }),
+            |s| async move { s.locate(&xpath).click().await.map(|_| format!("Clicked {xpath}")) },
+        )
+        .await
     }
 
     #[tool(
@@ -978,32 +446,14 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<FocusParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
         let xpath = params.xpath.clone();
-        let outcome: Result<String, String> = match managed.session.locate(&xpath).focus().await {
-            Ok(()) => Ok(format!("Focused {xpath}")),
-            Err(e) => Err(e.to_string()),
-        };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "focus",
-                serde_json::json!({ "xpath": params.xpath }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(focus) failed");
-        }
-
-        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        self.run_action(
+            &params.session_id,
+            "focus",
+            serde_json::json!({ "xpath": params.xpath }),
+            |s| async move { s.locate(&xpath).focus().await.map(|_| format!("Focused {xpath}")) },
+        )
+        .await
     }
 
     #[tool(
@@ -1014,32 +464,14 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<HoverParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
         let xpath = params.xpath.clone();
-        let outcome: Result<String, String> = match managed.session.locate(&xpath).hover().await {
-            Ok(()) => Ok(format!("Hovered {xpath}")),
-            Err(e) => Err(e.to_string()),
-        };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "hover",
-                serde_json::json!({ "xpath": params.xpath }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(hover) failed");
-        }
-
-        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        self.run_action(
+            &params.session_id,
+            "hover",
+            serde_json::json!({ "xpath": params.xpath }),
+            |s| async move { s.locate(&xpath).hover().await.map(|_| format!("Hovered {xpath}")) },
+        )
+        .await
     }
 
     #[tool(
@@ -1051,33 +483,19 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<DoubleClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
         let xpath = params.xpath.clone();
-        let outcome: Result<String, String> =
-            match managed.session.locate(&xpath).double_click().await {
-                Ok(()) => Ok(format!("Double-clicked {xpath}")),
-                Err(e) => Err(e.to_string()),
-            };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "double_click",
-                serde_json::json!({ "xpath": params.xpath }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(double_click) failed");
-        }
-
-        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        self.run_action(
+            &params.session_id,
+            "double_click",
+            serde_json::json!({ "xpath": params.xpath }),
+            |s| async move {
+                s.locate(&xpath)
+                    .double_click()
+                    .await
+                    .map(|_| format!("Double-clicked {xpath}"))
+            },
+        )
+        .await
     }
 
     #[tool(
@@ -1088,33 +506,19 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<RightClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
         let xpath = params.xpath.clone();
-        let outcome: Result<String, String> =
-            match managed.session.locate(&xpath).right_click().await {
-                Ok(()) => Ok(format!("Right-clicked {xpath}")),
-                Err(e) => Err(e.to_string()),
-            };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "right_click",
-                serde_json::json!({ "xpath": params.xpath }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(right_click) failed");
-        }
-
-        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        self.run_action(
+            &params.session_id,
+            "right_click",
+            serde_json::json!({ "xpath": params.xpath }),
+            |s| async move {
+                s.locate(&xpath)
+                    .right_click()
+                    .await
+                    .map(|_| format!("Right-clicked {xpath}"))
+            },
+        )
+        .await
     }
 
     #[tool(
@@ -1126,39 +530,25 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<DragToParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
-        let source = managed.session.locate(&params.source_xpath);
-        let target = managed.session.locate(&params.target_xpath);
-        let outcome: Result<String, String> = match source.drag_to(&target).await {
-            Ok(()) => Ok(format!(
-                "Dragged {} to {}",
-                params.source_xpath, params.target_xpath
-            )),
-            Err(e) => Err(e.to_string()),
-        };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "drag_to",
-                serde_json::json!({
-                    "source_xpath": params.source_xpath,
-                    "target_xpath": params.target_xpath,
-                }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(drag_to) failed");
-        }
-
-        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        let source_xpath = params.source_xpath.clone();
+        let target_xpath = params.target_xpath.clone();
+        self.run_action(
+            &params.session_id,
+            "drag_to",
+            serde_json::json!({
+                "source_xpath": params.source_xpath,
+                "target_xpath": params.target_xpath,
+            }),
+            |s| async move {
+                let source = s.locate(&source_xpath);
+                let target = s.locate(&target_xpath);
+                source
+                    .drag_to(&target)
+                    .await
+                    .map(|_| format!("Dragged {source_xpath} to {target_xpath}"))
+            },
+        )
+        .await
     }
 
     #[tool(
@@ -1169,34 +559,20 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SetTextParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
         let xpath = params.xpath.clone();
         let text = params.text.clone();
-        let outcome: Result<String, String> =
-            match managed.session.locate(&xpath).set_text(&text).await {
-                Ok(()) => Ok(format!("Set text on {xpath}")),
-                Err(e) => Err(e.to_string()),
-            };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "set_text",
-                serde_json::json!({ "xpath": params.xpath, "text": params.text }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(set_text) failed");
-        }
-
-        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        self.run_action(
+            &params.session_id,
+            "set_text",
+            serde_json::json!({ "xpath": params.xpath, "text": params.text }),
+            |s| async move {
+                s.locate(&xpath)
+                    .set_text(&text)
+                    .await
+                    .map(|_| format!("Set text on {xpath}"))
+            },
+        )
+        .await
     }
 
     #[tool(
@@ -1212,11 +588,8 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<FillParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
+        // Validate mode up front: it's a caller-input problem, not a
+        // runtime failure, so it shouldn't get logged as an action error.
         let mode = match params.mode.as_deref() {
             None | Some("caret_nav") => waydriver::FillMode::CaretNav,
             Some("select_all") => waydriver::FillMode::SelectAll,
@@ -1232,36 +605,22 @@ impl UiTestServer {
 
         let xpath = params.xpath.clone();
         let text = params.text.clone();
-        let outcome: Result<String, String> =
-            match managed
-                .session
-                .locate(&xpath)
-                .fill_with_opts(&text, mode)
-                .await
-            {
-                Ok(()) => Ok(format!("Filled {xpath}")),
-                Err(e) => Err(e.to_string()),
-            };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "fill",
-                serde_json::json!({
-                    "xpath": params.xpath,
-                    "text": params.text,
-                    "mode": params.mode,
-                }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(fill) failed");
-        }
-
-        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        self.run_action(
+            &params.session_id,
+            "fill",
+            serde_json::json!({
+                "xpath": params.xpath,
+                "text": params.text,
+                "mode": params.mode,
+            }),
+            |s| async move {
+                s.locate(&xpath)
+                    .fill_with_opts(&text, mode)
+                    .await
+                    .map(|_| format!("Filled {xpath}"))
+            },
+        )
+        .await
     }
 
     #[tool(
@@ -1276,53 +635,52 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SelectOptionParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
+        // Parse by/value up front into an owned discriminant so the
+        // closure can reconstruct `SelectBy` (which borrows). Bad input
+        // here is caller error, not infrastructure failure.
+        enum ParsedBy {
+            Label(String),
+            Index(usize),
+        }
+        let parsed = match params.by.as_str() {
+            "label" => ParsedBy::Label(params.value.clone()),
+            "index" => params.value.parse::<usize>().map(ParsedBy::Index).map_err(|e| {
+                McpError::invalid_params(
+                    format!("invalid index {:?}: {e}", params.value),
+                    None,
+                )
+            })?,
+            other => {
+                return Err(McpError::invalid_params(
+                    format!("invalid `by` {other:?}; expected \"label\" or \"index\""),
+                    None,
+                ));
+            }
+        };
 
         let xpath = params.xpath.clone();
         let by = params.by.clone();
         let value = params.value.clone();
-
-        let parsed_by: Result<waydriver::SelectBy<'_>, String> = match by.as_str() {
-            "label" => Ok(waydriver::SelectBy::Label(value.as_str())),
-            "index" => value
-                .parse::<usize>()
-                .map(waydriver::SelectBy::Index)
-                .map_err(|e| format!("invalid index {value:?}: {e}")),
-            other => Err(format!(
-                "invalid `by` {other:?}; expected \"label\" or \"index\""
-            )),
-        };
-
-        let outcome: Result<String, String> = match parsed_by {
-            Ok(selector) => match managed.session.locate(&xpath).select_option(selector).await {
-                Ok(()) => Ok(format!("Selected {by}={value:?} on {xpath}")),
-                Err(e) => Err(e.to_string()),
+        self.run_action(
+            &params.session_id,
+            "select_option",
+            serde_json::json!({
+                "xpath": params.xpath,
+                "by": params.by,
+                "value": params.value,
+            }),
+            |s| async move {
+                let selector = match &parsed {
+                    ParsedBy::Label(name) => waydriver::SelectBy::Label(name.as_str()),
+                    ParsedBy::Index(i) => waydriver::SelectBy::Index(*i),
+                };
+                s.locate(&xpath)
+                    .select_option(selector)
+                    .await
+                    .map(|_| format!("Selected {by}={value:?} on {xpath}"))
             },
-            Err(e) => Err(e),
-        };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "select_option",
-                serde_json::json!({
-                    "xpath": params.xpath,
-                    "by": params.by,
-                    "value": params.value,
-                }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(select_option) failed");
-        }
-
-        let result = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        )
+        .await
     }
 
     #[tool(
@@ -1333,34 +691,14 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<ReadTextParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-
         let xpath = params.xpath.clone();
-        let outcome: Result<String, String> = managed
-            .session
-            .locate(&xpath)
-            .text()
-            .await
-            .map_err(|e| e.to_string());
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "read_text",
-                serde_json::json!({ "xpath": params.xpath }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(read_text) failed");
-        }
-
-        let text = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        self.run_action(
+            &params.session_id,
+            "read_text",
+            serde_json::json!({ "xpath": params.xpath }),
+            |s| async move { s.locate(&xpath).text().await },
+        )
+        .await
     }
 
     #[tool(description = "Type text into the currently focused element via keyboard input")]
@@ -1368,32 +706,14 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-        let session = &managed.session;
-
-        let outcome: Result<String, String> = match session.type_text(&params.text).await {
-            Ok(()) => Ok(format!("Typed '{}'", params.text)),
-            Err(e) => Err(e.to_string()),
-        };
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "type_text",
-                serde_json::json!({ "text": params.text }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(type_text) failed");
-        }
-
-        let msg = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        let text = params.text.clone();
+        self.run_action(
+            &params.session_id,
+            "type_text",
+            serde_json::json!({ "text": params.text }),
+            |s| async move { s.type_text(&text).await.map(|_| format!("Typed '{text}'")) },
+        )
+        .await
     }
 
     #[tool(
@@ -1406,51 +726,24 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<PressKeyParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-        let session = &managed.session;
-
-        enum PressErr {
-            Unknown(String),
-            Internal(String),
-        }
-        let outcome: Result<String, PressErr> = async {
-            // Validate the chord string up front so an unparseable input
-            // surfaces as InvalidParams, not a generic internal error.
-            if parse_chord(&params.key).is_none() {
-                return Err(PressErr::Unknown(format!("unknown key: {}", params.key)));
-            }
-            session
-                .press_chord(&params.key)
-                .await
-                .map_err(|e| PressErr::Internal(e.to_string()))?;
-            Ok(format!("Pressed '{}'", params.key))
-        }
-        .await;
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| match e {
-            PressErr::Unknown(m) => m.as_str(),
-            PressErr::Internal(m) => m.as_str(),
-        });
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "press_key",
-                serde_json::json!({ "key": params.key }),
-                log_outcome,
+        // Validate the chord string up front so an unparseable input
+        // surfaces as invalid_params (caller error), not internal_error.
+        // press_chord would also reject it but with a less specific code.
+        if parse_chord(&params.key).is_none() {
+            return Err(McpError::invalid_params(
+                format!("unknown key: {}", params.key),
                 None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(press_key) failed");
+            ));
         }
 
-        let msg = outcome.map_err(|e| match e {
-            PressErr::Unknown(m) => McpError::invalid_params(m, None),
-            PressErr::Internal(m) => McpError::internal_error(m, None),
-        })?;
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        let key = params.key.clone();
+        self.run_action(
+            &params.session_id,
+            "press_key",
+            serde_json::json!({ "key": params.key }),
+            |s| async move { s.press_chord(&key).await.map(|_| format!("Pressed '{key}'")) },
+        )
+        .await
     }
 
     #[tool(description = "Move the pointer by a relative offset in logical pixels")]
@@ -1458,33 +751,19 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<MovePointerParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-        let session = &managed.session;
-
-        let outcome: Result<String, String> = session
-            .pointer_motion_relative(params.dx, params.dy)
-            .await
-            .map(|_| format!("Pointer moved by ({}, {})", params.dx, params.dy))
-            .map_err(|e| e.to_string());
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "move_pointer",
-                serde_json::json!({ "dx": params.dx, "dy": params.dy }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(move_pointer) failed");
-        }
-
-        let msg = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        let dx = params.dx;
+        let dy = params.dy;
+        self.run_action(
+            &params.session_id,
+            "move_pointer",
+            serde_json::json!({ "dx": params.dx, "dy": params.dy }),
+            |s| async move {
+                s.pointer_motion_relative(dx, dy)
+                    .await
+                    .map(|_| format!("Pointer moved by ({dx}, {dy})"))
+            },
+        )
+        .await
     }
 
     #[tool(description = "Press and release a pointer button (defaults to left click)")]
@@ -1492,34 +771,18 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<PointerClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        let sessions = self.sessions.read().await;
-        let managed = sessions.get(&params.session_id).ok_or_else(|| {
-            McpError::invalid_params(format!("session not found: {}", params.session_id), None)
-        })?;
-        let session = &managed.session;
-
         let button = params.button.unwrap_or(0x110); // BTN_LEFT
-        let outcome: Result<String, String> = session
-            .pointer_button(button)
-            .await
-            .map(|_| format!("Pointer button {button:#x} clicked"))
-            .map_err(|e| e.to_string());
-        let log_outcome = outcome.as_ref().map(|s| s.as_str()).map_err(|e| e.as_str());
-        if let Err(e) = managed
-            .log_event(
-                &params.session_id,
-                "pointer_click",
-                serde_json::json!({ "button": button }),
-                log_outcome,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(pointer_click) failed");
-        }
-
-        let msg = outcome.map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        self.run_action(
+            &params.session_id,
+            "pointer_click",
+            serde_json::json!({ "button": button }),
+            |s| async move {
+                s.pointer_button(button)
+                    .await
+                    .map(|_| format!("Pointer button {button:#x} clicked"))
+            },
+        )
+        .await
     }
 
     #[tool(description = "Take a screenshot of the session and return the file path")]
@@ -1582,37 +845,6 @@ impl ServerHandler for UiTestServer {
     }
 }
 
-#[derive(Parser, Debug)]
-#[command(version, about = "Headless GTK4 UI testing MCP server")]
-struct Cli {
-    /// Base directory for per-session report output (screenshots today;
-    /// video recordings and HTML summaries planned). Each session gets a
-    /// subdirectory under this path, each containing a self-contained
-    /// `index.html` viewer openable directly from the filesystem.
-    #[arg(long, default_value = "/tmp/waydriver", env = "WAYDRIVER_REPORT_DIR")]
-    report_dir: PathBuf,
-    /// Default virtual-display size ("WIDTHxHEIGHT") for sessions that don't
-    /// override it via start_session's `resolution` parameter.
-    #[arg(long, default_value = "1024x768", env = "WAYDRIVER_RESOLUTION")]
-    resolution: String,
-    /// Record a continuous WebM video of each session by default. When on,
-    /// each session writes `{report_dir}/{session_id}/{session_id}.webm`
-    /// alongside its screenshots and events. Per-session override via
-    /// start_session's `record_video` argument. Requires reports enabled.
-    #[arg(
-        long,
-        default_value_t = true,
-        action = clap::ArgAction::Set,
-        env = "WAYDRIVER_RECORD_VIDEO"
-    )]
-    record_video: bool,
-    /// Default VP8 target bitrate in bits/sec for session recordings. Higher
-    /// values produce sharper UI text at the cost of file size. Per-session
-    /// override via start_session's `video_bitrate` argument.
-    #[arg(long, default_value_t = 2_000_000, env = "WAYDRIVER_VIDEO_BITRATE")]
-    video_bitrate: u32,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -1661,9 +893,9 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
 
     use async_trait::async_trait;
-    use clap::Parser;
     use tempfile::TempDir;
     use waydriver::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
 
@@ -1799,8 +1031,6 @@ mod tests {
                 report_dir,
                 screenshot_counter: AtomicU32::new(0),
                 events: Mutex::new(Vec::new()),
-                started_at_ms: 0,
-                app_name: app_name.into(),
                 report_enabled,
             },
         );
@@ -2092,48 +1322,6 @@ mod tests {
 
     // ── Report path / counter ──────────────────────────────────────────
 
-    #[test]
-    fn resolve_report_dir_defaults_to_base() {
-        let base = PathBuf::from("/tmp/base");
-        let resolved = resolve_report_dir(&base, None);
-        assert_eq!(resolved, base);
-    }
-
-    #[test]
-    fn resolve_report_dir_uses_override_when_provided() {
-        let base = PathBuf::from("/tmp/base");
-        let resolved = resolve_report_dir(&base, Some("/tmp/override"));
-        assert_eq!(resolved, PathBuf::from("/tmp/override"));
-    }
-
-    #[test]
-    fn resolve_report_dir_override_is_absolute_replacement() {
-        // Relative override is taken as-is, not joined under the base.
-        let base = PathBuf::from("/tmp/base");
-        let resolved = resolve_report_dir(&base, Some("relative/path"));
-        assert_eq!(resolved, PathBuf::from("relative/path"));
-    }
-
-    #[test]
-    fn resolve_resolution_defaults_to_server_default() {
-        assert_eq!(resolve_resolution("1024x768", None), "1024x768");
-    }
-
-    #[test]
-    fn resolve_resolution_uses_override_when_provided() {
-        assert_eq!(
-            resolve_resolution("1024x768", Some("1920x1080")),
-            "1920x1080"
-        );
-    }
-
-    #[test]
-    fn resolve_resolution_override_replaces_default_entirely() {
-        // The override is taken as-is; the server default is ignored even if
-        // the override is nonsensical (mutter validator catches that later).
-        assert_eq!(resolve_resolution("1920x1080", Some("garbage")), "garbage");
-    }
-
     fn make_managed(dir: PathBuf) -> ManagedSession {
         let session = Session::new_for_test(
             "sid".into(),
@@ -2149,8 +1337,6 @@ mod tests {
             report_dir: dir,
             screenshot_counter: AtomicU32::new(0),
             events: Mutex::new(Vec::new()),
-            started_at_ms: 0,
-            app_name: "app".into(),
             report_enabled: true,
         }
     }
@@ -2263,89 +1449,6 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    #[test]
-    fn start_session_params_report_defaults_to_true() {
-        let params: StartSessionParams =
-            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
-        assert!(params.report);
-    }
-
-    #[test]
-    fn start_session_params_report_can_be_disabled() {
-        let params: StartSessionParams =
-            serde_json::from_value(serde_json::json!({ "command": "x", "report": false })).unwrap();
-        assert!(!params.report);
-    }
-
-    #[test]
-    fn start_session_params_record_video_defaults_to_none() {
-        let params: StartSessionParams =
-            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
-        assert_eq!(params.record_video, None);
-    }
-
-    #[test]
-    fn start_session_params_record_video_can_be_set() {
-        let params: StartSessionParams =
-            serde_json::from_value(serde_json::json!({ "command": "x", "record_video": false }))
-                .unwrap();
-        assert_eq!(params.record_video, Some(false));
-    }
-
-    #[test]
-    fn start_session_params_video_bitrate_defaults_to_none() {
-        let params: StartSessionParams =
-            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
-        assert_eq!(params.video_bitrate, None);
-    }
-
-    #[test]
-    fn start_session_params_video_bitrate_can_be_set() {
-        let params: StartSessionParams = serde_json::from_value(
-            serde_json::json!({ "command": "x", "video_bitrate": 5_000_000 }),
-        )
-        .unwrap();
-        assert_eq!(params.video_bitrate, Some(5_000_000));
-    }
-
-    // ── CLI parsing ────────────────────────────────────────────────────
-
-    #[test]
-    fn cli_defaults_to_tmp_waydriver() {
-        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
-        assert_eq!(cli.report_dir, PathBuf::from("/tmp/waydriver"));
-    }
-
-    #[test]
-    fn cli_accepts_report_dir_flag() {
-        let cli = Cli::try_parse_from(["waydriver-mcp", "--report-dir", "/custom/out"]).unwrap();
-        assert_eq!(cli.report_dir, PathBuf::from("/custom/out"));
-    }
-
-    #[test]
-    fn cli_record_video_defaults_to_true() {
-        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
-        assert!(cli.record_video);
-    }
-
-    #[test]
-    fn cli_record_video_can_be_disabled() {
-        let cli = Cli::try_parse_from(["waydriver-mcp", "--record-video", "false"]).unwrap();
-        assert!(!cli.record_video);
-    }
-
-    #[test]
-    fn cli_video_bitrate_defaults_to_two_mbps() {
-        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
-        assert_eq!(cli.video_bitrate, 2_000_000);
-    }
-
-    #[test]
-    fn cli_accepts_video_bitrate_flag() {
-        let cli = Cli::try_parse_from(["waydriver-mcp", "--video-bitrate", "5000000"]).unwrap();
-        assert_eq!(cli.video_bitrate, 5_000_000);
     }
 
     #[tokio::test]
@@ -2463,174 +1566,6 @@ mod tests {
         assert_eq!(seqs, (1..=25).collect::<Vec<_>>());
     }
 
-    // ── render_matches ────────────────────────────────────────────────────
-
-    fn info(role: &str, name: Option<&str>) -> ElementInfo {
-        ElementInfo {
-            ref_: ("bus".to_string(), "/p".to_string()),
-            role: role.to_string(),
-            role_raw: None,
-            name: name.map(str::to_string),
-            attributes: std::collections::HashMap::new(),
-            states: Vec::new(),
-            bounds: None,
-        }
-    }
-
-    #[test]
-    fn render_matches_pins_each_entry_by_one_indexed_ordinal() {
-        let base = "//PushButton";
-        let ms = vec![
-            info("PushButton", Some("A")),
-            info("PushButton", Some("B")),
-            info("PushButton", Some("C")),
-        ];
-        let arr = render_matches(base, &ms);
-        let arr = arr.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr[0]["xpath"], "(//PushButton)[1]");
-        assert_eq!(arr[1]["xpath"], "(//PushButton)[2]");
-        assert_eq!(arr[2]["xpath"], "(//PushButton)[3]");
-        assert_eq!(arr[0]["role"], "PushButton");
-        assert_eq!(arr[0]["name"], "A");
-    }
-
-    #[test]
-    fn render_matches_empty_returns_empty_array() {
-        let arr = render_matches("//Missing", &[]);
-        assert_eq!(arr.as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn render_matches_serializes_attributes_and_states() {
-        let mut m = info("PushButton", Some("OK"));
-        m.attributes.insert("id".to_string(), "btn-ok".to_string());
-        m.states.push("showing".to_string());
-        m.states.push("enabled".to_string());
-        let arr = render_matches("//PushButton", &[m]);
-        let entry = &arr.as_array().unwrap()[0];
-        assert_eq!(entry["attributes"]["id"], "btn-ok");
-        let states = entry["states"].as_array().unwrap();
-        let state_names: Vec<&str> = states.iter().filter_map(|v| v.as_str()).collect();
-        assert!(state_names.contains(&"showing"));
-        assert!(state_names.contains(&"enabled"));
-    }
-
-    #[test]
-    fn render_matches_includes_role_raw_when_present() {
-        // Node-fallback case: role="Node" but role_raw preserves the original.
-        let mut m = info("Node", Some("weird"));
-        m.role_raw = Some("0weird-role".to_string());
-        let arr = render_matches("//Node", &[m]);
-        let entry = &arr.as_array().unwrap()[0];
-        assert_eq!(entry["role"], "Node");
-        assert_eq!(entry["role_raw"], "0weird-role");
-    }
-
-    #[test]
-    fn render_matches_omits_role_raw_when_absent() {
-        let m = info("PushButton", Some("OK"));
-        let arr = render_matches("//PushButton", &[m]);
-        let entry = &arr.as_array().unwrap()[0];
-        assert!(
-            entry.get("role_raw").is_none(),
-            "role_raw should not be present on normal roles: {entry}"
-        );
-    }
-
-    #[test]
-    fn render_matches_includes_bounds_when_present() {
-        let mut m = info("PushButton", Some("OK"));
-        m.bounds = Some(waydriver::Rect {
-            x: 12,
-            y: 34,
-            width: 100,
-            height: 28,
-        });
-        let arr = render_matches("//PushButton", &[m]);
-        let entry = &arr.as_array().unwrap()[0];
-        assert_eq!(entry["bounds"]["x"], 12);
-        assert_eq!(entry["bounds"]["y"], 34);
-        assert_eq!(entry["bounds"]["width"], 100);
-        assert_eq!(entry["bounds"]["height"], 28);
-    }
-
-    #[test]
-    fn render_matches_omits_bounds_when_absent() {
-        // Elements without Component (or not laid out) shouldn't surface
-        // a misleading "bounds": null — just omit the key entirely.
-        let m = info("PushButton", Some("OK"));
-        let arr = render_matches("//PushButton", &[m]);
-        let entry = &arr.as_array().unwrap()[0];
-        assert!(
-            entry.get("bounds").is_none(),
-            "bounds should be absent when element has none: {entry}"
-        );
-    }
-
-    #[test]
-    fn render_matches_preserves_complex_base_xpath_in_pin() {
-        // Composed selectors like (//Dialog//PushButton)[2] must wrap correctly.
-        let base = "//Dialog[@name='Confirm']//PushButton";
-        let arr = render_matches(base, &[info("PushButton", Some("OK"))]);
-        assert_eq!(
-            arr.as_array().unwrap()[0]["xpath"],
-            "(//Dialog[@name='Confirm']//PushButton)[1]"
-        );
-    }
-
-    #[test]
-    fn render_index_html_contains_header_fields() {
-        let html = render_index_html("my-sid", "gnome-calculator", 1_700_000_000_000, None);
-        assert!(html.contains("my-sid"));
-        assert!(html.contains("gnome-calculator"));
-        assert!(html.contains("cdn.tailwindcss.com"));
-        assert!(html.contains("events.js?v="));
-        assert!(html.contains("window.__events_update"));
-        assert!(html.contains(r#"id="events""#));
-        assert!(html.contains("1700000000000"));
-    }
-
-    #[test]
-    fn render_index_html_escapes_header_fields() {
-        let evil = "<script>alert(1)</script>";
-        let html = render_index_html("sid", evil, 0, None);
-        assert!(!html.contains(evil), "raw evil string leaked into HTML");
-        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-    }
-
-    #[test]
-    fn render_index_html_embeds_video_when_file_given() {
-        let html = render_index_html("sid", "app", 0, Some("sid.webm"));
-        assert!(
-            html.contains("<video"),
-            "expected <video> tag, got:\n{html}"
-        );
-        assert!(html.contains("src=\"sid.webm\""));
-    }
-
-    #[test]
-    fn render_index_html_omits_video_when_none() {
-        let html = render_index_html("sid", "app", 0, None);
-        assert!(!html.contains("<video"), "unexpected <video> tag: {html}");
-    }
-
-    #[test]
-    fn render_index_html_escapes_video_filename() {
-        // An evil filename that tries to close the src attribute and inject
-        // a new script tag must be entity-escaped so it stays inside the
-        // attribute value.
-        let html = render_index_html("sid", "app", 0, Some("evil\"><x>.webm"));
-        assert!(
-            !html.contains("src=\"evil\"><x>.webm\""),
-            "raw evil filename escaped the attribute"
-        );
-        assert!(
-            html.contains("&quot;&gt;&lt;x&gt;.webm"),
-            "expected entity-escaped filename, got:\n{html}"
-        );
-    }
-
     #[tokio::test]
     async fn inserted_session_inherits_base_report_dir() {
         let s = UiTestServer::new(
@@ -2671,5 +1606,152 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    // ── start_session helpers ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_video_output_returns_none_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let path = resolve_video_output(false, tmp.path(), "sid-x").await;
+        assert!(path.is_none());
+        // Disabled means no side effects either — the session dir
+        // shouldn't have been created.
+        assert!(tokio::fs::metadata(tmp.path().join("sid-x")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_video_output_creates_dir_and_returns_webm_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = resolve_video_output(true, tmp.path(), "sid-x").await;
+        let path = path.expect("expected Some path when recording is enabled");
+        assert_eq!(path, tmp.path().join("sid-x").join("sid-x.webm"));
+        assert!(tokio::fs::metadata(tmp.path().join("sid-x")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn seed_viewer_writes_index_html() {
+        let tmp = TempDir::new().unwrap();
+        seed_viewer(tmp.path(), "sid", "calculator", 1_700_000_000_000, None).await;
+        let html = tokio::fs::read_to_string(tmp.path().join("sid").join("index.html"))
+            .await
+            .unwrap();
+        assert!(html.contains("sid"));
+        assert!(html.contains("calculator"));
+    }
+
+    #[tokio::test]
+    async fn seed_viewer_embeds_video_filename_when_path_given() {
+        let tmp = TempDir::new().unwrap();
+        let video_path = tmp.path().join("sid").join("sid.webm");
+        seed_viewer(tmp.path(), "sid", "app", 0, Some(&video_path)).await;
+        let html = tokio::fs::read_to_string(tmp.path().join("sid").join("index.html"))
+            .await
+            .unwrap();
+        assert!(html.contains("sid.webm"));
+        assert!(html.contains("<video"));
+    }
+
+    // ── run_action helper ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_action_returns_invalid_params_when_session_missing() {
+        let s = server();
+        let err = s
+            .run_action("ghost", "test", serde_json::json!({}), |_| async move {
+                Ok::<_, waydriver::Error>("unreachable".to_string())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code.0, -32602, "expected invalid_params, got {err:?}");
+        assert!(err.message.contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn run_action_propagates_locator_error_as_invalid_params() {
+        // ElementNotFound is a "your selector didn't match" caller error,
+        // not an infrastructure failure — must surface as invalid_params.
+        let s = server();
+        insert_test_session(&s, "sid", "app", "wayland-x").await;
+        let err = s
+            .run_action("sid", "test", serde_json::json!({}), |_| async move {
+                Err::<String, _>(waydriver::Error::ElementNotFound {
+                    xpath: "//Missing".into(),
+                })
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code.0, -32602);
+        assert!(err.message.contains("//Missing"));
+    }
+
+    #[tokio::test]
+    async fn run_action_propagates_infra_error_as_internal_error() {
+        let s = server();
+        insert_test_session(&s, "sid", "app", "wayland-x").await;
+        let err = s
+            .run_action("sid", "test", serde_json::json!({}), |_| async move {
+                Err::<String, _>(waydriver::Error::process("dbus dropped"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code.0, -32603);
+        assert!(err.message.contains("dbus dropped"));
+    }
+
+    #[tokio::test]
+    async fn run_action_logs_event_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let s = UiTestServer::new(tmp.path().to_path_buf(), "1024x768".into(), false, 2_000_000);
+        tokio::fs::create_dir_all(tmp.path().join("sid")).await.unwrap();
+        insert_test_session(&s, "sid", "app", "wayland-x").await;
+
+        let result = s
+            .run_action(
+                "sid",
+                "demo",
+                serde_json::json!({ "k": "v" }),
+                |_| async move { Ok::<_, waydriver::Error>("did the thing".to_string()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(content_text(&result), "did the thing");
+
+        let jsonl = tokio::fs::read_to_string(tmp.path().join("sid").join("events.jsonl"))
+            .await
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(jsonl.trim()).unwrap();
+        assert_eq!(event["action"], "demo");
+        assert_eq!(event["status"], "ok");
+        assert_eq!(event["message"], "did the thing");
+        assert_eq!(event["params"]["k"], "v");
+    }
+
+    #[tokio::test]
+    async fn run_action_logs_chain_walked_error() {
+        // The whole point of the new error plumbing: log_event sees the
+        // same chain-serialized message the MCP response carries.
+        let tmp = TempDir::new().unwrap();
+        let s = UiTestServer::new(tmp.path().to_path_buf(), "1024x768".into(), false, 2_000_000);
+        tokio::fs::create_dir_all(tmp.path().join("sid")).await.unwrap();
+        insert_test_session(&s, "sid", "app", "wayland-x").await;
+
+        let _ = s
+            .run_action("sid", "demo", serde_json::json!({}), |_| async move {
+                let io_err = std::io::Error::other("disk full");
+                Err::<String, _>(waydriver::Error::screenshot_with("write png", io_err))
+            })
+            .await
+            .unwrap_err();
+
+        let jsonl = tokio::fs::read_to_string(tmp.path().join("sid").join("events.jsonl"))
+            .await
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(jsonl.trim()).unwrap();
+        assert_eq!(event["status"], "err");
+        let msg = event["message"].as_str().unwrap();
+        assert!(msg.contains("write png"), "missing operation: {msg}");
+        assert!(msg.contains("disk full"), "missing source: {msg}");
+        assert!(msg.contains(" | "), "missing chain separator: {msg}");
     }
 }
