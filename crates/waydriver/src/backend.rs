@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 
@@ -35,46 +36,82 @@ pub trait CompositorRuntime: Send + Sync {
 /// Keyboard and pointer injection. Decoupled from the compositor trait so
 /// alternative implementations (e.g. libei) can drive the same compositor
 /// alongside a mutter/KWin/wlroots backend.
+///
+/// ## Cancellation convention
+///
+/// Every method accepts a [`CancellationToken`]. The token is the
+/// [`Session`](crate::Session)'s own cancellation handle, forwarded by
+/// Session-level wrappers so individual backend calls can observe it
+/// without the caller needing to plumb it themselves.
+///
+/// Implementations must treat cancellation as follows:
+/// - **Atomic press/release gaps must complete.** Backends that press a
+///   key (or button) down, wait, then release must *not* bail during
+///   that gap — doing so would leave a key stuck in the compositor's
+///   state. The gap is short (single-digit to tens of ms) so running
+///   it to completion costs little.
+/// - **Tail throttles may bail.** Backends that sleep *after* an event
+///   committed (so back-to-back events don't overwhelm the app) should
+///   race the sleep against `cancel.cancelled()` and return `Ok(())`
+///   early on cancel — the event already succeeded and the throttle
+///   is a courtesy. Higher-level loops (e.g.
+///   [`Session::type_text`](crate::Session::type_text)) pick up the
+///   cancellation on their next pre-flight check and return
+///   [`Error::Cancelled`](crate::Error::Cancelled) to the caller.
+/// - **Pre-event checks are optional** — the outer loops already
+///   short-circuit, so there's no correctness requirement to re-check
+///   at the backend boundary. Backends may still check if it saves
+///   setup work (e.g. a D-Bus call).
 #[async_trait]
 pub trait InputBackend: Send + Sync {
     /// Press and release a single X11 keysym. Implementations handle any
     /// inter-event timing required by the transport. Equivalent to
     /// [`key_down`](Self::key_down) immediately followed by
     /// [`key_up`](Self::key_up).
-    async fn press_keysym(&self, keysym: u32) -> Result<()>;
+    async fn press_keysym(&self, keysym: u32, cancel: &CancellationToken) -> Result<()>;
 
     /// Press a key and hold it down until a corresponding
     /// [`key_up`](Self::key_up) fires. Used to build modifier combos — hold
     /// `Ctrl` down across a target keystroke and release it afterward.
-    async fn key_down(&self, keysym: u32) -> Result<()>;
+    async fn key_down(&self, keysym: u32, cancel: &CancellationToken) -> Result<()>;
 
     /// Release a key that was previously pressed with
     /// [`key_down`](Self::key_down). Safe to call on a key that isn't held
     /// (behavior is implementation-defined, but must not panic).
-    async fn key_up(&self, keysym: u32) -> Result<()>;
+    async fn key_up(&self, keysym: u32, cancel: &CancellationToken) -> Result<()>;
 
     /// Move the pointer by a relative offset in logical pixels.
-    async fn pointer_motion_relative(&self, dx: f64, dy: f64) -> Result<()>;
+    async fn pointer_motion_relative(
+        &self,
+        dx: f64,
+        dy: f64,
+        cancel: &CancellationToken,
+    ) -> Result<()>;
 
     /// Move the pointer to a screen-relative absolute position in logical
     /// pixels. Implementations route through whatever channel their
     /// compositor exposes (e.g. `NotifyPointerMotionAbsolute` on mutter's
     /// RemoteDesktop). Backends with no active capture stream to address
     /// should return `Err`.
-    async fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<()>;
+    async fn pointer_motion_absolute(
+        &self,
+        x: f64,
+        y: f64,
+        cancel: &CancellationToken,
+    ) -> Result<()>;
 
     /// Press a pointer button and hold it down until a corresponding
     /// [`pointer_button_up`](Self::pointer_button_up) fires. `button` uses
     /// Linux evdev codes (e.g. `BTN_LEFT` = 0x110). Used to build drag
     /// gestures — press, move the pointer across intermediate coordinates,
     /// then release.
-    async fn pointer_button_down(&self, button: u32) -> Result<()>;
+    async fn pointer_button_down(&self, button: u32, cancel: &CancellationToken) -> Result<()>;
 
     /// Release a pointer button that was previously pressed with
     /// [`pointer_button_down`](Self::pointer_button_down). Safe to call on
     /// a button that isn't held (behavior is implementation-defined, but
     /// must not panic).
-    async fn pointer_button_up(&self, button: u32) -> Result<()>;
+    async fn pointer_button_up(&self, button: u32, cancel: &CancellationToken) -> Result<()>;
 
     /// Press and release a pointer button. `button` uses Linux evdev codes
     /// (e.g. `BTN_LEFT` = 0x110). Default impl composes
@@ -82,10 +119,16 @@ pub trait InputBackend: Send + Sync {
     /// [`pointer_button_up`](Self::pointer_button_up) with a short gap so
     /// the compositor distinguishes press from release; backends with a
     /// more efficient combined path can override.
-    async fn pointer_button(&self, button: u32) -> Result<()> {
-        self.pointer_button_down(button).await?;
+    ///
+    /// The 20 ms press/release gap is *atomic*: we do not race it
+    /// against the token because cancelling mid-gap would leave the
+    /// button held down in the compositor's state. Cancellation
+    /// observed on the tail of `pointer_button_up` (or at the outer
+    /// loop's next iteration) is the designed bail-point.
+    async fn pointer_button(&self, button: u32, cancel: &CancellationToken) -> Result<()> {
+        self.pointer_button_down(button, cancel).await?;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        self.pointer_button_up(button).await
+        self.pointer_button_up(button, cancel).await
     }
 
     /// Emit a discrete pointer-axis (wheel) event. `axis` selects the
@@ -98,7 +141,25 @@ pub trait InputBackend: Send + Sync {
     /// via continuous axis deltas; callers shouldn't rely on step being
     /// exactly one wheel click's worth of travel, just on sign + rough
     /// magnitude.
-    async fn pointer_axis_discrete(&self, axis: u32, steps: i32) -> Result<()>;
+    async fn pointer_axis_discrete(
+        &self,
+        axis: u32,
+        steps: i32,
+        cancel: &CancellationToken,
+    ) -> Result<()>;
+}
+
+/// Sleep up to `dur`, waking immediately if `cancel` trips. Returns
+/// unconditionally — the sleep is a courtesy throttle, not a critical
+/// section, so callers don't distinguish "slept full time" from "cancel
+/// cut the sleep short." Use for post-event tail delays in input
+/// backends; use [`tokio::select`] + an explicit
+/// `Err(crate::Error::Cancelled)` arm when cancelling must propagate.
+pub async fn cancellable_tail(dur: std::time::Duration, cancel: &CancellationToken) {
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        _ = tokio::time::sleep(dur) => {}
+    }
 }
 
 /// A live PipeWire stream the backend is keeping open on behalf of a caller.

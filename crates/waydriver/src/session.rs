@@ -256,7 +256,7 @@ impl Session {
 
     /// Send a key press + release for the given X11 keysym.
     pub async fn press_keysym(&self, keysym: u32) -> Result<()> {
-        self.input.press_keysym(keysym).await
+        self.input.press_keysym(keysym, &self.cancellation).await
     }
 
     /// Press a chord like `"Ctrl+Shift+A"` — modifiers are held in order,
@@ -267,19 +267,26 @@ impl Session {
     /// modifiers. See [`crate::keysym::parse_chord`] for the full grammar.
     /// Returns an error if the chord can't be parsed.
     pub async fn press_chord(&self, chord: &str) -> Result<()> {
+        // Pre-flight cancellation check: if kill fired before we started,
+        // bail without pressing anything. Checks *inside* the modifier
+        // loop would leave keys stuck down — the existing unwind always
+        // runs so any modifiers already pressed get released cleanly.
+        if self.cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let parsed = crate::keysym::parse_chord(chord)
             .ok_or_else(|| Error::process(format!("invalid chord: {chord:?}")))?;
         // Press all modifiers in order.
         for m in &parsed.modifiers {
-            self.input.key_down(*m).await?;
+            self.input.key_down(*m, &self.cancellation).await?;
         }
         // Press + release the target key while modifiers are held.
-        let target_result = self.input.press_keysym(parsed.key).await;
+        let target_result = self.input.press_keysym(parsed.key, &self.cancellation).await;
         // Release modifiers in reverse order, even if the target press
         // failed — leaving modifiers stuck down would break subsequent
         // keyboard input.
         for m in parsed.modifiers.iter().rev() {
-            if let Err(e) = self.input.key_up(*m).await {
+            if let Err(e) = self.input.key_up(*m, &self.cancellation).await {
                 tracing::warn!(error = %e, keysym = m, "key_up failed during chord unwind");
             }
         }
@@ -288,32 +295,40 @@ impl Session {
 
     /// Move the pointer by a relative offset in logical pixels.
     pub async fn pointer_motion_relative(&self, dx: f64, dy: f64) -> Result<()> {
-        self.input.pointer_motion_relative(dx, dy).await
+        self.input
+            .pointer_motion_relative(dx, dy, &self.cancellation)
+            .await
     }
 
     /// Move the pointer to a screen-relative absolute position in logical
     /// pixels. Requires an active capture stream on backends that route
     /// through the compositor's ScreenCast pipeline (mutter).
     pub async fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<()> {
-        self.input.pointer_motion_absolute(x, y).await
+        self.input
+            .pointer_motion_absolute(x, y, &self.cancellation)
+            .await
     }
 
     /// Press and release a pointer button (Linux evdev code, e.g. BTN_LEFT = 0x110).
     pub async fn pointer_button(&self, button: u32) -> Result<()> {
-        self.input.pointer_button(button).await
+        self.input.pointer_button(button, &self.cancellation).await
     }
 
     /// Hold a pointer button down until a matching [`pointer_button_up`](Self::pointer_button_up)
     /// fires. Used to build drag gestures — press, move across intermediate
     /// coordinates, then release.
     pub async fn pointer_button_down(&self, button: u32) -> Result<()> {
-        self.input.pointer_button_down(button).await
+        self.input
+            .pointer_button_down(button, &self.cancellation)
+            .await
     }
 
     /// Release a pointer button previously pressed with
     /// [`pointer_button_down`](Self::pointer_button_down).
     pub async fn pointer_button_up(&self, button: u32) -> Result<()> {
-        self.input.pointer_button_up(button).await
+        self.input
+            .pointer_button_up(button, &self.cancellation)
+            .await
     }
 
     /// Type a string as keyboard input, one X11 keysym per `char`. Latin-1
@@ -321,8 +336,18 @@ impl Session {
     /// encoding (see [`crate::keysym::char_to_keysym`]). Does not manage
     /// focus — call [`crate::Locator::focus`] or click the target widget
     /// first.
+    ///
+    /// Observes the session's cancellation token between characters so a
+    /// long typed string bails promptly on `kill_session` instead of
+    /// typing every remaining character before noticing. Cancellation
+    /// latency is capped at one keystroke (~50ms backend-internal
+    /// sleep); mid-keystroke cancel would require plumbing the token
+    /// through the [`InputBackend`](crate::backend::InputBackend) trait.
     pub async fn type_text(&self, text: &str) -> Result<()> {
         for ch in text.chars() {
+            if self.cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             self.press_keysym(crate::keysym::char_to_keysym(ch)).await?;
         }
         Ok(())
@@ -332,7 +357,9 @@ impl Session {
     /// vertical, 1 for horizontal. `steps` is the number of wheel
     /// detents — positive scrolls down/right, negative scrolls up/left.
     pub async fn pointer_axis_discrete(&self, axis: u32, steps: i32) -> Result<()> {
-        self.input.pointer_axis_discrete(axis, steps).await
+        self.input
+            .pointer_axis_discrete(axis, steps, &self.cancellation)
+            .await
     }
 
     /// Wayland display socket name this session is running against.
@@ -416,8 +443,10 @@ impl Session {
     }
 
     /// Wait for a stdout line matching `pred` to appear at or after index
-    /// `after` in the buffer. Returns the matched line on success, or
-    /// `Error::Timeout` if no matching line arrives before the deadline.
+    /// `after` in the buffer. Returns the matched line on success,
+    /// `Error::Timeout` if no matching line arrives before the deadline,
+    /// or `Error::Cancelled` if the session's cancellation token trips
+    /// while waiting (typically because `kill_session` fired).
     ///
     /// Lines already in the buffer at or after `after` count as matches —
     /// there's no "only future lines" mode. Pass `self.stdout_cursor()`
@@ -454,14 +483,24 @@ impl Session {
                     self.stdout.lines.lock().unwrap().len().saturating_sub(after),
                 )));
             }
-            if tokio::time::timeout(remaining, &mut notified)
-                .await
-                .is_err()
-            {
-                return Err(Error::Timeout(format!(
-                    "no stdout line matched within {timeout:?} (buffer had {} line(s) after cursor {after})",
-                    self.stdout.lines.lock().unwrap().len().saturating_sub(after),
-                )));
+            // Race three things: the `Notified` future (new line appended),
+            // the deadline (via tokio::time::sleep), and the session's
+            // cancellation token. A raced cancel surfaces as
+            // `Error::Cancelled` so callers can distinguish "kill fired"
+            // from "deadline elapsed without a match."
+            tokio::select! {
+                _ = &mut notified => {
+                    // Woken by a new line; loop and re-scan.
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    return Err(Error::Timeout(format!(
+                        "no stdout line matched within {timeout:?} (buffer had {} line(s) after cursor {after})",
+                        self.stdout.lines.lock().unwrap().len().saturating_sub(after),
+                    )));
+                }
+                _ = self.cancellation.cancelled() => {
+                    return Err(Error::Cancelled);
+                }
             }
         }
     }
@@ -937,28 +976,28 @@ mod tests {
         struct StubInput;
         #[async_trait]
         impl InputBackend for StubInput {
-            async fn press_keysym(&self, _: u32) -> Result<()> {
+            async fn press_keysym(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn key_down(&self, _: u32) -> Result<()> {
+            async fn key_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn key_up(&self, _: u32) -> Result<()> {
+            async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
+            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
+            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32) -> Result<()> {
+            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32) -> Result<()> {
+            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
+            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
         }
@@ -1008,31 +1047,31 @@ mod tests {
         struct RecordingInput(Arc<Mutex<Vec<Event>>>);
         #[async_trait]
         impl InputBackend for RecordingInput {
-            async fn press_keysym(&self, k: u32) -> Result<()> {
+            async fn press_keysym(&self, k: u32, _: &CancellationToken) -> Result<()> {
                 self.0.lock().unwrap().push(Event::Press(k));
                 Ok(())
             }
-            async fn key_down(&self, k: u32) -> Result<()> {
+            async fn key_down(&self, k: u32, _: &CancellationToken) -> Result<()> {
                 self.0.lock().unwrap().push(Event::Down(k));
                 Ok(())
             }
-            async fn key_up(&self, k: u32) -> Result<()> {
+            async fn key_up(&self, k: u32, _: &CancellationToken) -> Result<()> {
                 self.0.lock().unwrap().push(Event::Up(k));
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
+            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
+            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32) -> Result<()> {
+            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32) -> Result<()> {
+            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
+            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
         }
@@ -1128,28 +1167,28 @@ mod tests {
         struct StubInput;
         #[async_trait]
         impl InputBackend for StubInput {
-            async fn press_keysym(&self, _: u32) -> Result<()> {
+            async fn press_keysym(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn key_down(&self, _: u32) -> Result<()> {
+            async fn key_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn key_up(&self, _: u32) -> Result<()> {
+            async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
+            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
+            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32) -> Result<()> {
+            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32) -> Result<()> {
+            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
+            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
         }
@@ -1179,6 +1218,209 @@ mod tests {
         assert!(
             matches!(err, Error::Process { ref message, .. } if message.contains("invalid chord")),
             "expected process:invalid chord, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn type_text_bails_when_cancelled_mid_string() {
+        use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
+        use async_trait::async_trait;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // Input backend that counts keystrokes and fires the session's
+        // cancellation token after the Nth one. Driving cancellation
+        // from inside the backend (rather than a concurrent task +
+        // sleep) makes the test deterministic — no wall-clock race.
+        struct CountAndCancelInput {
+            count: Arc<AtomicUsize>,
+            cancel_after: usize,
+            token: CancellationToken,
+        }
+        #[async_trait]
+        impl InputBackend for CountAndCancelInput {
+            async fn press_keysym(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                let n = self.count.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                if n == self.cancel_after {
+                    self.token.cancel();
+                }
+                Ok(())
+            }
+            async fn key_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+        }
+        struct StubCompositor;
+        #[async_trait]
+        impl CompositorRuntime for StubCompositor {
+            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+                Ok(())
+            }
+            async fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn id(&self) -> &str {
+                "s"
+            }
+            fn wayland_display(&self) -> &str {
+                "d"
+            }
+            fn runtime_dir(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        struct StubCapture;
+        #[async_trait]
+        impl CaptureBackend for StubCapture {
+            async fn start_stream(&self) -> Result<PipeWireStream> {
+                unimplemented!()
+            }
+            async fn stop_stream(&self, _: PipeWireStream) -> Result<()> {
+                Ok(())
+            }
+            fn pipewire_socket(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+        }
+
+        // Build the session first so we can clone its real cancellation
+        // token into the backend. (new_for_test instantiates a fresh
+        // token internally; we share a handle to it.)
+        let count = Arc::new(AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let backend_token = token.clone();
+        let mut s = Session::new_for_test(
+            "t".into(),
+            "a".into(),
+            Box::new(CountAndCancelInput {
+                count: Arc::clone(&count),
+                cancel_after: 3,
+                token: backend_token,
+            }),
+            Box::new(StubCapture),
+            Box::new(StubCompositor),
+        );
+        // Swap the session's default-constructed token for the shared
+        // one so `self.cancellation.is_cancelled()` in type_text sees
+        // the cancel that the backend triggers.
+        s.cancellation = token;
+
+        let err = s
+            .type_text("abcdefghijklmnopqrstuvwxyz")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+        let typed = count.load(AtomicOrdering::SeqCst);
+        // The loop checks the token *before* each press_keysym, so the
+        // backend can consume iteration N, cancel, and iteration N+1
+        // will bail. Expected: exactly `cancel_after` presses.
+        assert_eq!(
+            typed, 3,
+            "loop should bail on the iteration after cancel; typed = {typed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn press_chord_bails_when_already_cancelled() {
+        use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream};
+        use async_trait::async_trait;
+        use std::path::{Path, PathBuf};
+
+        struct RejectInput;
+        #[async_trait]
+        impl InputBackend for RejectInput {
+            async fn press_keysym(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                panic!("press_keysym should not run on a cancelled session")
+            }
+            async fn key_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                panic!("key_down should not run on a cancelled session")
+            }
+            async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+        }
+        struct StubCompositor;
+        #[async_trait]
+        impl CompositorRuntime for StubCompositor {
+            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+                Ok(())
+            }
+            async fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn id(&self) -> &str {
+                "s"
+            }
+            fn wayland_display(&self) -> &str {
+                "d"
+            }
+            fn runtime_dir(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        struct StubCapture;
+        #[async_trait]
+        impl CaptureBackend for StubCapture {
+            async fn start_stream(&self) -> Result<PipeWireStream> {
+                unimplemented!()
+            }
+            async fn stop_stream(&self, _: PipeWireStream) -> Result<()> {
+                Ok(())
+            }
+            fn pipewire_socket(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+        }
+
+        let s = Session::new_for_test(
+            "t".into(),
+            "a".into(),
+            Box::new(RejectInput),
+            Box::new(StubCapture),
+            Box::new(StubCompositor),
+        );
+        s.cancel();
+
+        let err = s.press_chord("Ctrl+A").await.unwrap_err();
+        assert!(
+            matches!(err, Error::Cancelled),
+            "expected Cancelled, got {err:?}"
         );
     }
 
@@ -1212,28 +1454,28 @@ mod tests {
         struct StubInput;
         #[async_trait]
         impl InputBackend for StubInput {
-            async fn press_keysym(&self, _: u32) -> Result<()> {
+            async fn press_keysym(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn key_down(&self, _: u32) -> Result<()> {
+            async fn key_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn key_up(&self, _: u32) -> Result<()> {
+            async fn key_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_relative(&self, _: f64, _: f64) -> Result<()> {
+            async fn pointer_motion_relative(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_motion_absolute(&self, _: f64, _: f64) -> Result<()> {
+            async fn pointer_motion_absolute(&self, _: f64, _: f64, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_down(&self, _: u32) -> Result<()> {
+            async fn pointer_button_down(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_button_up(&self, _: u32) -> Result<()> {
+            async fn pointer_button_up(&self, _: u32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
-            async fn pointer_axis_discrete(&self, _: u32, _: i32) -> Result<()> {
+            async fn pointer_axis_discrete(&self, _: u32, _: i32, _: &CancellationToken) -> Result<()> {
                 Ok(())
             }
         }
@@ -1328,5 +1570,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Timeout(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_stdout_line_bails_when_cancelled() {
+        // kill_session firing during a long stdout wait should surface
+        // as Error::Cancelled in milliseconds, not wait out the deadline.
+        let s = Arc::new(make_test_session());
+        let s_for_cancel = s.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            s_for_cancel.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        // Deadline is 5s so any quick return is attributable to cancel,
+        // not timeout.
+        let err = s
+            .wait_for_stdout_line(0, |l| l == "never", Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(matches!(err, Error::Cancelled), "got: {err:?}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel should wake the wait promptly; elapsed = {elapsed:?}"
+        );
     }
 }

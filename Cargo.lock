@@ -3028,6 +3028,7 @@ dependencies = [
  "anyhow",
  "image",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "waydriver",
@@ -3050,6 +3051,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "tokio",
+ "tokio-util",
  "waydriver",
  "waydriver-compositor-mutter",
 ]
@@ -3067,6 +3069,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "waydriver",

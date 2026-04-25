@@ -1031,36 +1031,63 @@ mod tests {
 
     #[async_trait]
     impl InputBackend for MockInput {
-        async fn press_keysym(&self, _keysym: u32) -> waydriver::error::Result<()> {
+        async fn press_keysym(
+            &self,
+            _keysym: u32,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> waydriver::error::Result<()> {
             Ok(())
         }
-        async fn key_down(&self, _keysym: u32) -> waydriver::error::Result<()> {
+        async fn key_down(
+            &self,
+            _keysym: u32,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> waydriver::error::Result<()> {
             Ok(())
         }
-        async fn key_up(&self, _keysym: u32) -> waydriver::error::Result<()> {
+        async fn key_up(
+            &self,
+            _keysym: u32,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> waydriver::error::Result<()> {
             Ok(())
         }
         async fn pointer_motion_relative(
             &self,
             _dx: f64,
             _dy: f64,
+            _: &tokio_util::sync::CancellationToken,
         ) -> waydriver::error::Result<()> {
             Ok(())
         }
-        async fn pointer_motion_absolute(&self, _x: f64, _y: f64) -> waydriver::error::Result<()> {
+        async fn pointer_motion_absolute(
+            &self,
+            _x: f64,
+            _y: f64,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> waydriver::error::Result<()> {
             Ok(())
         }
-        async fn pointer_button_down(&self, button: u32) -> waydriver::error::Result<()> {
+        async fn pointer_button_down(
+            &self,
+            button: u32,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> waydriver::error::Result<()> {
             *self.last_button.lock().unwrap() = Some(button);
             Ok(())
         }
-        async fn pointer_button_up(&self, _button: u32) -> waydriver::error::Result<()> {
+        async fn pointer_button_up(
+            &self,
+            _button: u32,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> waydriver::error::Result<()> {
             Ok(())
         }
         async fn pointer_axis_discrete(
             &self,
             _axis: u32,
             _steps: i32,
+            _: &tokio_util::sync::CancellationToken,
         ) -> waydriver::error::Result<()> {
             Ok(())
         }

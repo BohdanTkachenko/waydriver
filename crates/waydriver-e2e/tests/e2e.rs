@@ -603,15 +603,19 @@ async fn fixture_pointer_input_operations() -> anyhow::Result<()> {
     // pattern tests use when they need both the Session's backend and a
     // directly-owned one for pointer calls.
     let pointer = MutterInput::new(state);
+    // Test-scope cancellation token: this second backend isn't owned by
+    // the Session so it can't reuse Session's token; a never-cancelled
+    // token is the right default for a straight-line input sequence.
+    let cancel = tokio_util::sync::CancellationToken::new();
 
-    pointer.pointer_motion_relative(100.0, 100.0).await?;
+    pointer.pointer_motion_relative(100.0, 100.0, &cancel).await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // BTN_LEFT = 0x110.
-    pointer.pointer_button(0x110).await?;
+    pointer.pointer_button(0x110, &cancel).await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    pointer.pointer_motion_relative(-50.0, -50.0).await?;
+    pointer.pointer_motion_relative(-50.0, -50.0, &cancel).await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Confirm session is still functional by taking a screenshot.

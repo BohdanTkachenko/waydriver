@@ -17,3 +17,4 @@ waydriver = { path = "../waydriver", version = "0.2.0" }
 waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter", version = "0.2.0" }
 async-trait.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true

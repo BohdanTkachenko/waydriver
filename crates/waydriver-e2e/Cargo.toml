@@ -19,6 +19,7 @@ waydriver-input-mutter = { path = "../waydriver-input-mutter" }
 waydriver-capture-mutter = { path = "../waydriver-capture-mutter" }
 anyhow.workspace = true
 tokio = { workspace = true }
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 image.workspace = true

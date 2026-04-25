@@ -31,3 +31,4 @@ tracing-subscriber.workspace = true
 waydriver = { path = "../waydriver", features = ["test-support"] }
 async-trait.workspace = true
 tempfile.workspace = true
+tokio-util.workspace = true

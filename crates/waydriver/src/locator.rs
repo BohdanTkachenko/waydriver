@@ -1307,6 +1307,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     // We can't instantiate a Locator without a Session, so composition
     // tests mirror the pure string logic via these helpers.
@@ -1420,28 +1421,43 @@ mod tests {
     struct StubInput;
     #[async_trait]
     impl InputBackend for StubInput {
-        async fn press_keysym(&self, _keysym: u32) -> WdResult<()> {
+        async fn press_keysym(&self, _keysym: u32, _: &CancellationToken) -> WdResult<()> {
             Ok(())
         }
-        async fn key_down(&self, _keysym: u32) -> WdResult<()> {
+        async fn key_down(&self, _keysym: u32, _: &CancellationToken) -> WdResult<()> {
             Ok(())
         }
-        async fn key_up(&self, _keysym: u32) -> WdResult<()> {
+        async fn key_up(&self, _keysym: u32, _: &CancellationToken) -> WdResult<()> {
             Ok(())
         }
-        async fn pointer_motion_relative(&self, _dx: f64, _dy: f64) -> WdResult<()> {
+        async fn pointer_motion_relative(
+            &self,
+            _dx: f64,
+            _dy: f64,
+            _: &CancellationToken,
+        ) -> WdResult<()> {
             Ok(())
         }
-        async fn pointer_motion_absolute(&self, _x: f64, _y: f64) -> WdResult<()> {
+        async fn pointer_motion_absolute(
+            &self,
+            _x: f64,
+            _y: f64,
+            _: &CancellationToken,
+        ) -> WdResult<()> {
             Ok(())
         }
-        async fn pointer_button_down(&self, _button: u32) -> WdResult<()> {
+        async fn pointer_button_down(&self, _button: u32, _: &CancellationToken) -> WdResult<()> {
             Ok(())
         }
-        async fn pointer_button_up(&self, _button: u32) -> WdResult<()> {
+        async fn pointer_button_up(&self, _button: u32, _: &CancellationToken) -> WdResult<()> {
             Ok(())
         }
-        async fn pointer_axis_discrete(&self, _axis: u32, _steps: i32) -> WdResult<()> {
+        async fn pointer_axis_discrete(
+            &self,
+            _axis: u32,
+            _steps: i32,
+            _: &CancellationToken,
+        ) -> WdResult<()> {
             Ok(())
         }
     }
