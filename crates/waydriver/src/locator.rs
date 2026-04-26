@@ -424,14 +424,24 @@ impl Locator {
     ///
     /// ## Focus handling
     ///
-    /// `fill` calls AT-SPI `Component::grab_focus` on the target and
-    /// **propagates any error** — including the `NotSupported` that
-    /// GTK4 text widgets currently return because their AT-SPI bridge
-    /// doesn't implement the Component interface. When you've already
-    /// focused the widget some other way (a prior pointer click, Tab
-    /// navigation, application-level `grab_focus` on startup) and want
-    /// `fill` to skip the focus call entirely, use
-    /// [`fill_assume_focused`](Self::fill_assume_focused).
+    /// `fill` tries AT-SPI `Component::grab_focus` first. Three cases:
+    /// - **Granted**: focus took, fill proceeds normally.
+    /// - **Rejected** (the bridge said the widget can't take focus
+    ///   right now): surfaced as `Error::Atspi` so callers see the real
+    ///   problem rather than typing into the wrong widget.
+    /// - **NotSupported** (the widget's a11y bridge doesn't expose
+    ///   `Component::grab_focus` — the documented GTK4 `Entry` /
+    ///   `Text` situation): fall back to a pointer click at the
+    ///   widget's centre, the same way a user would focus it. Needs
+    ///   `bounds()` from the snapshot; off-screen widgets without
+    ///   layout return an `Error::Atspi` directing the caller to
+    ///   `fill_assume_focused`.
+    ///
+    /// Stale-element and transport errors always propagate. Skip the
+    /// focus step entirely with [`fill_assume_focused`](Self::fill_assume_focused)
+    /// when the widget is already focused through another path —
+    /// useful for off-screen widgets or to avoid the extra pointer
+    /// click round-trip.
     ///
     /// Fills with [`FillMode::default()`]. Use
     /// [`fill_with_opts`](Self::fill_with_opts) when the default select-all
@@ -444,7 +454,47 @@ impl Locator {
     /// Same as [`fill`](Self::fill) but lets the caller pick the select-all
     /// strategy. See [`FillMode`] for the tradeoffs between strategies.
     pub async fn fill_with_opts(&self, text: &str, mode: FillMode) -> Result<()> {
-        self.focus().await?;
+        let info = self.wait_for_focusable().await?;
+        let (bus, path) = info.ref_.clone();
+        let a11y = self.a11y()?;
+        match atspi_client::try_grab_focus_on(a11y, &self.xpath, &bus, &path).await? {
+            atspi_client::FocusOutcome::Granted => {}
+            atspi_client::FocusOutcome::Rejected => {
+                return Err(Error::atspi(format!(
+                    "grab_focus returned false on {bus}{path} — element not focusable"
+                )));
+            }
+            atspi_client::FocusOutcome::NotSupported => {
+                // Documented GTK4 quirk: `GtkEntry` / `GtkText` don't
+                // expose `Component::grab_focus`. Drive focus through
+                // the input layer the way a user would — a pointer
+                // click at the widget's centre. This is what
+                // ergonomically makes `fill` Just Work on a vanilla
+                // `Entry`; the alternative (typing into whatever
+                // currently has focus) silently corrupts unrelated
+                // widgets when our assumption is wrong.
+                let bounds = info.bounds.ok_or_else(|| {
+                    Error::atspi(format!(
+                        "fill: target {} does not expose Component::grab_focus and has no \
+                         bounds to fall back on a pointer click. Pre-focus the widget \
+                         (pointer click, Tab, app-level grab_focus) and use \
+                         fill_assume_focused.",
+                        self.xpath
+                    ))
+                })?;
+                tracing::debug!(
+                    xpath = %self.xpath, %bus, %path,
+                    cx = bounds.center_x(), cy = bounds.center_y(),
+                    "fill: Component::grab_focus not supported; falling back to pointer click"
+                );
+                self.session
+                    .pointer_motion_absolute(bounds.center_x() as f64, bounds.center_y() as f64)
+                    .await?;
+                self.session
+                    .pointer_button(crate::backend::PointerButton::Left)
+                    .await?;
+            }
+        }
         self.clear_and_type(text, mode).await
     }
 

@@ -158,7 +158,7 @@ with `.nth(i)` or a more specific XPath.
 | `drag_to`         | Press, move across an element's center, release — full Wayland drag gesture |
 | `focus`           | Give keyboard focus to an element via AT-SPI `Component::grab_focus`  |
 | `set_text`        | Replace an editable element's contents via `EditableText` (fast, requires the interface) |
-| `fill`            | Focus + clear + type — fallback for widgets without `EditableText` (e.g. `GtkTextView`); supports `assume_focused` opt-out and `caret_nav`/`select_all` clear modes |
+| `fill`            | Focus + clear + type — fallback for widgets without `EditableText` (e.g. `GtkTextView`/`GtkEntry`). Tries AT-SPI `Component::grab_focus` first; widgets whose bridge doesn't expose Component (the documented GTK4 case) fall back to a pointer click at the widget's centre to drive focus through the input layer, the same way a user would. Set `assume_focused: true` to skip the whole focus step when the target is already focused. Supports `caret_nav`/`select_all` clear modes. |
 | `select_option`   | Pick an entry from a Selection-interface container (combo box, list, …) by label or by index |
 | `read_text`       | Read an element's text via the `Text` interface                       |
 | `type_text`       | Type a string into the currently focused element through the input backend |

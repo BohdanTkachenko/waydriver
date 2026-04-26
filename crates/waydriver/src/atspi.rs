@@ -857,6 +857,27 @@ pub async fn scroll_to_point_on(
     }
 }
 
+/// Outcome of an AT-SPI focus request that wants to distinguish "the
+/// widget's a11y bridge doesn't expose this" from "the bridge said no
+/// to this specific request".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusOutcome {
+    /// `Component::grab_focus` returned true — the widget reports it
+    /// took focus.
+    Granted,
+    /// `Component::grab_focus` returned false — widget exists, exposes
+    /// Component, but rejected the request (typically because it
+    /// isn't focusable in its current state).
+    Rejected,
+    /// The widget's a11y bridge doesn't implement the Component
+    /// interface or the `grab_focus` method on it. Common on GTK4
+    /// `Entry` / `Text` widgets, where focus has to be driven through
+    /// the input layer (Tab navigation, pointer click) instead of
+    /// AT-SPI. The keystrokes that follow will land on whatever
+    /// currently holds keyboard focus.
+    NotSupported,
+}
+
 /// Give keyboard focus to the element identified by `(bus, path)` via the
 /// AT-SPI Component interface.
 ///
@@ -882,6 +903,56 @@ pub async fn grab_focus_on(
         )));
     }
     Ok(())
+}
+
+/// Like [`grab_focus_on`] but maps `MethodError` (the Component
+/// interface or `grab_focus` method isn't implemented for this widget)
+/// to [`FocusOutcome::NotSupported`] instead of an error.
+///
+/// Used by `Locator::fill_with_opts` so a missing-Component bridge
+/// doesn't fail the whole fill — that's the documented GTK4 quirk
+/// behind `Entry` and `Text`. Stale-element D-Bus errors still
+/// propagate as [`Error::ElementStale`] via [`map_action_err`];
+/// transport-level failures still propagate as [`Error::Atspi`].
+pub async fn try_grab_focus_on(
+    conn: &zbus::Connection,
+    xpath: &str,
+    bus: &str,
+    path: &str,
+) -> Result<FocusOutcome> {
+    // Building the Component proxy itself doesn't issue a method
+    // call — it only verifies the address shape — so a "this widget
+    // doesn't support Component" error surfaces on `grab_focus()`.
+    let component = build_component(conn, bus, path)
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    match component.grab_focus().await {
+        Ok(true) => Ok(FocusOutcome::Granted),
+        Ok(false) => Ok(FocusOutcome::Rejected),
+        Err(zbus::Error::MethodError(name, _, _)) => {
+            // Stale-element names (UnknownObject / ServiceUnknown /
+            // NoReply / Disconnected) still surface as ElementStale —
+            // those mean the target is gone, not that focus isn't
+            // supported. Everything else (including
+            // `org.freedesktop.DBus.Error.NotSupported` and
+            // `UnknownMethod`) maps to NotSupported because the
+            // widget exists but doesn't expose this AT-SPI method.
+            if is_stale_error_name(name.as_str()) {
+                tracing::debug!(
+                    %xpath, %bus, %path, error_name = %name.as_str(),
+                    "classified D-Bus error as ElementStale during try_grab_focus"
+                );
+                Err(Error::ElementStale {
+                    xpath: xpath.to_string(),
+                    bus: bus.to_string(),
+                    path: path.to_string(),
+                })
+            } else {
+                Ok(FocusOutcome::NotSupported)
+            }
+        }
+        Err(e) => Err(Error::atspi_with("dbus", e)),
+    }
 }
 
 /// Replace the editable-text contents of the element identified by `(bus, path)`.
