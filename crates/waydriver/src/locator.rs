@@ -42,8 +42,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use atspi::connection::AccessibilityConnection;
-
 use crate::atspi as atspi_client;
 use crate::atspi::ElementInfo;
 use crate::error::{Error, Result};
@@ -643,7 +641,7 @@ impl Locator {
             atspi::ScrollType::TopLeft,
             atspi::ScrollType::TopEdge,
         ] {
-            if atspi_client::scroll_to_on(a11y.connection(), &bus, &path, st)
+            if atspi_client::scroll_to_on(a11y, &bus, &path, st)
                 .await
                 .unwrap_or(false)
             {
@@ -655,7 +653,7 @@ impl Locator {
         // inside the scrollable ancestor — the toolkit infers the
         // ancestor and adjusts its adjustment accordingly.
         let _ = atspi_client::scroll_to_point_on(
-            a11y.connection(),
+            a11y,
             &bus,
             &path,
             atspi::CoordType::Window,
@@ -1053,7 +1051,7 @@ impl Locator {
             .any(|s| s == state))
     }
 
-    fn a11y(&self) -> Result<&AccessibilityConnection> {
+    fn a11y(&self) -> Result<&zbus::Connection> {
         self.session
             .a11y_connection
             .as_ref()

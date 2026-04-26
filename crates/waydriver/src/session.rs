@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use atspi::connection::AccessibilityConnection;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
@@ -20,6 +19,17 @@ use crate::locator::Locator;
 /// Fallback default timeout for auto-wait and explicit `wait_for_*` methods
 /// when the `WAYDRIVER_DEFAULT_TIMEOUT_MS` env var isn't set.
 const FALLBACK_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hard cap on [`Session::kill`]. Past this, the future is dropped and the
+/// caller gets [`Error::Timeout`] rather than waiting on a wedged D-Bus
+/// call (compositor `stop()`, recording flush) or a stuck child wait.
+///
+/// Sized to comfortably exceed the worst-case mutter compositor shutdown
+/// (~2-3s on a healthy session) plus a margin for recording-flush. With
+/// AT-SPI proxies capped at the 2s `A11Y_METHOD_TIMEOUT` in `atspi.rs`,
+/// a single in-flight Locator round-trip can't blow this budget on its
+/// own — the cancellation token short-circuits the next iteration.
+const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Environment variable controlling the default wait/auto-wait timeout, in
 /// milliseconds. Overridable per-session via [`Session::set_default_timeout`]
@@ -78,7 +88,7 @@ pub struct Session {
     pub app_name: String,
     pub app_bus_name: String,
     pub app_path: String,
-    pub a11y_connection: Option<AccessibilityConnection>,
+    pub a11y_connection: Option<zbus::Connection>,
     /// Default timeout (in nanoseconds) applied to auto-wait on Locator
     /// actions and explicit `wait_for_*` calls. Stored as AtomicU64 so
     /// [`set_default_timeout`] can mutate it behind an `Arc<Session>`
@@ -255,45 +265,69 @@ impl Session {
     ///    underlying resource down.
     /// 3. Stop the compositor.
     pub async fn kill(mut self) -> Result<()> {
-        tracing::info!(id = self.id, "killing session");
+        let id = self.id.clone();
+        tracing::info!(id = %id, "killing session");
 
-        // Signal the stdout reader to exit cooperatively before we
-        // SIGKILL the app. A leaked grandchild that inherited the
-        // app's stdout pipe would otherwise keep `next_line()`
-        // pending and pin the reader task — plus the
-        // `Arc<AppStdout>` it closes over — past the session's end.
+        // Cancel the token *before* arming the outer timeout so any
+        // tool currently inside `poll_with_retry` short-circuits at
+        // its next iteration rather than racing the kill budget.
         self.cancellation.cancel();
-        if let Some(handle) = self.stdout_reader.take() {
-            // The cooperative path runs first via the token; the
-            // abort here is a hard fallback for the case where the
-            // reader is wedged inside a syscall that doesn't observe
-            // the select.
-            handle.abort();
-            let _ = handle.await;
-        }
 
-        let _ = self.app.kill().await;
-        let _ = self.app.wait().await;
+        // Bound the whole shutdown sequence so a wedged D-Bus call
+        // (compositor stop, recording flush) or a child stuck in
+        // uninterruptible state can't pin the caller indefinitely.
+        // Past KILL_TIMEOUT we surface Error::Timeout; the in-flight
+        // futures are dropped, which for tokio process / D-Bus
+        // primitives means cancellation rather than detached work.
+        let inner = async move {
+            if let Some(handle) = self.stdout_reader.take() {
+                // Cooperative path runs first via the token; the
+                // abort here is a hard fallback for the case where
+                // the reader is wedged inside a syscall that doesn't
+                // observe the select.
+                handle.abort();
+                let _ = handle.await;
+            }
 
-        // Finalize the recording before tearing down the ScreenCast stream so
-        // the muxer still has a live PipeWire node to flush through. Errors
-        // are logged but don't block session teardown.
-        if let Some(recorder) = self.video_recorder.take() {
-            if let Err(e) = self.capture.stop_recording(recorder).await {
-                tracing::warn!(error = %e, "stop_recording failed");
+            let _ = self.app.kill().await;
+            let _ = self.app.wait().await;
+
+            // Finalize the recording before tearing down the ScreenCast
+            // stream so the muxer still has a live PipeWire node to
+            // flush through. Errors are logged but don't block teardown.
+            if let Some(recorder) = self.video_recorder.take() {
+                if let Err(e) = self.capture.stop_recording(recorder).await {
+                    tracing::warn!(error = %e, "stop_recording failed");
+                }
+            }
+
+            // Stop the keepalive ScreenCast stream before dropping backends.
+            if let Some(stream) = self.keepalive_stream.take() {
+                let _ = self.capture.stop_stream(stream).await;
+            }
+
+            self.compositor.stop().await?;
+
+            // self drops here: Drop sees an already-dead app and
+            // already-stopped compositor, then input/capture release
+            // their Arc refs harmlessly.
+            Result::<()>::Ok(())
+        };
+
+        match tokio::time::timeout(KILL_TIMEOUT, inner).await {
+            Ok(res) => res,
+            Err(_) => {
+                tracing::warn!(
+                    id = %id,
+                    timeout_ms = KILL_TIMEOUT.as_millis(),
+                    "kill exceeded budget; abandoning shutdown"
+                );
+                Err(Error::Timeout(format!(
+                    "session {id} kill exceeded {}s budget",
+                    KILL_TIMEOUT.as_secs()
+                )))
             }
         }
-
-        // Stop the keepalive ScreenCast stream before dropping backends.
-        if let Some(stream) = self.keepalive_stream.take() {
-            let _ = self.capture.stop_stream(stream).await;
-        }
-
-        self.compositor.stop().await?;
-
-        // self drops here: Drop sees an already-dead app and already-stopped
-        // compositor, then input/capture release their Arc refs harmlessly.
-        Ok(())
     }
 
     /// Send a key press + release for the given X11 keysym.
@@ -767,7 +801,7 @@ fn app_name_matches(found: &str, target: &str) -> bool {
     norm_found.contains(&norm_target) || norm_target.contains(&norm_found)
 }
 
-async fn wait_for_app(conn: &AccessibilityConnection, app_name: &str) -> Result<(String, String)> {
+async fn wait_for_app(conn: &zbus::Connection, app_name: &str) -> Result<(String, String)> {
     let total_polls =
         (APP_DISCOVERY_TIMEOUT.as_millis() / APP_DISCOVERY_POLL_INTERVAL.as_millis()) as usize;
     // Log the registry snapshot ~5 times over the wait so a stuck
@@ -784,9 +818,7 @@ async fn wait_for_app(conn: &AccessibilityConnection, app_name: &str) -> Result<
                     };
                     let path = child_ref.path_as_str();
 
-                    if let Ok(child) =
-                        atspi_client::build_accessible(conn.connection(), bus_name, path).await
-                    {
+                    if let Ok(child) = atspi_client::build_accessible(conn, bus_name, path).await {
                         if let Ok(name) = child.name().await {
                             if app_name_matches(&name, app_name) {
                                 tracing::info!(

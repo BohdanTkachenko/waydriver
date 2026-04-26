@@ -1,4 +1,3 @@
-use atspi::connection::AccessibilityConnection;
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
 use atspi::proxy::bus::BusProxy;
@@ -12,11 +11,37 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use sxd_document::parser;
 use sxd_xpath::{Context, Factory, Value};
 use zbus::proxy::CacheProperties;
 
 use crate::error::{Error, Result};
+
+/// Per-method reply timeout applied to every proxy on the a11y bus.
+///
+/// AT-SPI calls target the *target application's* bridge, so when the
+/// app crashes after a Locator has resolved a `(bus, path)` reference,
+/// any in-flight call against that bridge waits out the connection's
+/// reply timeout. zbus' default (~25s) is a long way to hang
+/// `kill_session`, and it dominates [`Locator`](crate::Locator)
+/// cancellation latency: `poll_with_retry` checks the cancellation
+/// token only at iteration boundaries, so a single stuck call adds the
+/// full reply timeout to the kill latency before the next poll
+/// observes the cancel.
+///
+/// 2s is short enough that a worst-case `kill_session` waits at most
+/// one in-flight call (the rest short-circuit on the token), and long
+/// enough that a momentarily-busy live widget rarely trips it. Calls
+/// that *do* time out surface as `MethodError(NoReply)`, which
+/// `is_stale_error_name` already classifies as retriable — so the
+/// behavior matches the existing "widget went away" path.
+///
+/// Compositor (mutter RemoteDesktop) and PipeWire connections keep the
+/// zbus default: their slow paths (`CreateSession`, ScreenCast
+/// negotiation) are bursty by design, and shrinking their timeout
+/// would risk false `NoReply`s on a healthy session.
+const A11Y_METHOD_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Screen-relative rectangle for an accessibility element, in logical
 /// pixels. All four fields are i32 to match AT-SPI's native types (which
@@ -190,7 +215,12 @@ async fn build_collection<'a>(
 // ── Connection ──────────────────────────────────────────────────────────────
 
 /// Connect to the AT-SPI accessibility bus for a given D-Bus session.
-pub async fn connect_a11y(dbus_address: &str) -> Result<AccessibilityConnection> {
+///
+/// Returns the raw [`zbus::Connection`] (not [`atspi::connection::AccessibilityConnection`])
+/// so we can configure [`A11Y_METHOD_TIMEOUT`] on it via the connection
+/// builder — the upstream wrapper offers no public hook for that, and
+/// we don't use its registry/event-stream sugar anywhere.
+pub async fn connect_a11y(dbus_address: &str) -> Result<zbus::Connection> {
     let session_addr: zbus::address::Address = dbus_address
         .try_into()
         .map_err(|e: zbus::Error| Error::atspi_with("invalid dbus address", e))?;
@@ -205,7 +235,9 @@ pub async fn connect_a11y(dbus_address: &str) -> Result<AccessibilityConnection>
         .as_str()
         .try_into()
         .map_err(|e: zbus::Error| Error::atspi_with("invalid a11y bus address", e))?;
-    let a11y_conn = AccessibilityConnection::from_address(a11y_addr)
+    let a11y_conn = zbus::connection::Builder::address(a11y_addr)?
+        .method_timeout(A11Y_METHOD_TIMEOUT)
+        .build()
         .await
         .map_err(|e| Error::atspi_with("failed to connect to a11y bus", e))?;
 
@@ -213,9 +245,9 @@ pub async fn connect_a11y(dbus_address: &str) -> Result<AccessibilityConnection>
 }
 
 /// Get the root accessible node from the AT-SPI registry.
-pub async fn get_registry_root(conn: &AccessibilityConnection) -> Result<AccessibleProxy<'_>> {
+pub async fn get_registry_root(conn: &zbus::Connection) -> Result<AccessibleProxy<'_>> {
     build_accessible(
-        conn.connection(),
+        conn,
         "org.a11y.atspi.Registry",
         "/org/a11y/atspi/accessible/root",
     )
@@ -336,25 +368,17 @@ const EMITTED_STATES: &[(State, &str)] = &[
 /// evaluator reads this after matching to recover the AT-SPI identity of
 /// each matched node.
 pub async fn snapshot_tree(
-    conn: &AccessibilityConnection,
+    conn: &zbus::Connection,
     app_bus_name: &str,
     app_path: &str,
 ) -> Result<String> {
-    let app_root = build_accessible(conn.connection(), app_bus_name, app_path)
+    let app_root = build_accessible(conn, app_bus_name, app_path)
         .await
         .map_err(|e| Error::atspi_with("failed to get app root", e))?;
 
     let mut output = String::new();
     output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    snapshot_node(
-        conn.connection(),
-        &app_root,
-        app_bus_name,
-        app_path,
-        0,
-        &mut output,
-    )
-    .await;
+    snapshot_node(conn, &app_root, app_bus_name, app_path, 0, &mut output).await;
     Ok(output)
 }
 
@@ -726,12 +750,12 @@ fn is_stale_error_name(name: &str) -> bool {
 /// redraws. Callers driving a test session must follow up with a
 /// RemoteDesktop event to force a repaint.
 pub async fn do_action_on(
-    conn: &AccessibilityConnection,
+    conn: &zbus::Connection,
     xpath: &str,
     bus: &str,
     path: &str,
 ) -> Result<()> {
-    let action = build_action(conn.connection(), bus, path)
+    let action = build_action(conn, bus, path)
         .await
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
 
@@ -840,12 +864,12 @@ pub async fn scroll_to_point_on(
 /// Component or when `grab_focus` returned false (the toolkit rejected the
 /// focus request — typically because the element isn't focusable).
 pub async fn grab_focus_on(
-    conn: &AccessibilityConnection,
+    conn: &zbus::Connection,
     xpath: &str,
     bus: &str,
     path: &str,
 ) -> Result<()> {
-    let component = build_component(conn.connection(), bus, path)
+    let component = build_component(conn, bus, path)
         .await
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
     let ok = component
@@ -862,13 +886,13 @@ pub async fn grab_focus_on(
 
 /// Replace the editable-text contents of the element identified by `(bus, path)`.
 pub async fn set_text_on(
-    conn: &AccessibilityConnection,
+    conn: &zbus::Connection,
     xpath: &str,
     bus: &str,
     path: &str,
     text: &str,
 ) -> Result<()> {
-    let et = build_editable_text(conn.connection(), bus, path)
+    let et = build_editable_text(conn, bus, path)
         .await
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
     let ok = et
@@ -893,13 +917,13 @@ pub async fn set_text_on(
 /// from `(bus, path)` going stale between resolution and the call
 /// produces `Error::ElementStale` via [`map_action_err`].
 pub async fn select_child_on(
-    conn: &AccessibilityConnection,
+    conn: &zbus::Connection,
     xpath: &str,
     bus: &str,
     path: &str,
     index: i32,
 ) -> Result<()> {
-    let sel = build_selection(conn.connection(), bus, path)
+    let sel = build_selection(conn, bus, path)
         .await
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
     let ok = sel
@@ -919,12 +943,12 @@ pub async fn select_child_on(
 /// Read the full text contents of the element identified by `(bus, path)`
 /// via the Text interface.
 pub async fn read_text_on(
-    conn: &AccessibilityConnection,
+    conn: &zbus::Connection,
     xpath: &str,
     bus: &str,
     path: &str,
 ) -> Result<String> {
-    let t = build_text(conn.connection(), bus, path)
+    let t = build_text(conn, bus, path)
         .await
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
     let n = t

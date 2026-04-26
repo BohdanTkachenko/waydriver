@@ -983,3 +983,65 @@ async fn fixture_locator_drag_to_drops_payload() -> anyhow::Result<()> {
     kill(session).await?;
     Ok(())
 }
+
+/// `Session::cancel` interrupts a stuck `wait_for_visible` against a real
+/// mutter + GTK4 fixture within ~1s — the integration counterpart to the
+/// mocked-backend tests in `locator::tests::poll_with_retry_*`.
+///
+/// Without this, a future refactor that quietly drops the cancellation
+/// token from `poll_with_retry` (or replaces a method that takes
+/// `&CancellationToken`) wouldn't be caught by the unit suite, and a
+/// real `kill_session` would silently regress to waiting out the full
+/// 30s deadline.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_session_cancel_interrupts_wait_for_visible() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Selector that's structurally valid but will never match — forces the
+    // locator into the auto-wait poll loop until the deadline or a cancel.
+    let locator = session
+        .locate("//*[@name='nonexistent-widget-for-cancel-test']")
+        .with_timeout(Duration::from_secs(30));
+
+    // Drive the wait on a separate task so we can fire `cancel()` from the
+    // test thread while it's parked inside `poll_with_retry`. The session
+    // clone is moved into the task and dropped on its return, so `kill()`
+    // below sees a unique Arc.
+    let session_for_wait = session.clone();
+    let waiter = tokio::spawn(async move {
+        let _keep = session_for_wait;
+        locator.wait_for_visible().await
+    });
+
+    // Give the auto-wait one full poll iteration (initial delay is well
+    // under 100ms) so the cancel races a parked sleep, not an empty loop.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let cancel_at = std::time::Instant::now();
+    session.cancel();
+
+    // Bound the join so a regression doesn't hang the test process;
+    // failure surfaces as the outer Timeout instead.
+    let result = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+    let elapsed = cancel_at.elapsed();
+
+    let join_outcome = result.map_err(|_| {
+        anyhow::anyhow!(
+            "wait_for_visible did not return within 2s of cancel — cancellation propagation regressed"
+        )
+    })?;
+    let inner = join_outcome.map_err(|e| anyhow::anyhow!("waiter task panicked: {e}"))?;
+    match inner {
+        Err(Error::Cancelled) => {}
+        Err(other) => anyhow::bail!("expected Error::Cancelled, got {other:?}"),
+        Ok(()) => anyhow::bail!("wait_for_visible returned Ok on a never-matching selector"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "cancel should propagate quickly; elapsed = {elapsed:?}"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
