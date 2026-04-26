@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.2](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.2.1...waydriver-v0.2.2) - 2026-04-26
+
+### Added
+
+- *(locator)* pointer-click fallback when fill target lacks Component::grab_focus
+- *(input)* thread CancellationToken through InputBackend for prompt kill
+- *(locator)* element-scoped pointer actions (hover, double_click, right_click, drag_to)
+- *(locator)* Locator::select_option via AT-SPI Selection interface
+- *(input)* Locator::scroll_into_view with AT-SPI + wheel fallbacks
+- *(input)* Locator::fill(), absolute pointer motion, Session::type_text (WAY-5)
+- *(atspi)* capture element bounds via Component::get_extents
+
+### Fixed
+
+- *(mcp)* kill_session no longer blocks on in-flight tool auto-waits
+
+### Other
+
+- release v0.2.1
+- refresh AGENTS.md and README.md for current API surface
+- workspace-wide audit pass tightening trait surfaces and error types
+- *(mcp)* split tool handlers into per-concern modules
+- *(mcp)* split monolithic main.rs into focused modules
+- split e2e tests into waydriver-e2e crate, add configurable video_fps
+- *(error)* preserve typed error sources on Atspi/Process/Screenshot
+- *(compositor-mutter)* separate doc paragraph before stage rationale
+
 ## [0.2.1](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.2.0...waydriver-v0.2.1) - 2026-04-26
 
 ### Added
