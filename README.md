@@ -70,7 +70,9 @@ use waydriver_capture_mutter::MutterCapture;
 
 let mut compositor = MutterCompositor::new();
 compositor.start(None).await?;
-let state = compositor.state();
+// `state()` is `Option`; immediately after a successful `start()` it is
+// always `Some` — `expect` documents that invariant locally.
+let state = compositor.state().expect("state available after start");
 let input = MutterInput::new(state.clone());
 let capture = MutterCapture::new(state);
 
@@ -122,15 +124,17 @@ about stale element handles. Common methods:
 
 | Method                                     | What it does                                     |
 | ------------------------------------------ | ------------------------------------------------ |
-| `click()`                                  | Invoke the AT-SPI `Action` interface             |
-| `focus()`                                  | Call `Component::grab_focus` if supported        |
-| `set_text(s)` / `text()`                   | Read/write via `EditableText` / `Text` interfaces |
-| `count()` / `all()`                        | Multi-match: element count, list of locators     |
-| `attribute(k)` / `attributes()`            | Read AT-SPI attributes                           |
+| `click()` / `double_click()` / `right_click()` | Invoke the AT-SPI `Action` interface (primary, secondary, tertiary actions) |
+| `hover()` / `drag_to(target)`              | Pointer-driven hover and drag — lands on real Wayland input events for repaint |
+| `focus()` / `scroll_into_view()`           | `Component::grab_focus` and `scroll_to`/`scroll_to_point` |
+| `set_text(s)` / `fill(s)`                  | Direct `EditableText` write vs. focus-and-type fallback for widgets without `EditableText` (e.g. `GtkTextView`) |
+| `select_option(by)`                        | Pick a child of a Selection-interface container by label or index |
+| `text()`                                   | Read via the `Text` interface                    |
+| `count()` / `all()` / `inspect_all()`      | Multi-match: count, list of locators, full metadata in one snapshot |
+| `name()` / `role()` / `attribute(k)` / `attributes()` / `bounds()` | Accessible name, role, AT-SPI attributes, screen-relative bounds |
 | `is_showing()` / `is_enabled()`            | State predicates                                 |
-| `name()` / `role()`                        | Accessible name + role                           |
-| `wait_for_visible()` / `_hidden()` / `_enabled()` | Block until the state holds                      |
-| `wait_for_count(n)` / `wait_for_text(pred)` | Block until a predicate matches                  |
+| `wait_for_visible()` / `_hidden()` / `_enabled()` / `_count(n)` / `_text(pred)` | Block until state or predicate holds |
+| `wait_for(pred)` / `wait_until(pred)` / `wait_until_async(pred)` | General-purpose predicate auto-waits  |
 | `with_timeout(d)`                          | Per-call override of the auto-wait timeout        |
 | `nth(i)` / `first()` / `last()` / `parent()` / `locate(sub_xpath)` | Compose sub-locators |
 
@@ -149,9 +153,13 @@ with `.nth(i)` or a more specific XPath.
 | `kill_session`    | Tear down a session and clean up all child processes                  |
 | `dump_tree`       | Dump the AT-SPI accessibility tree as XML — each node carries a `_ref` you can target with `query`/`click`/etc. |
 | `query`           | Evaluate an XPath over the tree; returns every match's role, name, attributes, and states |
-| `click`           | Click an element selected by XPath (via AT-SPI `Action` interface). Auto-waits for visibility + enablement. |
+| `click` / `double_click` / `right_click` | Invoke an element's primary / secondary / tertiary AT-SPI `Action`. Auto-waits for visibility + enablement. |
+| `hover`           | Move the pointer to an element's center — drives a real Wayland motion event so hover-state UI repaints |
+| `drag_to`         | Press, move across an element's center, release — full Wayland drag gesture |
 | `focus`           | Give keyboard focus to an element via AT-SPI `Component::grab_focus`  |
-| `set_text`        | Replace an editable element's contents via `EditableText`             |
+| `set_text`        | Replace an editable element's contents via `EditableText` (fast, requires the interface) |
+| `fill`            | Focus + clear + type — fallback for widgets without `EditableText` (e.g. `GtkTextView`); supports `assume_focused` opt-out and `caret_nav`/`select_all` clear modes |
+| `select_option`   | Pick an entry from a Selection-interface container (combo box, list, …) by label or by index |
 | `read_text`       | Read an element's text via the `Text` interface                       |
 | `type_text`       | Type a string into the currently focused element through the input backend |
 | `press_key`       | Press a named key or chord (`Return`, `Ctrl+A`, `Shift+Tab`, `Escape`, …) |

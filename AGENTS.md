@@ -158,8 +158,10 @@ The project is a Cargo workspace under `crates/` with the naming convention `way
 
 ```rust
 let mut compositor = MutterCompositor::new();
-compositor.start().await?;              // spawns dbus, pipewire, wireplumber, mutter
-let state = compositor.state();         // Arc<MutterState> — D-Bus conn + RD path + runtime dir
+compositor.start(None).await?;          // spawns dbus, pipewire, wireplumber, mutter
+// state() is Option<Arc<MutterState>>; always Some immediately after a
+// successful start(). Expect documents the invariant locally.
+let state = compositor.state().expect("state available after start");
 let input = MutterInput::new(state.clone());
 let capture = MutterCapture::new(state);
 let session = Session::start(Box::new(compositor), Box::new(input), Box::new(capture), cfg).await?;
@@ -169,13 +171,16 @@ let session = Session::start(Box::new(compositor), Box::new(input), Box::new(cap
 
 ### `Session::kill` drop ordering — load-bearing
 
-`Session::kill` destructures `self` and shuts down in this order:
+`Session::kill` cancels the cooperative `CancellationToken` first, then runs the rest under a `KILL_TIMEOUT` (5s) `tokio::time::timeout` so a wedged D-Bus call surfaces as `Error::Timeout` instead of hanging the caller. Inside the budget:
 
-1. Kill the **app** first — its Wayland connection holds a reference into mutter.
-2. **Drop input and capture** — for mutter, this releases `Arc<MutterState>` strong refs before the D-Bus connection is torn down.
-3. Call **`compositor.stop()`** — kills mutter/pipewire/wireplumber, terminates the private dbus-daemon, removes the runtime dir.
+1. Abort + await the **stdout reader** `JoinHandle` — drops the `Arc<AppStdout>` even when a leaked grandchild has inherited the app's stdout pipe.
+2. Kill the **app** — its Wayland connection holds a reference into mutter.
+3. **Stop the video recorder** (if any) — sends EOS so `webmmux` writes the seekhead before the source disappears.
+4. **Stop the keepalive ScreenCast stream** — must run before the backends drop, while mutter and the PipeWire node are still alive.
+5. Call **`compositor.stop()`** — kills mutter/pipewire/wireplumber, terminates the private dbus-daemon, removes the runtime dir.
+6. `self` drops: input/capture release their `Arc<MutterState>` refs after the compositor is already down (harmless).
 
-The `Session` struct's field declaration order mirrors this sequence so implicit `Drop` is also safe. **Do not reorder the fields.**
+The `Session` struct's field declaration order mirrors this sequence so the implicit `Drop` path (used when `kill` was never called or panicked mid-shutdown) is also safe. **Do not reorder the fields.** `Drop` itself only cancels the token, aborts the reader handle, and `start_kill`s the app — async cleanup belongs in `kill`.
 
 ### `Arc<MutterState>` sharing invariant
 
@@ -185,19 +190,21 @@ The `Session` struct's field declaration order mirrors this sequence so implicit
 
 GTK4's built-in AT-SPI backend hard-codes to the host session bus and ignores custom `DBUS_SESSION_BUS_ADDRESS`. So the code holds two D-Bus connections per session:
 
-- `a11y_connection` (in `Session`) — host session bus → AT-SPI registry → the app's accessible tree.
-- `MutterState::conn` — private bus → mutter's ScreenCast and RemoteDesktop interfaces.
+- `a11y_connection` (in `Session`) — host session bus → AT-SPI registry → the app's accessible tree. Built directly as a `zbus::Connection` (not the upstream `AccessibilityConnection` wrapper) so we can configure `method_timeout(A11Y_METHOD_TIMEOUT = 2s)` — this caps how long a stuck D-Bus call against a crashed app's bridge can hang `kill_session` / a Locator wait. NoReply errors at this timeout map to `Error::ElementStale` via the existing classifier, so the retry path stays unchanged.
+- `MutterState::conn` — private bus → mutter's ScreenCast and RemoteDesktop interfaces. Keeps zbus' default reply timeout: compositor calls (`CreateSession`, ScreenCast negotiation) are bursty by design.
 
 When editing session setup, keep this invariant: the **app** gets the host bus; **mutter/pipewire/wireplumber** get the private bus. Mixing them will silently break either accessibility or input/screencast.
 
-### Click = AT-SPI action + input wake
+### AT-SPI actions vs. real input
 
-After AT-SPI `do_action(0)` (invoked by `Locator::click`), the caller should send a harmless Shift_L press/release through the input backend. This wakes GTK4's GLib main loop, flushing pending widget invalidations so the framebuffer reflects the click. Without this, screenshots after clicks are stale.
+- `Locator::click` / `double_click` / `right_click` call AT-SPI's `Action.DoAction(n)` directly. Fast and precise but updates GTK4's internal model without a compositor redraw, so a screenshot taken immediately after may show a stale frame. Pair with `press_key` / `pointer_*` / `hover` / `drag_to` when the test needs to assert on a repainted UI.
+- `Locator::hover` and `Locator::drag_to` go through the input backend's pointer motion + button primitives, so they drive a real Wayland event and the frame clock ticks.
 
-### Text input vs. key press
+### Text input and chords
 
-- `press_key` and `type_text` both go through `Session::press_keysym` → the input backend. Text input sends each `char` individually via `char_to_keysym` (Latin-1 maps directly, other Unicode uses the `0x01000000 + codepoint` keysym encoding).
-- `key_name_to_keysym` in `waydriver::keysym` handles named keys (Return, Tab, F1–F12, arrows, etc.). Modifier-only keys (`ctrl`, `shift`, `alt`, `super`) intentionally return `None` — the API currently has no modifier/chord support.
+- `press_key` and `type_text` both go through `Session::press_keysym` → the input backend. Text input sends each `char` individually via `char_to_keysym` (Latin-1 maps directly, other Unicode uses the `0x01000000 + codepoint` keysym encoding). The loop checks the session's `CancellationToken` between characters so a long string bails on `kill_session`.
+- `Session::press_chord` parses strings like `"Ctrl+Shift+S"` via `keysym::parse_chord`, holds modifiers via `InputBackend::key_down`/`key_up`, and presses the target key in between. The unwind always releases held modifiers — even if the target press fails — so a panicked chord can't leave keys stuck down.
+- `key_name_to_keysym` in `waydriver::keysym` handles named keys (Return, Tab, F1–F12, arrows, etc.). Modifier-only names (`ctrl`, `shift`, `alt`, `super`) map to their left-side keysyms via `parse_chord` and are not exposed as standalone `press_key` targets.
 
 ### Screenshot pipeline
 
@@ -221,7 +228,8 @@ The screenshot and recording pipelines both read `PIPEWIRE_REMOTE` and `XDG_RUNT
 
 - `crates/waydriver-mcp/src/main.rs` wires `UiTestServer` to stdio via `rmcp`. **All logging must go to stderr** — stdout is the JSON-RPC transport. `tracing_subscriber` is configured with `with_writer(std::io::stderr)`; don't `println!` anywhere.
 - Uses `rmcp`'s `#[tool_router]` / `#[tool]` macros. Each tool method takes `Parameters<T>` where `T` derives `Deserialize + JsonSchema` — the schema is what the MCP client (Claude) sees.
-- Session state lives in `Arc<RwLock<HashMap<String, ManagedSession>>>`, where `ManagedSession` wraps the underlying `Session` plus a per-session `report_dir`, an atomic screenshot counter, and an `events: Mutex<Vec<serde_json::Value>>` that guards both the on-disk `events.jsonl` (append) and the atomically-rewritten `events.js` (replace). Read-only tools take a `.read()` lock, `start_session`/`kill_session` take `.write()`.
+- Session state lives in `Arc<RwLock<HashMap<String, Arc<ManagedSession>>>>`. `ManagedSession` wraps the underlying `Session` plus a per-session `report_dir`, an atomic screenshot counter, an `events: Mutex<EventLog>` (a bounded ring with a 1024-event cap on the resident `VecDeque` plus a monotonic total counter — guards both the append-only `events.jsonl` and the atomically-rewritten `events.js`), and a per-session `kill_lock: Arc<RwLock<()>>` drain.
+- Tool calls go through `UiTestServer::acquire(session_id)` which (1) clones the `Arc<ManagedSession>` out under the map's read lock, (2) takes `kill_lock.read_owned()` to block any concurrent `kill_session`. The returned `InFlightSession` derefs to `ManagedSession` and releases both locks on drop. `kill_session` removes from the map under write, `cancellation.cancel()`s the session, then takes `kill_lock.write_owned()` to drain in-flight tools before tearing down — so `Arc::try_unwrap` on the session is deterministically the unique reference.
 - Report output path is configurable via the `--report-dir` CLI flag / `WAYDRIVER_REPORT_DIR` env var (default `/tmp/waydriver`), or per-session via `start_session`'s optional `report_dir` argument. Each session directory holds `{session_id}-{n}.png` (screenshots), `{session_id}.webm` (recording), `events.jsonl` / `events.js` (event log), and `index.html` (viewer). The virtual-monitor geometry is configurable via `--resolution` / `WAYDRIVER_RESOLUTION` (default `1024x768`), or per-session via `start_session`'s optional `resolution` argument (format `WIDTHxHEIGHT`).
 - Session recording is on by default. `--record-video <bool>` / `WAYDRIVER_RECORD_VIDEO` (default `true`) sets the server-wide default; `start_session`'s optional `record_video: bool` overrides it per session. Recording requires `report: true` since the `.webm` lives in the session's report dir. Bitrate is tuned via `--video-bitrate` / `WAYDRIVER_VIDEO_BITRATE` (default `2_000_000` bits/sec) or `start_session`'s optional `video_bitrate: u32`.
 - Every session-scoped tool handler **must call `ManagedSession::log_event`** (or `append_event` for `kill_session`, which has to destructure first). That single call appends to `events.jsonl` and atomically rewrites `events.js` (tempfile + rename) so the static viewer sees new events on its next `<script src>` reload. Logging errors are swallowed via `tracing::warn!` and never mask the real tool result.
@@ -235,27 +243,19 @@ Inside the MCP binary, errors are mapped to `rmcp::ErrorData` via `McpError::int
 
 ## Testing notes
 
-Unit tests live inside `#[cfg(test)] mod tests` blocks:
-- `waydriver::error::tests` — error display and From impls.
-- `waydriver::keysym::tests` — keysym mapping tables.
-- `waydriver::session::tests` — app name normalization and matching.
-- `waydriver::capture::tests` — pipeline string building and path validation.
-- `waydriver_compositor_mutter::tests` — D-Bus output parsing, Wayland socket wait, constructor properties.
-- `waydriver_mcp::tests` — MCP tool error paths + success paths with mock backends.
+Unit tests live inside `#[cfg(test)] mod tests` blocks at the bottom of each module:
+- `waydriver::error` / `keysym` / `capture` — error display and `From` impls, keysym tables, GStreamer pipeline-string assembly.
+- `waydriver::atspi` — XML snapshot + XPath evaluation, role/attr sanitization, `is_stale_error_name` classifier, `Rect` / `bbox` round-trip + containment.
+- `waydriver::locator` — `poll_with_retry` semantics (success, retriable swallowing, timeout, fatal-error pass-through, cancellation), state predicate composition.
+- `waydriver::session` — app-name normalization/matching, `press_chord` modifier ordering + unwind, `type_text` cancellation, stdout-buffer wait and notify, default-timeout env parsing.
+- `waydriver_compositor_mutter` — D-Bus output parsing, Wayland and PipeWire socket-readiness polls, resolution parsing, `state()`-before-`start()` invariant.
+- `waydriver_mcp` (`main`, `report`, `params`, `mcp_error`, `cli`) — tool error paths + success with mock backends, `EventLog` ring behaviour, parameter deserialization, error mapping, CLI/env resolution.
 
 These tests are pure — they don't spawn mutter or touch D-Bus — so `cargo test --workspace` runs fast and works without the full runtime stack.
 
 End-to-end tests exercise the full stack (mutter, pipewire, AT-SPI, target app):
 
-**Library e2e** (`crates/waydriver-e2e/tests/e2e.rs`) — all against the project's own `waydriver-fixture-gtk` binary:
-- `fixture_exposes_{gtk4,adw,dnd}_widgets` — per-section tree diagnostic assertions.
-- `fixture_click_emits_stdout_event` — click via Locator, verify signal handler fired via fixture stdout.
-- `fixture_toggle_changes_screenshot` — locator action → pixel diff.
-- `fixture_tree_and_locator_features` — tree dump, count, wait_for_visible, ElementNotFound shape.
-- `fixture_keyboard_chord_dispatches_modifiers` — end-to-end chord dispatch, modifier release.
-- `fixture_main_menu_opens_auto_waits` — Locator auto-wait through a state transition.
-- `fixture_pointer_input_operations` — pointer motion and button input primitives.
-- `#[ignore]` — spawn mutter + pipewire. Run with `--ignored --test-threads=1`. Run `cargo build -p waydriver-fixture-gtk` first.
+**Library e2e** (`crates/waydriver-e2e/tests/e2e.rs`) — all against the project's own `waydriver-fixture-gtk` binary. Each is `#[ignore]`-gated; run with `--ignored --test-threads=1` after `cargo build -p waydriver-fixture-gtk`. The current set covers per-section tree diagnostics (gtk4 / adw / dnd), click → stdout event, element bounds sanity, `scroll_into_view` no-op, locator-action → pixel diff, full tree+locator feature surface, keyboard chord dispatch + modifier-release, main-menu auto-wait, pointer motion (relative + absolute) and button primitives, `Locator::fill` on entry widgets, hover, double-click, right-click, drag-to, and `Session::cancel` interrupting a stuck `wait_for_visible` within ~1s.
 
 **MCP e2e** (`crates/waydriver-mcp/tests/e2e.rs`) — one Docker-based test:
 - `fixture_via_docker` — spawns `docker run -i waydriver-mcp-e2e:latest` and exercises the full MCP tool surface against the `waydriver-fixture-gtk` binary running inside the container. `#[ignore]` — requires pre-built Docker image. **Runs in CI** via the `e2e` job in `.github/workflows/ci.yml`.
