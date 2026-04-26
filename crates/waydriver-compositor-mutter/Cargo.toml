@@ -13,7 +13,7 @@ keywords = ["wayland", "mutter", "headless", "testing", "compositor"]
 categories = ["development-tools::testing"]
 
 [dependencies]
-waydriver = { path = "../waydriver", version = "0.2.0" }
+waydriver = { path = "../waydriver", version = "0.2.1" }
 async-trait.workspace = true
 libc.workspace = true
 thiserror.workspace = true
