@@ -58,6 +58,7 @@ pub(crate) enum MutterError {
     ///   transport).
     /// - `"connect"` — `Builder::build().await` couldn't reach the
     ///   bus (handshake / auth / socket).
+    ///
     /// Carrying the stage avoids needing two near-identical
     /// variants while keeping the failure point identifiable in
     /// logs and `source` walks.
