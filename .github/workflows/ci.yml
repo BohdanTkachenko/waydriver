@@ -97,3 +97,22 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Run Docker-based e2e test
         run: cargo test -p waydriver-mcp --test e2e -- --ignored fixture_via_docker --test-threads=1
+
+  examples:
+    name: docker examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build examples Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime-examples
+          tags: waydriver-examples:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run gnome_calculator example
+        run: docker run --rm waydriver-examples:latest gnome_calculator

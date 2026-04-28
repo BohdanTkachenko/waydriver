@@ -8,6 +8,7 @@ members = [
     "crates/waydriver-mcp",
     "crates/waydriver-fixture-gtk",
     "crates/waydriver-e2e",
+    "crates/waydriver-examples",
 ]
 
 [workspace.package]

@@ -21,7 +21,8 @@ FROM builder-base AS builder
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p waydriver-mcp -p waydriver-fixture-gtk
+RUN cargo build --release -p waydriver-mcp -p waydriver-fixture-gtk \
+    && cargo build --release -p waydriver-examples --example gnome_calculator
 
 # Stage 3: Base runtime image — shared pieces for both production and e2e.
 FROM fedora:42 AS runtime-base
@@ -50,3 +51,13 @@ FROM runtime-base AS runtime-e2e
 
 RUN dnf install -y gtk4 libadwaita && dnf clean all
 COPY --from=builder /src/target/release/waydriver-fixture-gtk /usr/local/bin/
+
+# Stage 4c: examples image — adds gnome-calculator and the example
+# binaries from `crates/waydriver-examples`. The CI `examples` job
+# runs the example end-to-end against this image; locally reproduce
+# via `docker build --target runtime-examples -t waydriver-examples .`
+# and `docker run --rm waydriver-examples gnome_calculator`.
+FROM runtime-base AS runtime-examples
+
+RUN dnf install -y gtk4 libadwaita gnome-calculator && dnf clean all
+COPY --from=builder /src/target/release/examples/gnome_calculator /usr/local/bin/

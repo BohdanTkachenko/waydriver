@@ -40,6 +40,7 @@ The `Dockerfile` (Fedora 42, multi-stage) produces two publishable images from t
 |-------|-------------------|----------|
 | `waydriver-mcp` | final (default) | Runtime: mutter, pipewire, gstreamer, AT-SPI, dbus + waydriver-mcp binary |
 | `waydriver-mcp-builder` | `builder-base` | Build env: Fedora 42 + Rust (rustup) + gcc + GTK4/GLib/GStreamer/PipeWire dev headers |
+| `waydriver-examples` | `runtime-examples` | Runtime + gnome-calculator + the example binary from `crates/waydriver-examples` |
 
 Both are published to `ghcr.io/bohdantkachenko/` on each release and on push to main.
 
@@ -270,6 +271,7 @@ CI (`.github/workflows/ci.yml`) does not use Nix — it uses standard `apt-get` 
 | `clippy` | `cargo clippy -- -D warnings` (needs system dev headers) |
 | `test` | `cargo test --workspace` (unit tests only, no `--ignored`) |
 | `e2e` | Builds `waydriver-mcp-e2e` Docker image, runs `fixture_via_docker` |
+| `examples` | Builds `waydriver-examples` Docker image, runs the `gnome_calculator` example end-to-end |
 
 Docker images are published to ghcr.io via `.github/workflows/publish-docker.yml` on push to main (`:main` tag) and on release tags (`:latest`, `:<version>`, `:<minor>`, `:<major>`).
 
