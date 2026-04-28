@@ -9,6 +9,12 @@ A Rust library for headless GUI application testing on Wayland. Launches apps in
 
 The repo also contains `waydriver-mcp`, a standalone MCP server binary built on top of the library that lets AI assistants drive GTK4 apps directly — see [MCP server](#mcp-server) below.
 
+## Demo
+
+The clip below is the full output of [`crates/waydriver-examples/examples/gnome_calculator.rs`](crates/waydriver-examples/examples/gnome_calculator.rs), runnable with `cargo run -p waydriver-examples --example gnome_calculator`. Read the source for the API surface in context — it covers a session lifecycle, AT-SPI button clicks, keyboard chord dispatch (`Shift+9`/`Shift+0` for parens), a typed unit conversion, and per-step result verification via XPath locators. The recording is captured by waydriver itself via PipeWire.
+
+<video src="https://github.com/user-attachments/assets/96480250-0e78-4cd7-8228-d5e0620b4ca1" controls width="640"></video>
+
 ## How it works
 
 Each test session creates an isolated environment with a headless compositor, input injection, and screen capture:
