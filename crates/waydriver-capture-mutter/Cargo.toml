@@ -13,8 +13,8 @@ keywords = ["wayland", "mutter", "screencast", "pipewire", "testing"]
 categories = ["development-tools::testing", "multimedia::images"]
 
 [dependencies]
-waydriver = { path = "../waydriver", version = "0.2.2" }
-waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter", version = "0.2.2" }
+waydriver = { path = "../waydriver", version = "0.2.3" }
+waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter", version = "0.2.3" }
 async-trait.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
