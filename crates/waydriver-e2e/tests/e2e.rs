@@ -1045,3 +1045,29 @@ async fn fixture_session_cancel_interrupts_wait_for_visible() -> anyhow::Result<
     kill(session).await?;
     Ok(())
 }
+
+/// Regression: `grab_png_sync` mutates the parent process's
+/// `PIPEWIRE_REMOTE` to point `pipewiresrc` at the live session's
+/// pipewire socket. After the session is killed, that socket is gone.
+/// If the next session's spawned `pipewire`/`wireplumber`/`mutter`
+/// inherit the stale env var, mutter's `ScreenCast.Start` fails with
+/// "Couldn't connect pipewire context" — deterministically, every
+/// time. Two sessions back-to-back in one process, each taking a
+/// screenshot, exercises the leak path.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn sequential_sessions_share_no_pipewire_env() -> anyhow::Result<()> {
+    init_tracing();
+
+    let (session1, _state1) = start_fixture_session("gtk4").await?;
+    let png1 = extract_png(&session1.take_screenshot().await?)?;
+    assert!(png1.len() > 1000, "first-session screenshot too small");
+    kill(session1).await?;
+
+    let (session2, _state2) = start_fixture_session("gtk4").await?;
+    let png2 = extract_png(&session2.take_screenshot().await?)?;
+    assert!(png2.len() > 1000, "second-session screenshot too small");
+    kill(session2).await?;
+
+    Ok(())
+}

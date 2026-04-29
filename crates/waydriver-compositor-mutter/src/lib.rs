@@ -228,7 +228,21 @@ impl MutterCompositor {
         tracing::debug!(id = self.id, mutter_dbus_address = %self.mutter_dbus_address, "private D-Bus for mutter");
 
         // Step 2: PipeWire + WirePlumber (for screenshots via ScreenCast).
+        //
+        // `env_remove("PIPEWIRE_REMOTE")` is load-bearing: `waydriver`'s
+        // `grab_png_sync` mutates the parent's process env to point
+        // `pipewiresrc` at the live session's pipewire socket. After a
+        // session stops, that socket is gone but the env var lingers in
+        // the parent. Without scrubbing it here, a freshly spawned
+        // `pipewire`/`wireplumber`/`mutter` for the next session would
+        // inherit the stale value and try to connect to the previous
+        // session's dead socket — wireplumber/mutter prefer
+        // `PIPEWIRE_REMOTE` over `XDG_RUNTIME_DIR/pipewire-0`, so the
+        // explicit `XDG_RUNTIME_DIR` override below isn't enough.
+        // Symptom: `ScreenCast.Start` fails with "Couldn't connect
+        // pipewire context" on every session after the first.
         let pipewire = Command::new("pipewire")
+            .env_remove("PIPEWIRE_REMOTE")
             .env("DBUS_SESSION_BUS_ADDRESS", &self.mutter_dbus_address)
             .env("XDG_RUNTIME_DIR", &runtime_str)
             .stdout(Stdio::null())
@@ -249,6 +263,7 @@ impl MutterCompositor {
         wait_for_pipewire_socket(&runtime_str).await?;
 
         let wireplumber = Command::new("wireplumber")
+            .env_remove("PIPEWIRE_REMOTE")
             .env("DBUS_SESSION_BUS_ADDRESS", &self.mutter_dbus_address)
             .env("XDG_RUNTIME_DIR", &runtime_str)
             .stdout(Stdio::null())
@@ -282,6 +297,7 @@ impl MutterCompositor {
                 "--virtual-monitor",
                 resolution,
             ])
+            .env_remove("PIPEWIRE_REMOTE")
             .env("DBUS_SESSION_BUS_ADDRESS", &self.mutter_dbus_address)
             .env("XDG_RUNTIME_DIR", &runtime_str)
             .stdout(Stdio::null())
