@@ -6,8 +6,8 @@
 //! - **gtk4** — raw `gtk::Button` / `gtk::Entry` / `gtk::PopoverMenu` / etc.
 //!   Tests what bare GTK4 exposes to AT-SPI.
 //! - **libadwaita** — `adw::EntryRow`, `adw::ComboRow`, `adw::SwitchRow`,
-//!   `adw::ActionRow`, `adw::Dialog`. Tests the widget classes real-world
-//!   GNOME apps use.
+//!   `adw::ActionRow`, `adw::ButtonRow`, `adw::Dialog`. Tests the widget
+//!   classes real-world GNOME apps use.
 //! - **dnd** — drag-and-drop source + target, for exercising pointer-based
 //!   drag flows.
 //!
@@ -530,6 +530,10 @@ fn build_adw_preferences_group() -> adw::PreferencesGroup {
         .build();
     action_row.connect_activated(|_| emit("activated adw-action-row"));
     group.add(&action_row);
+
+    let button_row = adw::ButtonRow::builder().title("adw-button-row").build();
+    button_row.connect_activated(|_| emit("activated adw-button-row"));
+    group.add(&button_row);
 
     group
 }

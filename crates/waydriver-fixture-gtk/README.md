@@ -180,6 +180,7 @@ only shows up when wrapped by libadwaita.
 | `adw::ComboRow`        | `adw-combo-row`      | Adw combobox (different a11y from GTK)            |
 | `adw::SwitchRow`       | `adw-switch-row`     | Row-hosted GtkSwitch; nested toggle a11y          |
 | `adw::ActionRow`       | `adw-action-row`     | Ubiquitous list-row pattern                       |
+| `adw::ButtonRow`       | `adw-button-row`     | Row-hosted action button (1.6+); nested button a11y |
 | `adw::Dialog` trigger  | `open-adw-dialog`    | Modern dialog primitive (1.5+)                    |
 | `adw::Dialog`          | `adw-sample-dialog`  | Dialog window/content a11y                        |
 

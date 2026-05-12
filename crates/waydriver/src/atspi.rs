@@ -775,6 +775,81 @@ pub async fn do_action_on(
     Ok(())
 }
 
+/// Outcome of an AT-SPI action invocation that wants to distinguish
+/// "the widget's a11y bridge doesn't expose this" from "the bridge
+/// rejected this specific request".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// `Action.DoAction(0)` returned true — the widget reports it
+    /// performed the action.
+    Performed,
+    /// `Action.DoAction(0)` returned false — widget exists, exposes
+    /// Action, but rejected the request.
+    Refused,
+    /// The widget's a11y bridge doesn't implement the Action interface
+    /// or `do_action(0)` is missing (no action with index 0). Notably
+    /// `AdwButtonRow` and the outer accessible of `AdwSwitchRow` —
+    /// activation has to be driven through the input layer (a real
+    /// pointer click) instead of AT-SPI.
+    NotSupported,
+}
+
+/// Like [`do_action_on`] but maps a missing Action interface or "no
+/// action with index 0" `MethodError` to [`ActionOutcome::NotSupported`]
+/// instead of an error.
+///
+/// Used by `Locator::click` so a missing-Action bridge doesn't fail the
+/// click — the caller can then fall back to a pointer click. Stale-element
+/// D-Bus errors still propagate as [`Error::ElementStale`] via
+/// [`map_action_err`]; transport-level failures still propagate as
+/// [`Error::Atspi`].
+pub async fn try_do_action_on(
+    conn: &zbus::Connection,
+    xpath: &str,
+    bus: &str,
+    path: &str,
+) -> Result<ActionOutcome> {
+    // Building the Action proxy itself doesn't issue a method call —
+    // it only verifies the address shape — so a "this widget doesn't
+    // support Action" error surfaces on `do_action()`.
+    let action = build_action(conn, bus, path)
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+
+    let n_actions: i32 = action.nactions().await.unwrap_or(0);
+    tracing::debug!(%xpath, %bus, %path, n_actions, "try_do_action(0)");
+
+    match action.do_action(0).await {
+        Ok(true) => Ok(ActionOutcome::Performed),
+        Ok(false) => Ok(ActionOutcome::Refused),
+        Err(zbus::Error::MethodError(name, _, _)) => {
+            // Stale-element names (UnknownObject / ServiceUnknown /
+            // NoReply / Disconnected) still surface as ElementStale —
+            // those mean the target is gone, not that activation isn't
+            // supported. Everything else (including
+            // `org.freedesktop.DBus.Error.NotSupported`,
+            // `UnknownMethod`, and the GTK-emitted "No action with
+            // index 0" GError that AdwButtonRow surfaces) maps to
+            // NotSupported because the widget exists but doesn't
+            // expose a primary action through AT-SPI.
+            if is_stale_error_name(name.as_str()) {
+                tracing::debug!(
+                    %xpath, %bus, %path, error_name = %name.as_str(),
+                    "classified D-Bus error as ElementStale during try_do_action"
+                );
+                Err(Error::ElementStale {
+                    xpath: xpath.to_string(),
+                    bus: bus.to_string(),
+                    path: path.to_string(),
+                })
+            } else {
+                Ok(ActionOutcome::NotSupported)
+            }
+        }
+        Err(e) => Err(Error::atspi_with("dbus", e)),
+    }
+}
+
 /// Read screen/window-relative bounds for the element identified by
 /// `(bus, path)` via the AT-SPI Component interface.
 ///

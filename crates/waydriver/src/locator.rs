@@ -392,11 +392,47 @@ impl Locator {
     ///
     /// Auto-waits for the element to be resolvable, showing, and enabled
     /// within the effective timeout. Requires exactly one match.
+    ///
+    /// Tries the AT-SPI `Action.DoAction(0)` path first — fast, precise,
+    /// and what every toolkit-supplied Button/MenuItem/etc accepts.
+    /// When the widget's a11y bridge doesn't expose Action (notably
+    /// `AdwButtonRow` and the outer accessible of `AdwSwitchRow`),
+    /// falls back to a synthetic pointer click at the element's centre.
+    /// Mirrors the `Component::grab_focus` → pointer-click fallback in
+    /// [`fill_with_opts`](Self::fill_with_opts), so widgets that aren't
+    /// reachable through AT-SPI alone still Just Work as long as a real
+    /// pointer click would activate them.
     pub async fn click(&self) -> Result<()> {
         let info = self.wait_for_actionable().await?;
-        let (bus, path) = info.ref_;
+        let (bus, path) = info.ref_.clone();
         let a11y = self.a11y()?;
-        atspi_client::do_action_on(a11y, &self.xpath, &bus, &path).await
+        match atspi_client::try_do_action_on(a11y, &self.xpath, &bus, &path).await? {
+            atspi_client::ActionOutcome::Performed => Ok(()),
+            atspi_client::ActionOutcome::Refused => Err(Error::atspi(format!(
+                "do_action(0) returned false on {bus}{path} — element may not support activation"
+            ))),
+            atspi_client::ActionOutcome::NotSupported => {
+                let bounds = info.bounds.ok_or_else(|| {
+                    Error::atspi(format!(
+                        "click: target {} doesn't expose AT-SPI Action and has no bounds to \
+                         fall back on a pointer click",
+                        self.xpath
+                    ))
+                })?;
+                tracing::debug!(
+                    xpath = %self.xpath, %bus, %path,
+                    cx = bounds.center_x(), cy = bounds.center_y(),
+                    "click: AT-SPI Action not supported; falling back to pointer click"
+                );
+                self.session
+                    .pointer_motion_absolute(bounds.center_x() as f64, bounds.center_y() as f64)
+                    .await?;
+                self.session
+                    .pointer_button(crate::backend::PointerButton::Left)
+                    .await?;
+                Ok(())
+            }
+        }
     }
 
     /// Replace the contents of an editable text element via the AT-SPI

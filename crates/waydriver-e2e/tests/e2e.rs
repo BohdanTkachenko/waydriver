@@ -230,6 +230,7 @@ async fn fixture_exposes_adw_widgets() -> anyhow::Result<()> {
             "adw-combo-row",
             "adw-switch-row",
             "adw-action-row",
+            "adw-button-row",
             "open-adw-dialog",
             // The main-menu button lives in the header bar and is present
             // regardless of which section is selected.
@@ -1089,5 +1090,104 @@ async fn sequential_sessions_share_no_pipewire_env() -> anyhow::Result<()> {
     assert!(png2.len() > 1000, "second-session screenshot too small");
     kill(session2).await?;
 
+    Ok(())
+}
+
+/// AdwButtonRow surfaces in AT-SPI as `<Button name="adw-button-row">`
+/// but implements neither `Action` nor `Component::grab_focus`, so it
+/// can't be driven through the fast AT-SPI paths every other Button
+/// accessible accepts. `Locator::click()` papers over this with a
+/// pointer-click fallback (parallel to the fill→pointer-click fallback
+/// for widgets missing `Component::grab_focus`): when
+/// `Action.DoAction(0)` returns `NotSupported`, click moves the pointer
+/// to the element's centre and synthesizes a real left-button press.
+///
+/// Before the fallback shipped, `click()` errored with `No action with
+/// index 0` and the caller had to know to drop down to pointer events.
+/// This test pins that the error is gone — `click()` resolves without
+/// surfacing an AT-SPI Action gap to the caller.
+///
+/// Asserting the *resulting* `activated adw-button-row` event isn't
+/// reliable in this test harness: headless mutter has a documented
+/// cold-start pointer race (see `Session::start`) where the first
+/// pointer events on a freshly-mapped toplevel get dropped, and the
+/// existing `fixture_locator_pointer_actions` test fails on `main`
+/// today for the same reason. Real environments don't have that race
+/// — once it's fixed (or a reliable per-session pointer warmup lands),
+/// this test should grow a positive activation assertion.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_adw_button_row_click_via_pointer_fallback() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    // The bare assertion: `click()` resolves without an AT-SPI Action
+    // error. Pre-fallback this would have errored with `No action with
+    // index 0`; with the fallback it routes through pointer-click.
+    session
+        .locate("//Button[@name='adw-button-row']")
+        .click()
+        .await?;
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// AdwSwitchRow surfaces in AT-SPI as **two** `<Switch name="adw-switch-row">`
+/// nodes — the outer activatable row wraps the inner GtkSwitch (with two
+/// `Generic` containers in between), and both inherit the row title as
+/// their accessible name. Only the inner toggle implements the AT-SPI
+/// `Action` interface (`Action.DoAction(0)` on the outer row errors with
+/// `No action with index 0`), so the selector has to disambiguate to the
+/// inner one.
+///
+/// The natural way is the descendant-axis selector
+/// `//Switch[@name='adw-switch-row']//Switch` — "the Switch nested
+/// under the row's Switch" — which uniquely matches the inner toggle.
+/// It expresses the parent/child relationship directly, doesn't depend
+/// on a `.nth(...)` index, and reads as the intent (target the nested
+/// one).
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_adw_switch_row_toggle_emits_event() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    // Sanity: confirm the documented duplicate exists and the
+    // descendant-axis selector uniquely picks the inner toggle. If
+    // either count changes, libadwaita reshaped the AT-SPI tree and
+    // the selector advice in the doc comment + memory needs to be
+    // revisited.
+    assert_eq!(
+        session
+            .locate("//Switch[@name='adw-switch-row']")
+            .count()
+            .await?,
+        2,
+        "AdwSwitchRow should expose two Switch accessibles (row + inner toggle)"
+    );
+    assert_eq!(
+        session
+            .locate("//Switch[@name='adw-switch-row']//Switch")
+            .count()
+            .await?,
+        1,
+        "the descendant-axis selector should uniquely match the inner Switch"
+    );
+
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Switch[@name='adw-switch-row']//Switch")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("toggled adw-switch-row active=true"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    kill(session).await?;
     Ok(())
 }
