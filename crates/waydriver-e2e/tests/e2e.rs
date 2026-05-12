@@ -490,14 +490,12 @@ async fn fixture_keyboard_chord_dispatches_modifiers() -> anyhow::Result<()> {
     init_tracing();
     let (session, _state) = start_fixture_session("gtk4").await?;
 
-    // Focus-routing handshake. The fixture emits `focus-acquired text-entry`
-    // as soon as GTK grabs focus client-side, but the Wayland compositor
-    // needs time to redirect keyboard input to the newly-focused surface —
-    // key events sent too soon after the focus event get routed to
-    // whichever surface held focus before. Fire warmup keystrokes until
-    // we see one actually land on the entry; that's the deterministic
-    // signal that routing has caught up. Then clear the entry and let
-    // the buffer settle so the real test starts from a clean state.
+    // Wait for the fixture's text-entry to grab focus client-side.
+    // `Session::start` already primes mutter's keyboard-focus
+    // assignment with a no-op `Shift_L` press, so the first real
+    // keystroke after focus-acquired now reliably lands on the entry —
+    // the 15-keystroke warmup loop that used to live here is no longer
+    // necessary.
     session
         .wait_for_stdout_line(
             0,
@@ -505,34 +503,6 @@ async fn fixture_keyboard_chord_dispatches_modifiers() -> anyhow::Result<()> {
             Duration::from_secs(5),
         )
         .await?;
-    let mut routed = false;
-    let warmup_start = session.stdout_cursor();
-    for _ in 0..15 {
-        session.press_chord("a").await?;
-        if session
-            .wait_for_stdout_line(
-                warmup_start,
-                |l| l.contains("text-changed text-entry"),
-                Duration::from_millis(250),
-            )
-            .await
-            .is_ok()
-        {
-            routed = true;
-            break;
-        }
-    }
-    assert!(
-        routed,
-        "keystrokes never reached text-entry despite focus-acquired"
-    );
-    // Any additional buffered 'a' presses may still be queued — sleep
-    // briefly so they flush, then clear, then sleep again so the clear
-    // event is the last thing in the buffer before the real test runs.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    session.press_chord("Ctrl+A").await?;
-    session.press_chord("BackSpace").await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Real test starts here. Cursor captures the state after clear +
     // settle; anything appearing after this point is produced by the
@@ -1043,6 +1013,56 @@ async fn fixture_session_cancel_interrupts_wait_for_visible() -> anyhow::Result<
     );
 
     kill(session).await?;
+    Ok(())
+}
+
+/// Regression: cold-start first-keypress drop. `Session::start` primes
+/// mutter's keyboard-focus assignment with a no-op `Shift_L` press, so a
+/// single `press_chord("a")` after `focus-acquired text-entry` reliably
+/// produces a `text-changed text-entry` event. Without the prime, the
+/// first keystroke is consumed by mutter's focus-assignment and the wait
+/// below times out.
+///
+/// Each `cargo test` invocation spawns a fresh mutter session per test,
+/// so the prior tests in the binary don't change the outcome — but the
+/// MCP-server use case is exactly the same single-session cold start
+/// this test asserts on.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn cold_first_keypress_lands_without_warmup() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Wait until the fixture's text-entry grabs keyboard focus client-side.
+    session
+        .wait_for_stdout_line(
+            0,
+            |l| l.contains("focus-acquired text-entry"),
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    // Single keypress — no warmup loop.
+    let cursor = session.stdout_cursor();
+    session.press_chord("a").await?;
+    let result = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("text-changed text-entry"),
+            Duration::from_secs(3),
+        )
+        .await;
+
+    let outcome = result.is_ok();
+    eprintln!(
+        "cold first-keypress outcome: {}",
+        if outcome { "LANDED" } else { "DROPPED" }
+    );
+    kill(session).await?;
+    assert!(
+        outcome,
+        "first press_chord after focus-acquired did not produce a text-changed event"
+    );
     Ok(())
 }
 

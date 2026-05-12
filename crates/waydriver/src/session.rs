@@ -213,6 +213,46 @@ impl Session {
         // clock never ticks.
         let keepalive_stream = capture.start_stream().await?;
 
+        // Prime mutter's keyboard-focus assignment. On a fresh headless
+        // mutter session, the first `NotifyKeyboardKeysym` arrives
+        // before mutter has bound keyboard focus to the newly-mapped
+        // toplevel — the event is delivered to no client and silently
+        // dropped, even though the AT-SPI bridge is already serving
+        // queries against the app's tree. Subsequent keypresses land
+        // because the first one wakes mutter into assigning focus.
+        //
+        // Pumping one priming press up-front absorbs that consumed-by-
+        // focus-assignment event so the caller's first real keystroke
+        // is reliably the second one mutter sees. `Shift_L` is chosen
+        // deliberately: a bare modifier press generates no character,
+        // doesn't trigger button/menu accelerators on any GTK widget,
+        // and `press_keysym` always emits its matching release — so
+        // there's no risk of leaving the modifier stuck down.
+        //
+        // Pointer events have the same cold-start race in headless
+        // mutter — the `fixture_locator_pointer_actions` e2e test
+        // documents the symptom — but no single priming pointer call
+        // (motion, click, relative or absolute) reliably bootstraps
+        // surface focus from a freshly-mapped toplevel. Tests that
+        // depend on pointer events still need an ad-hoc warmup; this
+        // session-startup prime covers the keyboard path only.
+        //
+        // Best-effort: a backend that returns an error here shouldn't
+        // fail session startup, which is otherwise fully ready. The
+        // `Locator` paths that don't depend on keyboard input
+        // continue to work.
+        //
+        // See the `cold_first_keypress_lands_without_warmup` test in
+        // `waydriver-e2e` for the bare repro.
+        const SHIFT_L_KEYSYM: u32 = 0xffe1;
+        if let Err(e) = input.press_keysym(SHIFT_L_KEYSYM, &cancellation).await {
+            tracing::warn!(
+                id,
+                error = %e,
+                "keyboard focus prime failed; first user keypress may be dropped"
+            );
+        }
+
         // If the caller requested a recording, start a second GStreamer
         // pipeline on the same PipeWire node. Failure here aborts session
         // startup: the caller explicitly opted in, so silently skipping
