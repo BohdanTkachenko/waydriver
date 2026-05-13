@@ -24,23 +24,23 @@ jobs:
   clippy:
     name: cargo clippy
     runs-on: ubuntu-latest
+    # Match the runtime/builder image in Dockerfile: Ubuntu 24.04 ships
+    # libadwaita 1.5, but we depend on the v1_6 feature (AdwButtonRow).
+    container: fedora:42
     steps:
+      - name: Install container prerequisites and system dependencies
+        run: |
+          dnf install -y \
+            git nodejs \
+            gcc g++ make pkg-config \
+            dbus-devel at-spi2-core-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            pipewire-devel \
+            gtk4-devel glib2-devel libadwaita-devel
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libdbus-1-dev \
-            libatspi2.0-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libpipewire-0.3-dev \
-            libgtk-4-dev \
-            libadwaita-1-dev
       - uses: Swatinem/rust-cache@v2
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -48,21 +48,19 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-latest
+    container: fedora:42
     steps:
+      - name: Install container prerequisites and system dependencies
+        run: |
+          dnf install -y \
+            git nodejs \
+            gcc g++ make pkg-config \
+            dbus-devel at-spi2-core-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            pipewire-devel \
+            gtk4-devel glib2-devel libadwaita-devel
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libdbus-1-dev \
-            libatspi2.0-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libpipewire-0.3-dev \
-            libgtk-4-dev \
-            libadwaita-1-dev
       - uses: Swatinem/rust-cache@v2
       - name: Run unit tests
         run: cargo test --workspace
