@@ -886,6 +886,44 @@ pub async fn extents_on(
     }
 }
 
+/// Force lazy AT-SPI realization by hit-testing inside the element
+/// identified by `(bus, path)`.
+///
+/// Calls `Component::GetAccessibleAtPoint(x, y, CoordType::Window)` and
+/// discards the result. The point is the side effect on the toolkit:
+/// GTK has to call `gtk_widget_pick` to find the widget at `(x, y)` and
+/// then `get_accessible()` on it, which is the call path that triggers
+/// libadwaita's lazy accessible-subtree build for non-initial
+/// `AdwPreferencesDialog` pages and hidden→shown `AdwPreferencesGroup`
+/// instances.
+///
+/// `(x, y)` are interpreted as window-relative — i.e. relative to the
+/// toplevel containing the element. For a dialog that is itself the
+/// toplevel, that means `(0, 0)` is the dialog's top-left corner and
+/// the legal range is `(0..dialog.width, 0..dialog.height)`.
+///
+/// `MethodError` from the toolkit (Component interface not implemented,
+/// or point outside the widget) is swallowed as a successful no-op so
+/// callers can blanket-probe a grid without per-cell capability checks.
+/// Transport-level failures propagate as `Err`.
+pub async fn hit_test_at_point_on(
+    conn: &zbus::Connection,
+    bus: &str,
+    path: &str,
+    x: i32,
+    y: i32,
+) -> zbus::Result<()> {
+    let component = build_component(conn, bus, path).await?;
+    match component
+        .get_accessible_at_point(x, y, CoordType::Window)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(zbus::Error::MethodError(_, _, _)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Ask the toolkit to scroll the element identified by `(bus, path)` into
 /// view via the AT-SPI `Component::scroll_to` method.
 ///

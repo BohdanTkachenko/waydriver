@@ -134,6 +134,16 @@ async fn start_fixture_session(section: &str) -> anyhow::Result<(Arc<Session>, A
             video_output: None,
             video_bitrate: None,
             video_fps: None,
+            // Pre-warm the ocrs engine in the background so the
+            // visual-locator tests (notably `lazy_a11y_*`) don't pay
+            // the ~1-2s model-load cost on their first `find_by_text`
+            // call. Cheap to leave on for the AT-SPI-only tests too:
+            // the prewarm task lives in `tokio::spawn`, never blocks
+            // session startup, and gets dropped when the session ends.
+            prewarm_visual: true,
+            visual_region_tuning: Default::default(),
+            visual_text_tuning: Default::default(),
+            visual_click_tuning: Default::default(),
         },
     )
     .await?;
@@ -253,6 +263,538 @@ async fn fixture_exposes_dnd_widgets() -> anyhow::Result<()> {
         &["drag-source", "drop-target", "drop-status", "main-menu"],
     )
     .await?;
+    kill(session).await?;
+    Ok(())
+}
+
+/// Sanity test for `Locator::list_text` — enumerate every OCR'd
+/// line inside a scope and confirm at least the labels we know are
+/// visible show up.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; downloads ocrs models on first run"]
+async fn visual_locator_list_text_enumerates_visible_labels() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Scope the locator in a block so it drops before `kill`
+    // takes ownership of the session Arc.
+    let hits = {
+        // First element with AT-SPI bounds (toplevel widget area).
+        let scope = session.locate("//*[@bbox][1]").first();
+        scope.list_text().await?
+    };
+    eprintln!("OCR enumerated {} text hit(s):", hits.len());
+    for h in &hits {
+        eprintln!("  - {:?} @ {:?}", h.text, h.bounds);
+    }
+
+    // The GTK4 section has labelled buttons among other widgets.
+    // OCR may misread a few characters, but stock GTK buttons are
+    // legible enough that at least one of these substrings should
+    // show up.
+    let expected = ["primary-button", "agree-check", "mode-toggle"];
+    let found_any = hits.iter().any(|h| {
+        expected
+            .iter()
+            .any(|want| h.text.to_lowercase().contains(&want.to_lowercase()))
+    });
+    assert!(
+        found_any,
+        "list_text didn't recognise any of {expected:?} in {hits:?}"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Sanity test for the OCR-backed visual locator against a vanilla
+/// `GtkButton` (whose AT-SPI surface is well-behaved). Proves the
+/// screenshot → OCR → pointer-click pipeline works end-to-end.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; downloads ocrs models on first run"]
+async fn visual_locator_click_fires_gtk_button_activation() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let cursor = session.stdout_cursor();
+    session.find_by_text("primary-button").click().await?;
+    let line = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("clicked primary-button"),
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert!(
+        line.contains("clicked primary-button"),
+        "unexpected stdout line after visual click: {line}"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Pins libadwaita lazy-realization bug: an `AdwPreferencesGroup`
+/// constructed with `visible:false` *inside an `AdwPreferencesPage`*
+/// and then flipped to visible after `present()` never has its
+/// accessible subtree built. The `lazy-button` `AdwButtonRow` inside
+/// is rendered on screen but absent from AT-SPI.
+///
+/// A naive top-level repro (group → window content, no prefs page in
+/// between) does *not* trigger the bug — that variant surfaces fine.
+/// The fixture mirrors the real-world shape that reproduces the bug.
+///
+/// ## Why we count `role="generic" focusable="true"` instead of
+/// querying by name
+///
+/// `AdwButtonRow`'s title doesn't surface as an AT-SPI accessible name
+/// in current libadwaita (an independent gap from this bug — see
+/// `MEMORY.md`'s `adw_widget_atspi_gaps`). So `find_by_name("lazy-button")`
+/// returns 0 *regardless* of whether the lazy-realization bug is fixed.
+/// Each `AdwButtonRow` does, however, surface as a focusable Generic
+/// inside the dialog. Counting focusable Generics inside the dialog
+/// before and after the visibility flip is what actually distinguishes
+/// "bug present" (count unchanged) from "bug fixed" (count grew by 1).
+///
+/// ## Asserts the fixed behavior so the bug shows up as a test failure
+///
+/// We tried two client-side workarounds in waydriver and neither helped:
+///
+///   - Replacing `Accessible.GetChildren` with a `0..ChildCount` loop of
+///     `Accessible.GetChildAtIndex(i)` calls. Did not surface the missing
+///     widgets — `ChildCount` itself reports them missing.
+///   - Calling `Cache.GetItems` on the app (bypasses parent traversal).
+///     The lazy widgets are not in the cache either; libadwaita simply
+///     doesn't register them with AT-SPI when the trigger conditions are
+///     present.
+///
+/// The bug is genuinely upstream and only libadwaita can fix it. This
+/// test will start passing again the day that happens.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn lazy_a11y_hidden_then_shown_widget_missing_from_atspi() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("lazy-a11y").await?;
+
+    // Open the issue 1 dialog and wait for it to be present.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='open-hidden-group-dialog']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dialog-opened hidden-group-dialog"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // Snapshot focusable-Generic count after the dialog is up but
+    // *before* the 300ms timer flips the hidden group visible.
+    let focusable_selector = "//Dialog//*[@role='generic' and @focusable='true']";
+    let count_before = session.locate(focusable_selector).count().await?;
+    assert!(
+        count_before >= 1,
+        "dialog is up but contains zero focusable Generic widgets — the \
+         control row should be queryable. count_before={count_before}"
+    );
+
+    // Wait for the visibility flip + a settle window for any potential
+    // a11y-tree rebuild to land.
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("lazy-shown hidden-group-target-group"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let count_after = session.locate(focusable_selector).count().await?;
+    assert!(
+        count_after > count_before,
+        "expected focusable-Generic count to grow after the hidden group \
+         was made visible (the new AdwButtonRow should surface in AT-SPI), \
+         but stayed at {count_before} → {count_after}. This is the \
+         libadwaita lazy-realization bug for hidden-then-shown groups \
+         inside an AdwPreferencesPage — see waydriver-fixture-gtk's \
+         lazy-a11y section for the minimal repro."
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Pins libadwaita lazy-realization bug for `AdwPreferencesDialog`:
+/// after opening the dialog and switching to a non-initial page via
+/// `set_visible_page_name`, the widgets on that page never enter the
+/// AT-SPI tree. The `lazy-switch` `AdwSwitchRow` on page2 is rendered
+/// on screen but absent from AT-SPI.
+///
+/// Asserts on `role='switch'` rather than the row's title — see the
+/// rationale on the hidden-group test (`AdwSwitchRow` titles don't surface,
+/// so a title-based count can't distinguish "bug present" from "title
+/// not exposed"). Same upstream-only conclusion: `Cache.GetItems`
+/// confirms page2 widgets aren't registered with AT-SPI at all.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn lazy_a11y_non_initial_prefs_page_missing_from_atspi() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("lazy-a11y").await?;
+
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='open-non-initial-page-dialog']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dialog-opened non-initial-page-dialog"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // Settle for any potential lazy-realization to land.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let switch_count = session
+        .locate("//Dialog//*[@role='switch']")
+        .count()
+        .await?;
+    assert!(
+        switch_count >= 1,
+        "expected at least one Switch widget inside the dialog after \
+         set_visible_page_name(\"page2\") (the page2 AdwSwitchRow should \
+         surface in AT-SPI), but found {switch_count}. This is the \
+         libadwaita lazy-realization bug for non-initial AdwPreferencesDialog \
+         pages — see waydriver-fixture-gtk's lazy-a11y section for the \
+         minimal repro."
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Visual-locator workaround for the non-initial-page bug: drives
+/// `lazy-switch` on the non-initial prefs page via OCR even though the
+/// row is absent from AT-SPI. Mirrors the pattern from
+/// `visual_locator_click_fires_gtk_button_activation`
+/// but targets an `AdwSwitchRow` that doesn't exist in the a11y tree at
+/// all. Because the whole row is activatable, clicking anywhere on it
+/// (including the title text glyphs OCR finds) toggles the switch.
+/// Ground truth is the fixture's `toggled lazy-switch active=true`
+/// stdout event.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; downloads ocrs models on first run"]
+async fn lazy_a11y_non_initial_prefs_page_switchable_via_visual_locator(
+) -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("lazy-a11y").await?;
+
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='open-non-initial-page-dialog']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dialog-opened non-initial-page-dialog"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Scope OCR to the dialog's AT-SPI bounds. The dialog itself
+    // surfaces even though its page2 contents don't, so cropping
+    // before OCR keeps recognition fast and free of off-dialog text.
+    // Scoped in a block so the parent Locator drops before `kill`
+    // takes ownership of the session Arc.
+    let click_cursor = session.stdout_cursor();
+    {
+        let dialog = session.locate("//Dialog[@name='Preferences']");
+        dialog.find_by_text("lazy-switch").await?.click().await?;
+    }
+
+    let line = session
+        .wait_for_stdout_line(
+            click_cursor,
+            |l| l.contains("toggled lazy-switch active=true"),
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert!(
+        line.contains("toggled lazy-switch active=true"),
+        "unexpected stdout line after visual click: {line}"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Phase 1 probe (deletable once the decision is made): does
+/// `Component::GetAccessibleAtPoint` on the dialog force libadwaita to
+/// build the page2 widgets' AT-SPI subtree?
+///
+/// All other AT-SPI angles were ruled out by prior experiments:
+/// `GetChildren`, a `0..ChildCount` `GetChildAtIndex` loop, and
+/// `Cache.GetItems` on the app bus all confirmed the lazy widgets are
+/// never published. Hit-test is a different code path — GTK has to call
+/// `gtk_widget_pick` and then `get_accessible()` on whatever it finds,
+/// which builds lazy accessible subtrees.
+///
+/// Realization in libadwaita is per-level, so a single pass only
+/// exposes the children one step below the probed accessible. The
+/// probe iterates: walk a grid on the dialog → re-snapshot → walk a
+/// grid on every newly-surfaced descendant → repeat until the tree
+/// stops growing or we hit a sanity ceiling.
+///
+/// Always passes — diagnostic, not an oracle. Read stderr for the
+/// before/after switch counts and the iteration trace.
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn lazy_a11y_probe_hit_test_realizes_widgets() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("lazy-a11y").await?;
+
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='open-non-initial-page-dialog']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dialog-opened non-initial-page-dialog"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let pre_tree = session.dump_tree().await?;
+    eprintln!(
+        "── tree before probe ────────────────────────────────────\n{pre_tree}\n\
+         ─────────────────────────────────────────────────────────"
+    );
+
+    let switch_selector = "//Dialog//*[@role='switch']";
+    let count_before = session.locate(switch_selector).count().await?;
+
+    let conn = session
+        .a11y_connection
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("session has no AT-SPI connection"))?
+        .clone();
+
+    // Resolve the dialog and its current set of descendants into owned data
+    // so the Locator can drop before kill(). `inspect_all` on `//Dialog//*`
+    // gives us every node under the dialog with its bounds and (bus, path).
+    let dialog_info = session
+        .locate("//Dialog")
+        .inspect_all()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no Dialog in the AT-SPI tree after open"))?;
+    let dialog_bounds = dialog_info
+        .bounds
+        .ok_or_else(|| anyhow::anyhow!("Dialog has no bounds — probe needs window size"))?;
+    eprintln!(
+        "probe: dialog bounds={dialog_bounds:?} bus={} path={}",
+        dialog_info.ref_.0, dialog_info.ref_.1
+    );
+
+    // Iterative probe loop. Each iteration:
+    //   1. Collect every (bus, path, bounds) under the dialog that hasn't
+    //      been probed yet AND has a positive-area bounds.
+    //   2. Walk a 40px grid across each, calling GetAccessibleAtPoint.
+    //   3. Settle for tree mutations.
+    //   4. Stop when no new accessibles surface, or after a safety ceiling.
+    use std::collections::HashSet;
+    let step = 40;
+    let max_iterations = 8;
+    let mut probed: HashSet<String> = HashSet::new();
+    let mut total_hit_calls = 0u32;
+    let mut total_new_nodes = 0u32;
+
+    for iteration in 0..max_iterations {
+        let mut targets: Vec<((String, String), waydriver::Rect)> = Vec::new();
+        // Always re-probe the dialog itself — its child set is what changes.
+        targets.push((dialog_info.ref_.clone(), dialog_bounds));
+
+        let descendants = session.locate("//Dialog//*").inspect_all().await?;
+        for info in &descendants {
+            let key = format!("{}{}", info.ref_.0, info.ref_.1);
+            if probed.contains(&key) {
+                continue;
+            }
+            if let Some(b) = info.bounds {
+                if b.width > 0 && b.height > 0 && b.width < 100_000 && b.height < 100_000 {
+                    targets.push((info.ref_.clone(), b));
+                }
+            }
+        }
+
+        let new_targets = targets.len();
+        if iteration > 0 && new_targets <= 1 {
+            // Only the dialog itself remains — nothing new to probe.
+            eprintln!("probe: iteration {iteration} found no new targets, stopping");
+            break;
+        }
+
+        let mut iter_calls = 0u32;
+        for ((bus, path), b) in &targets {
+            let key = format!("{bus}{path}");
+            probed.insert(key);
+
+            let x_start = b.x.max(0);
+            let y_start = b.y.max(0);
+            let x_end = b.x.saturating_add(b.width);
+            let y_end = b.y.saturating_add(b.height);
+
+            let mut y = y_start;
+            while y < y_end {
+                let mut x = x_start;
+                while x < x_end {
+                    waydriver::atspi::hit_test_at_point_on(&conn, bus, path, x, y).await?;
+                    iter_calls += 1;
+                    x += step;
+                }
+                y += step;
+            }
+        }
+        total_hit_calls += iter_calls;
+        total_new_nodes += (new_targets as u32).saturating_sub(1);
+
+        // Settle so children-changed signals can land before re-snapshot.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mid_count = session.locate(switch_selector).count().await?;
+        eprintln!(
+            "probe: iteration {iteration}: {new_targets} targets ({} new), {iter_calls} hit calls, switches now {mid_count}",
+            (new_targets as u32).saturating_sub(if iteration == 0 { 0 } else { 1 })
+        );
+
+        if mid_count >= 1 {
+            eprintln!("probe: switch surfaced after iteration {iteration} — stopping");
+            break;
+        }
+    }
+
+    let post_tree = session.dump_tree().await?;
+    eprintln!(
+        "── tree after probe ─────────────────────────────────────\n{post_tree}\n\
+         ─────────────────────────────────────────────────────────"
+    );
+
+    let count_after = session.locate(switch_selector).count().await?;
+    eprintln!(
+        "── PROBE RESULT ─────────────────────────────────────────\n\
+         switches before: {count_before}\n\
+         switches after:  {count_after}\n\
+         dialog bounds:   {dialog_bounds:?}\n\
+         total hit calls: {total_hit_calls}\n\
+         total new nodes: {total_new_nodes}\n\
+         ─────────────────────────────────────────────────────────"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Phase 1 probe (companion to `lazy_a11y_probe_hit_test_realizes_widgets`):
+/// does *synthetic pointer motion* into the dialog's page-content area
+/// force libadwaita to realize the page2 widgets?
+///
+/// Real compositor pointer events take a different code path than
+/// AT-SPI hit-test: they go through mutter → wayland → GTK's event
+/// loop, where GTK dispatches the motion to whichever widget is under
+/// the point (hover state, tooltip timer, focus-follows-mouse for some
+/// widgets, etc.). The poshta-agent investigation noted "hover doesn't
+/// trigger AT-SPI emissions," but that was checking for signals rather
+/// than re-querying the tree post-hover.
+///
+/// Always passes — diagnostic. Read stderr for the before/after switch
+/// counts.
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn lazy_a11y_probe_pointer_hover_realizes_widgets() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("lazy-a11y").await?;
+
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='open-non-initial-page-dialog']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dialog-opened non-initial-page-dialog"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let switch_selector = "//Dialog//*[@role='switch']";
+    let count_before = session.locate(switch_selector).count().await?;
+
+    // The dialog is at (0,0) covering the whole 720x640 window in this
+    // fixture. Walk a 40px grid across the right 75% of the dialog (the
+    // page-content area; AdwPreferencesDialog reserves the left ~25% for
+    // the sidebar). Pointer motion in mutter is absolute screen coords;
+    // in headless single-display mutter that's identical to window coords.
+    let dialog_bounds = session
+        .locate("//Dialog")
+        .inspect_all()
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|info| info.bounds)
+        .ok_or_else(|| anyhow::anyhow!("no Dialog bounds for probe"))?;
+    eprintln!("probe: dialog bounds={dialog_bounds:?}");
+
+    let step = 40;
+    let sidebar_x_end = dialog_bounds.x + dialog_bounds.width / 4;
+    let x_end = dialog_bounds.x.saturating_add(dialog_bounds.width);
+    let y_end = dialog_bounds.y.saturating_add(dialog_bounds.height);
+
+    let mut moves = 0u32;
+    let mut y = dialog_bounds.y;
+    while y < y_end {
+        let mut x = sidebar_x_end;
+        while x < x_end {
+            session.pointer_motion_absolute(x as f64, y as f64).await?;
+            moves += 1;
+            // Brief pause so GTK actually processes each motion event
+            // rather than coalescing the burst.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            x += step;
+        }
+        y += step;
+    }
+    eprintln!("probe: {moves} synthetic pointer motions in page-content area");
+
+    // Settle for any realization signals.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let count_after = session.locate(switch_selector).count().await?;
+    let post_tree = session.dump_tree().await?;
+    eprintln!(
+        "── tree after hover probe ────────────────────────────────\n{post_tree}\n\
+         ─────────────────────────────────────────────────────────"
+    );
+    eprintln!(
+        "── HOVER PROBE RESULT ───────────────────────────────────\n\
+         switches before: {count_before}\n\
+         switches after:  {count_after}\n\
+         dialog bounds:   {dialog_bounds:?}\n\
+         pointer moves:   {moves}\n\
+         ─────────────────────────────────────────────────────────"
+    );
+
     kill(session).await?;
     Ok(())
 }

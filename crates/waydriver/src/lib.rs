@@ -21,6 +21,10 @@ pub mod keysym;
 pub mod locator;
 /// Test session lifecycle management.
 pub mod session;
+/// OCR-backed visual locator for widgets that don't surface in AT-SPI.
+/// Opt-in via the `visual` Cargo feature.
+#[cfg(feature = "visual")]
+pub mod visual;
 
 pub use atspi::Rect;
 pub use backend::{
@@ -29,4 +33,6 @@ pub use backend::{
 };
 pub use error::{Error, Result};
 pub use locator::{FillMode, Locator, SelectBy};
-pub use session::{Session, SessionConfig};
+pub use session::{Session, SessionConfig, VisualRegionTuning, VisualTextTuning};
+#[cfg(feature = "visual")]
+pub use visual::{ImageLocator, MatchMode, RegionLocator, Shape, TextHit, VisualLocator};

@@ -4,9 +4,10 @@ A purpose-built GTK4 + libadwaita demo app used as a deterministic
 end-to-end testing fixture for waydriver. Run it manually with:
 
 ```sh
-cargo run -p waydriver-fixture-gtk                    # default: gtk4
-cargo run -p waydriver-fixture-gtk -- --section=adw   # just libadwaita
-cargo run -p waydriver-fixture-gtk -- --section=dnd   # just drag-and-drop
+cargo run -p waydriver-fixture-gtk                          # default: gtk4
+cargo run -p waydriver-fixture-gtk -- --section=adw         # just libadwaita
+cargo run -p waydriver-fixture-gtk -- --section=dnd         # just drag-and-drop
+cargo run -p waydriver-fixture-gtk -- --section=lazy-a11y   # adw lazy-realization repros
 ```
 
 Or use it as an e2e test fixture target:
@@ -34,6 +35,8 @@ Sections:
 1. **gtk4** — raw GTK4 widgets (default)
 2. **libadwaita** — Adw Row widgets + Adw dialog
 3. **dnd** — drag-and-drop source + target + status label
+4. **lazy-a11y** — minimal repros for two libadwaita lazy-realization
+   bugs where on-screen widgets never enter the AT-SPI tree
 
 Only one section is ever live in the a11y tree at a time. There is
 no "all" view: mixing sections makes selectors ambiguous and widgets
@@ -48,6 +51,7 @@ they're the focused section.
 | `--section=gtk4`                            | Only GTK4 widgets in the tree   |
 | `--section=adw` / `--section=libadwaita`    | Only Adw widgets                |
 | `--section=dnd` / `--section=drag-and-drop` | Only DnD widgets                |
+| `--section=lazy-a11y` / `--section=lazy`    | Adw lazy-realization repros     |
 
 Legacy alias `--tab=<name>` is accepted for backwards compatibility.
 
@@ -107,6 +111,16 @@ fixture-event: drag-entered drop-target
 fixture-event: drag-left drop-target
 fixture-event: drag-ended drag-source delete_data=false
 fixture-event: dropped drop-target payload="dnd-payload-token"
+fixture-event: clicked open-hidden-group-dialog
+fixture-event: dialog-opened hidden-group-dialog
+fixture-event: lazy-shown hidden-group-target-group
+fixture-event: dialog-closed hidden-group-dialog
+fixture-event: activated hidden-group-control-row
+fixture-event: activated lazy-button
+fixture-event: clicked open-non-initial-page-dialog
+fixture-event: dialog-opened non-initial-page-dialog
+fixture-event: dialog-closed non-initial-page-dialog
+fixture-event: toggled lazy-switch active=true
 ```
 
 Quoting: string fields use Rust `{:?}` debug formatting (embedded quotes
@@ -183,6 +197,48 @@ only shows up when wrapped by libadwaita.
 | `adw::ButtonRow`       | `adw-button-row`     | Row-hosted action button (1.6+); nested button a11y |
 | `adw::Dialog` trigger  | `open-adw-dialog`    | Modern dialog primitive (1.5+)                    |
 | `adw::Dialog`          | `adw-sample-dialog`  | Dialog window/content a11y                        |
+
+## lazy-a11y tab — widget inventory
+
+Repros for two libadwaita bugs where on-screen widgets never enter the
+AT-SPI tree. Both surface as `Locator::count() == 0` for the affected
+widget despite the widget being visible in screenshots. The control
+widget `lazy-control` is always present and confirms the section loaded.
+
+| Widget        | Accessible name              | Expected AT-SPI state                         |
+|---------------|------------------------------|-----------------------------------------------|
+| `gtk::Label`  | `lazy-control`               | Present — confirms section loaded             |
+| `gtk::Button` | `open-hidden-group-dialog`   | Present — opens the hidden-group repro dialog |
+| `gtk::Button` | `open-non-initial-page-dialog` | Present — opens the non-initial-page repro dialog |
+
+After clicking each button, query inside the resulting dialog:
+
+| Inside                              | Widget              | Accessible name              | Expected AT-SPI state                       |
+|-------------------------------------|---------------------|------------------------------|---------------------------------------------|
+| `hidden-group-dialog` (one page)    | `adw::ButtonRow`    | `hidden-group-control-row`   | Present — group visible from construction   |
+| `hidden-group-dialog`               | `adw::ButtonRow`    | `lazy-button`                | **Missing** — hidden→shown group bug        |
+| `non-initial-page-dialog` (two pages) | `adw::SwitchRow`  | `lazy-switch`                | **Missing** — non-initial page bug          |
+
+**hidden-group repro** — A naive top-level repro (an `AdwPreferencesGroup`
+with `set_visible(false)` added directly to a window, then flipped to
+`true` after `present()`) does *not* trigger the bug — the contained
+`AdwButtonRow` surfaces fine. The bug surfaces only when the toggled
+group is nested inside an `AdwPreferencesPage`. The fixture's
+`hidden-group-dialog` mirrors the real-world shape: an
+`AdwPreferencesDialog` whose page contains a visible group (control)
+and a hidden group; the hidden group is flipped to visible 300ms after
+`present()`. The `lazy-button` `AdwButtonRow` inside is drawn on screen
+but absent from AT-SPI: libadwaita builds the accessible subtree lazily
+on first realization and `set_visible(true)` does not re-trigger it
+inside a prefs page.
+
+**non-initial-page repro** — `non-initial-page-dialog` is an
+`AdwPreferencesDialog` with two pages; the click handler calls
+`set_visible_page_name("page2")` right after `present()`. The
+`adw::SwitchRow` on `page2` renders on screen but never appears in the
+AT-SPI tree because non-initial pages aren't realized at construction
+time.
+
 
 ## DnD tab — widget inventory
 

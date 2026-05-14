@@ -15,6 +15,12 @@ categories = ["development-tools::testing", "gui"]
 [features]
 default = []
 test-support = []
+# Optional OCR-backed visual locator (`Session::find_by_text`). Adds the
+# pure-Rust ocrs stack (~tens of MB of compile time, ~50MB of ONNX model
+# files downloaded to `$XDG_CACHE_HOME/waydriver/ocrs-models/` on first
+# use). Off by default; consumers opt in for tests that need to drive
+# widgets missing from the AT-SPI tree.
+visual = ["dep:ocrs", "dep:rten", "dep:rten-imageproc", "dep:ureq", "dep:palette", "dep:unicode-normalization", "dep:sha2", "dep:hex", "dep:imageproc"]
 
 [dependencies]
 async-trait.workspace = true
@@ -29,3 +35,17 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 zbus.workspace = true
+# Non-optional: used by `Locator::screenshot` (crop) regardless of
+# whether the visual / OCR feature is enabled.
+image.workspace = true
+
+# `visual` feature deps.
+ocrs = { workspace = true, optional = true }
+rten = { workspace = true, optional = true }
+rten-imageproc = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
+palette = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+imageproc = { workspace = true, optional = true }

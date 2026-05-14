@@ -142,6 +142,12 @@ impl UiTestServer {
                 video_output: video_path.clone(),
                 video_bitrate: Some(resolved_bitrate),
                 video_fps: None,
+                // MCP sessions don't use the visual locator; leave the
+                // ocrs engine cold (ignored unless `visual` feature is on).
+                prewarm_visual: false,
+                visual_region_tuning: Default::default(),
+                visual_text_tuning: Default::default(),
+                visual_click_tuning: Default::default(),
             },
         )
         .await

@@ -66,6 +66,10 @@ async fn main() -> anyhow::Result<()> {
             video_output: Some(video_path.clone()),
             video_bitrate: None,
             video_fps: None,
+            prewarm_visual: false,
+            visual_region_tuning: Default::default(),
+            visual_text_tuning: Default::default(),
+            visual_click_tuning: Default::default(),
         },
     )
     .await?;

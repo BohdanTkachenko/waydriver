@@ -10,6 +10,10 @@
 //!   classes real-world GNOME apps use.
 //! - **dnd** — drag-and-drop source + target, for exercising pointer-based
 //!   drag flows.
+//! - **lazy-a11y** — minimal repros for two libadwaita lazy-realization
+//!   bugs that hide widgets from AT-SPI: a `PreferencesGroup` built with
+//!   `visible:false` then flipped on, and an `AdwPreferencesDialog` where
+//!   `set_visible_page_name` switches to a never-realized page.
 //!
 //! Only the selected section's widgets live in the AT-SPI tree — no
 //! hidden sibling subtrees and no "show everything at once" mode. That's
@@ -22,8 +26,8 @@
 //! ## CLI
 //!
 //! `--section=<name>` (or the legacy alias `--tab=<name>`). Accepts
-//! `gtk4`, `adw` / `libadwaita`, or `dnd` / `drag-and-drop`. Default is
-//! `gtk4`.
+//! `gtk4`, `adw` / `libadwaita`, `dnd` / `drag-and-drop`, or `lazy-a11y`.
+//! Default is `gtk4`.
 //!
 //! ## Main menu
 //!
@@ -79,6 +83,7 @@ enum Section {
     Gtk4,
     Adw,
     Dnd,
+    LazyA11y,
 }
 
 impl Section {
@@ -87,6 +92,7 @@ impl Section {
             "gtk4" => Some(Section::Gtk4),
             "adw" | "libadwaita" => Some(Section::Adw),
             "dnd" | "drag-and-drop" => Some(Section::Dnd),
+            "lazy-a11y" | "lazy" => Some(Section::LazyA11y),
             _ => None,
         }
     }
@@ -99,6 +105,7 @@ impl Section {
             Section::Gtk4 => "gtk4",
             Section::Adw => "adw",
             Section::Dnd => "dnd",
+            Section::LazyA11y => "lazy-a11y",
         }
     }
 
@@ -110,6 +117,7 @@ impl Section {
             Section::Gtk4 => "GTK4",
             Section::Adw => "libadwaita",
             Section::Dnd => "Drag and drop",
+            Section::LazyA11y => "Lazy a11y",
         }
     }
 }
@@ -205,6 +213,7 @@ fn build_section(section: Section, window: &adw::ApplicationWindow) -> ScrolledW
         Section::Gtk4 => append_gtk4_widgets(&col, window),
         Section::Adw => append_adw_widgets(&col, window),
         Section::Dnd => append_dnd_widgets(&col),
+        Section::LazyA11y => append_lazy_a11y_widgets(&col, window),
     }
 
     scroll.set_child(Some(&col));
@@ -448,6 +457,10 @@ fn build_menu_button(initial: Section) -> MenuButton {
         Some("Drag and drop"),
         Some("app.section::dnd"),
     ));
+    menu.append_item(&gio::MenuItem::new(
+        Some("Lazy a11y"),
+        Some("app.section::lazy-a11y"),
+    ));
 
     let popover = PopoverMenu::from_model(Some(&menu));
 
@@ -662,6 +675,126 @@ fn build_drop_target(status: &Label) -> Label {
     label.add_controller(drop);
 
     label
+}
+
+// ── Lazy-a11y repros (libadwaita realization bugs) ───────────────────────
+//
+// Two minimal reproductions of libadwaita widgets that exist on screen
+// but never enter the AT-SPI tree because their accessible subtree is
+// built lazily on first realization and not rebuilt on later visibility
+// or page-switch changes.
+//
+// `hidden-group` repro — hidden-then-shown PreferencesGroup *inside an
+// AdwPreferencesDialog page*. A naive top-level repro (group → window
+// content) does NOT trigger the bug — the group's accessibles surface
+// fine. The bug surfaces only when the toggled group is nested inside an
+// `AdwPreferencesPage` (the real-world shape: a settings dialog whose
+// layout swaps between an empty-state group and a populated-state group).
+// Open the dialog via the `open-hidden-group-dialog` button; the dialog
+// presents on page1 with a hidden `hidden-group-target` group and flips
+// it visible 300ms later. The `lazy-button` `AdwButtonRow` inside remains
+// absent from AT-SPI.
+//
+// `non-initial-page` repro — non-initial AdwPreferencesDialog page. Open
+// via `open-non-initial-page-dialog`: the dialog has two pages, calls
+// `set_visible_page_name("page2")` right after `present()`. The
+// `lazy-switch` `AdwSwitchRow` on page2 is drawn on screen but never enters
+// the AT-SPI tree because non-initial pages aren't realized at construction.
+//
+// The control widget `lazy-control` always appears, so tests can confirm
+// the section loaded before opening either dialog.
+
+fn append_lazy_a11y_widgets(col: &GtkBox, parent: &adw::ApplicationWindow) {
+    let control = Label::new(Some("lazy-control"));
+    name(&control, "lazy-control");
+    col.append(&control);
+
+    // hidden-group repro trigger button.
+    let open_hidden_group = instrumented_button("open-hidden-group-dialog");
+    let parent_for_hidden_group = parent.clone();
+    open_hidden_group.connect_clicked(move |_| {
+        let dialog = adw::PreferencesDialog::new();
+
+        let page1 = adw::PreferencesPage::builder()
+            .name("page1")
+            .title("Page 1")
+            .build();
+
+        // Visible-from-the-start group acts as a sanity check: its rows
+        // do surface in AT-SPI, so tests can confirm the dialog itself
+        // is queryable before asserting on the absent lazy widgets.
+        let control_group = adw::PreferencesGroup::builder()
+            .title("hidden-group-control-group")
+            .build();
+        let control_row = adw::ButtonRow::builder()
+            .title("hidden-group-control-row")
+            .build();
+        control_row.connect_activated(|_| emit("activated hidden-group-control-row"));
+        control_group.add(&control_row);
+        page1.add(&control_group);
+
+        // Hidden-at-construction group; flipped visible after present().
+        // The `lazy-button` inside is the widget we expect to be missing
+        // from AT-SPI even though it renders on screen.
+        let target_group = adw::PreferencesGroup::builder()
+            .title("hidden-group-target-group")
+            .build();
+        target_group.set_visible(false);
+        let lazy_button = adw::ButtonRow::builder().title("lazy-button").build();
+        lazy_button.connect_activated(|_| emit("activated lazy-button"));
+        target_group.add(&lazy_button);
+        page1.add(&target_group);
+
+        dialog.add(&page1);
+        dialog.connect_closed(|_| emit("dialog-closed hidden-group-dialog"));
+        dialog.present(Some(&parent_for_hidden_group));
+        emit("dialog-opened hidden-group-dialog");
+
+        let group_for_show = target_group.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+            group_for_show.set_visible(true);
+            emit("lazy-shown hidden-group-target-group");
+        });
+    });
+    col.append(&open_hidden_group);
+
+    // non-initial-page repro trigger button.
+    let open_non_initial_page = instrumented_button("open-non-initial-page-dialog");
+    let parent_for_non_initial_page = parent.clone();
+    open_non_initial_page.connect_clicked(move |_| {
+        let dialog = adw::PreferencesDialog::new();
+
+        let page1 = adw::PreferencesPage::builder()
+            .name("page1")
+            .title("Page 1")
+            .build();
+        let p1_group = adw::PreferencesGroup::builder()
+            .title("non-initial-page-control-group")
+            .build();
+        page1.add(&p1_group);
+
+        let page2 = adw::PreferencesPage::builder()
+            .name("page2")
+            .title("Page 2")
+            .build();
+        let p2_group = adw::PreferencesGroup::builder()
+            .title("non-initial-page-target-group")
+            .build();
+        let switch = adw::SwitchRow::builder().title("lazy-switch").build();
+        switch.connect_active_notify(|s| {
+            emit(&format!("toggled lazy-switch active={}", s.is_active()));
+        });
+        p2_group.add(&switch);
+        page2.add(&p2_group);
+
+        dialog.add(&page1);
+        dialog.add(&page2);
+        dialog.connect_closed(|_| emit("dialog-closed non-initial-page-dialog"));
+        dialog.present(Some(&parent_for_non_initial_page));
+        dialog.set_visible_page_name("page2");
+        emit("dialog-opened non-initial-page-dialog");
+    });
+    col.append(&open_non_initial_page);
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────

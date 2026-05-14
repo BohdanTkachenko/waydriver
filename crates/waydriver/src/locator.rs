@@ -182,12 +182,29 @@ impl Locator {
 
     /// Scope a sub-expression to the nodes matched by this locator.
     ///
-    /// If `sub` is absolute (starts with `/`), it replaces the current
-    /// selector entirely. Otherwise it's evaluated as descendants of the
-    /// current matches: `(self)//sub`.
+    /// Composition rules, chosen to match how Selenium/Playwright users
+    /// typically reason about chained finders:
+    ///
+    /// - `loc.locate("foo")` (no leading slash) — descendants of the
+    ///   current matches: `(self)//foo`.
+    /// - `loc.locate("//foo")` — also descendants of the current
+    ///   matches: `(self)//foo`. `//` here means "anywhere under this
+    ///   locator", not "anywhere in the document," because that's the
+    ///   useful interpretation when you've already narrowed to a
+    ///   subtree. This is the common test-framework convention.
+    /// - `loc.locate(".//foo")` — same as above; explicit XPath
+    ///   descendant-axis form.
+    /// - `loc.locate("/foo")` (single leading slash, no second slash)
+    ///   — absolute, replaces the selector entirely. Use this when you
+    ///   genuinely need to break out of the current scope.
     pub fn locate(&self, sub: &str) -> Locator {
         let trimmed = sub.trim();
-        let new_xpath = if trimmed.starts_with('/') {
+        let new_xpath = if let Some(rest) = trimmed.strip_prefix("//") {
+            format!("({})//{}", self.xpath, rest)
+        } else if let Some(rest) = trimmed.strip_prefix(".//") {
+            format!("({})//{}", self.xpath, rest)
+        } else if trimmed.starts_with('/') {
+            // Single leading slash → absolute path, replaces.
             trimmed.to_string()
         } else {
             format!("({})//{}", self.xpath, trimmed)
@@ -858,6 +875,250 @@ impl Locator {
             .await
     }
 
+    /// Take a screenshot of just this element — full-frame screen
+    /// capture cropped to the AT-SPI-reported bounds. Useful for
+    /// visual debugging, pixel diffs of a single widget, or feeding a
+    /// narrow region to OCR via [`find_by_text`](Self::find_by_text).
+    ///
+    /// Auto-waits for the element to exist and produce bounds. Returns
+    /// PNG bytes, same encoding as
+    /// [`Session::take_screenshot`](crate::Session::take_screenshot).
+    /// Errors when the locator has no AT-SPI bounds, or when the
+    /// bounds extend past the screen edge in a way that would crop to
+    /// zero pixels.
+    pub async fn screenshot(&self) -> Result<Vec<u8>> {
+        let info = self.wait_for_existing().await?;
+        let bounds = info.bounds.ok_or_else(|| {
+            Error::atspi(format!(
+                "screenshot: target {} has no AT-SPI bounds to crop to",
+                self.xpath
+            ))
+        })?;
+
+        let raw = self.session.take_screenshot().await?;
+        let full = decode_screenshot_png(&raw)?;
+        let cropped = crop_to_bounds(full, bounds)?;
+
+        let mut out = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut out);
+        cropped
+            .write_with_encoder(encoder)
+            .map_err(|e| Error::screenshot_with("encode cropped PNG", e))?;
+        Ok(out)
+    }
+
+    /// OCR-backed visual locator pre-scoped to this element's
+    /// screen-rectangle. Returns a [`VisualLocator`](crate::VisualLocator)
+    /// that searches *only* within the AT-SPI bounds of this locator —
+    /// the screenshot is cropped before OCR runs, which makes searches
+    /// inside a known parent both faster (less pixels) and more
+    /// accurate (less surrounding text to confuse the recogniser).
+    ///
+    /// Use this when AT-SPI sees the parent but not the target widget
+    /// (the motivating case is libadwaita's lazy-realization bugs —
+    /// the parent dialog is queryable, the populated row is not).
+    /// Requires the `visual` Cargo feature on `waydriver`.
+    #[cfg(feature = "visual")]
+    pub async fn find_by_text(
+        &self,
+        text: &str,
+    ) -> Result<crate::visual::VisualLocator> {
+        let info = self.wait_for_existing().await?;
+        let bounds = info.bounds.ok_or_else(|| {
+            Error::atspi(format!(
+                "find_by_text: parent locator {} has no AT-SPI bounds; \
+                 use Session::find_by_text(...).within(rect) with an explicit \
+                 rect when the parent doesn't expose Component extents",
+                self.xpath
+            ))
+        })?;
+        Ok(self.session.find_by_text(text).within(bounds))
+    }
+
+    /// Template-matching locator pre-scoped to this element's
+    /// AT-SPI screen rectangle. Returns an
+    /// [`ImageLocator`](crate::visual::ImageLocator) restricted to
+    /// the cropped region — faster than a screen-wide search and
+    /// fewer false positives.
+    ///
+    /// See [`Session::find_image`](crate::Session::find_image) for
+    /// the matching algorithm and when to reach for this vs.
+    /// [`find_by_text`](Self::find_by_text). Requires the `visual`
+    /// Cargo feature.
+    #[cfg(feature = "visual")]
+    pub async fn find_image(
+        &self,
+        png_bytes: &[u8],
+    ) -> Result<crate::visual::ImageLocator> {
+        let info = self.wait_for_existing().await?;
+        let bounds = info.bounds.ok_or_else(|| {
+            Error::atspi(format!(
+                "find_image: parent locator {} has no AT-SPI bounds; \
+                 use Session::find_image(...)?.within(rect) with an explicit \
+                 rect when the parent doesn't expose Component extents",
+                self.xpath
+            ))
+        })?;
+        Ok(self
+            .session
+            .find_image(png_bytes)?
+            .within(bounds))
+    }
+
+    /// Find all visually-distinct enclosing regions around `inner`,
+    /// scoped to this locator's AT-SPI bounds. A region is a
+    /// contiguous block of pixels whose colour is within tolerance
+    /// of a seed sample — typically a button's pill, a row's rounded
+    /// rectangle, a card's frame. Works for any closed shape (pills,
+    /// circles, polygon icons), not just rectangles.
+    ///
+    /// Returned **outermost-first**: index 0 is the outermost region
+    /// inside this locator's bounds; the last element is the tightest
+    /// region around `inner`. Order matches the call-site mental
+    /// model — start from the parent, the parent-adjacent region
+    /// comes first.
+    ///
+    /// Tolerance / iteration cap come from
+    /// [`Session::visual_region_tuning`].
+    #[cfg(feature = "visual")]
+    pub async fn find_regions(
+        &self,
+        inner: &crate::visual::VisualLocator,
+    ) -> Result<Vec<crate::visual::RegionLocator>> {
+        let (parent_bounds, inner_bbox, png) = self.region_inputs(inner).await?;
+        let mut regions = crate::visual::__region_sweep(
+            &self.session,
+            parent_bounds,
+            inner_bbox,
+            &png,
+            self.session.visual_region_tuning,
+        )?;
+        regions.reverse(); // outer-first for the public API
+        Ok(regions)
+    }
+
+    /// Outermost enclosing region (the parent-adjacent ring,
+    /// `find_regions[0]`). Runs the full sweep — no algorithmic
+    /// short-cut, but skips the intermediate `Vec` allocations.
+    #[cfg(feature = "visual")]
+    pub async fn first_region(
+        &self,
+        inner: &crate::visual::VisualLocator,
+    ) -> Result<crate::visual::RegionLocator> {
+        let (parent_bounds, inner_bbox, png) = self.region_inputs(inner).await?;
+        let regions = crate::visual::__region_sweep(
+            &self.session,
+            parent_bounds,
+            inner_bbox,
+            &png,
+            self.session.visual_region_tuning,
+        )?;
+        regions.into_iter().last().ok_or_else(|| {
+            Error::visual(format!(
+                "first_region: no enclosing region detected around {}",
+                self.xpath
+            ))
+        })
+    }
+
+    /// Enumerate every line of text OCR can recognise inside this
+    /// locator's AT-SPI bounds. Returns one [`TextHit`](crate::TextHit)
+    /// per recognised line (words joined with spaces, plus the
+    /// union bbox covering all words in the line, in screen
+    /// coordinates).
+    ///
+    /// Useful for test discovery ("what labels are visible in this
+    /// dialog?") and for fuzzy-locator workflows that pick a target
+    /// after seeing what's on screen rather than hard-coding the
+    /// text. No substring filter is applied — for searches use
+    /// [`find_by_text`](Self::find_by_text) instead.
+    #[cfg(feature = "visual")]
+    pub async fn list_text(&self) -> Result<Vec<crate::visual::TextHit>> {
+        let info = self.wait_for_existing().await?;
+        let scope = info.bounds.ok_or_else(|| {
+            Error::atspi(format!(
+                "list_text: parent locator {} has no AT-SPI bounds",
+                self.xpath
+            ))
+        })?;
+        let png = self.session.take_screenshot().await?;
+        crate::visual::__list_text(&self.session, scope, png).await
+    }
+
+    /// Pair every OCR'd line in this locator's bounds with the visual
+    /// region (button pill / row / card frame) that contains it.
+    /// Equivalent to running [`list_text`](Self::list_text) and then
+    /// [`last_region`](Self::last_region) for every hit, but the
+    /// screenshot is taken once and reused.
+    ///
+    /// Heavier than `list_text` (one flood-fill per label), but
+    /// produces a complete map of "every text-bearing widget in
+    /// this scope and the shape it sits in" — useful for visual
+    /// regression diffs, dynamic test selectors, and debugging.
+    #[cfg(feature = "visual")]
+    pub async fn list_labelled_regions(
+        &self,
+    ) -> Result<Vec<(crate::visual::TextHit, crate::visual::RegionLocator)>> {
+        let info = self.wait_for_existing().await?;
+        let scope = info.bounds.ok_or_else(|| {
+            Error::atspi(format!(
+                "list_labelled_regions: parent locator {} has no AT-SPI bounds",
+                self.xpath
+            ))
+        })?;
+        let png = self.session.take_screenshot().await?;
+        crate::visual::__list_labelled_regions(
+            &self.session,
+            scope,
+            png,
+            self.session.visual_region_tuning,
+        )
+        .await
+    }
+
+    /// Innermost enclosing region (`find_regions[last]`). **Cheap** —
+    /// one flood-fill from a seed adjacent to `inner`, no chain walk.
+    /// Use when you've located a button label via OCR and want to
+    /// click the button pill that surrounds it rather than its text
+    /// glyphs.
+    #[cfg(feature = "visual")]
+    pub async fn last_region(
+        &self,
+        inner: &crate::visual::VisualLocator,
+    ) -> Result<crate::visual::RegionLocator> {
+        let (parent_bounds, inner_bbox, png) = self.region_inputs(inner).await?;
+        crate::visual::__region_last_only(
+            &self.session,
+            parent_bounds,
+            inner_bbox,
+            &png,
+            self.session.visual_region_tuning,
+        )
+    }
+
+    /// Shared input gathering for the three region methods: resolve
+    /// `self`'s AT-SPI bounds, resolve `inner`'s OCR bbox, take a
+    /// fresh screenshot. Each region call re-screenshots so the
+    /// flood reflects the current screen state — same per-call
+    /// freshness as the AT-SPI snapshot.
+    #[cfg(feature = "visual")]
+    async fn region_inputs(
+        &self,
+        inner: &crate::visual::VisualLocator,
+    ) -> Result<(crate::atspi::Rect, crate::atspi::Rect, Vec<u8>)> {
+        let info = self.wait_for_existing().await?;
+        let parent_bounds = info.bounds.ok_or_else(|| {
+            Error::atspi(format!(
+                "find_regions: parent locator {} has no AT-SPI bounds; \
+                 supply an explicit scope via Session::find_by_text(...).within(rect)",
+                self.xpath
+            ))
+        })?;
+        let inner_bbox = inner.bounds().await?;
+        let png = self.session.take_screenshot().await?;
+        Ok((parent_bounds, inner_bbox, png))
+    }
+
     /// Right-click the matched element at its centre, typically opening
     /// the widget's context menu.
     ///
@@ -1242,6 +1503,49 @@ impl Locator {
 ///
 /// Used only by the fallback path of [`Locator::scroll_into_view`]; kept
 /// free-standing so it can be unit-tested without spinning up a session.
+/// Decode the PNG bytes returned by [`Session::take_screenshot`] into
+/// an in-memory image. Centralised so error messages stay consistent
+/// between the cropping path (`Locator::screenshot`) and the OCR path
+/// (`VisualLocator`), and so a future capture-backend that returns a
+/// different envelope (raw RGBA, jpeg, etc.) has exactly one place to
+/// adapt.
+pub(crate) fn decode_screenshot_png(bytes: &[u8]) -> Result<image::DynamicImage> {
+    // The GStreamer keepalive stream emits a small textual status
+    // chunk before the PNG magic on some builds; the existing e2e
+    // tests handle that via `extract_png` at the test layer. We don't
+    // strip here — capture backends are expected to return clean PNGs.
+    image::load_from_memory(bytes)
+        .map_err(|e| Error::screenshot_with("decode screenshot PNG", e))
+}
+
+/// Crop `img` to the screen-rectangle in `bounds`. Returns an error
+/// when the rectangle is wholly outside the image or has zero area
+/// after clamping. The clamp keeps `screenshot()` working when AT-SPI
+/// reports bounds slightly off the screen edge (one-pixel rounding,
+/// off-by-ones in toolkit allocations).
+pub(crate) fn crop_to_bounds(
+    img: image::DynamicImage,
+    bounds: crate::atspi::Rect,
+) -> Result<image::DynamicImage> {
+    use image::GenericImageView;
+    let (iw, ih) = img.dimensions();
+    let x = bounds.x.max(0) as u32;
+    let y = bounds.y.max(0) as u32;
+    if x >= iw || y >= ih {
+        return Err(Error::screenshot(format!(
+            "crop: bounds {bounds:?} lie outside the {iw}x{ih} screenshot"
+        )));
+    }
+    let w = (bounds.width.max(0) as u32).min(iw - x);
+    let h = (bounds.height.max(0) as u32).min(ih - y);
+    if w == 0 || h == 0 {
+        return Err(Error::screenshot(format!(
+            "crop: bounds {bounds:?} clamp to zero area inside {iw}x{ih} screenshot"
+        )));
+    }
+    Ok(img.crop_imm(x, y, w, h))
+}
+
 fn wheel_direction(elem: &crate::atspi::Rect, scrollable: &crate::atspi::Rect) -> i32 {
     if elem.y < scrollable.y {
         -1
@@ -1643,11 +1947,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn locator_locate_absolute_replaces_scope() {
+    async fn locator_locate_double_slash_composes_descendant() {
         let s = test_session();
         let dialog = s.locate("//Dialog");
-        // Absolute sub-xpath ignores the outer scope entirely.
-        assert_eq!(dialog.locate("//Menu").xpath(), "//Menu");
+        // `//Menu` inside a sub-locator is descendant-of-current,
+        // matching Selenium/Playwright convention rather than the
+        // strict-XPath "anywhere in the document" reading.
+        assert_eq!(
+            dialog.locate("//Menu").xpath(),
+            "(//Dialog)//Menu"
+        );
+    }
+
+    #[tokio::test]
+    async fn locator_locate_dot_slash_composes_descendant() {
+        let s = test_session();
+        let dialog = s.locate("//Dialog");
+        assert_eq!(
+            dialog.locate(".//Menu").xpath(),
+            "(//Dialog)//Menu"
+        );
+    }
+
+    #[tokio::test]
+    async fn locator_locate_single_slash_replaces_scope() {
+        let s = test_session();
+        let dialog = s.locate("//Dialog");
+        // Single leading slash is the explicit "break out of scope"
+        // escape hatch for the rare case where you've narrowed too far.
+        assert_eq!(dialog.locate("/Menu").xpath(), "/Menu");
     }
 
     #[tokio::test]

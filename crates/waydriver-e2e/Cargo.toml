@@ -13,7 +13,7 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-waydriver = { path = "../waydriver" }
+waydriver = { path = "../waydriver", features = ["visual"] }
 waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter" }
 waydriver-input-mutter = { path = "../waydriver-input-mutter" }
 waydriver-capture-mutter = { path = "../waydriver-capture-mutter" }

@@ -65,6 +65,308 @@ pub struct SessionConfig {
     /// `video_output` is `Some`. When `None`, falls back to
     /// [`crate::capture::DEFAULT_VIDEO_FPS`].
     pub video_fps: Option<u32>,
+    /// When true and the `visual` Cargo feature is enabled, spawn a
+    /// background task during [`Session::start`] that downloads any
+    /// missing ocrs model files and loads the [`ocrs::OcrEngine`]. This
+    /// keeps the first
+    /// [`Session::find_by_text`](crate::Session::find_by_text) call
+    /// off the test's critical path: when the test eventually reaches an
+    /// OCR-based assertion, the engine is either already ready or about
+    /// to be — the call awaits the prewarm without doing the load work
+    /// twice.
+    ///
+    /// The field is always present so adding the visual feature on a
+    /// downstream crate doesn't break existing callers; without the
+    /// feature, the value is read and ignored.
+    pub prewarm_visual: bool,
+    /// Per-session tuning knobs for `Locator::find_regions` /
+    /// `first_region` / `last_region` (the flood-fill-based visual
+    /// region detection). The defaults work for stock Adw themes;
+    /// override when flood-fill over-grows (lower `tolerance`) or
+    /// under-grows (raise `tolerance`). Has no effect unless one of
+    /// the region APIs is actually called.
+    pub visual_region_tuning: VisualRegionTuning,
+
+    /// Per-session tuning knobs for OCR multi-line block grouping
+    /// (the geometric clustering that decides when consecutive
+    /// `TextLine`s belong to the same logical label). Defaults
+    /// work for stock Adw themes; override when wrapped labels are
+    /// being split across blocks (raise the gap factor) or
+    /// unrelated rows are being merged (lower it).
+    pub visual_text_tuning: VisualTextTuning,
+
+    /// Per-session tuning knobs for the headless-mutter cold-start
+    /// pointer-routing workaround applied by
+    /// [`VisualLocator::click`](crate::VisualLocator::click) and
+    /// [`RegionLocator::click`](crate::RegionLocator::click).
+    /// Defaults work for stock headless mutter; disable the warmup
+    /// or shorten the settle times on real hardware where the race
+    /// doesn't apply.
+    pub visual_click_tuning: VisualClickTuning,
+}
+
+/// Which colour-distance metric the visual locator uses when
+/// comparing pixels. See the `crate::visual::color` module docs for
+/// the full tradeoffs; the short version: [`Rgb`](Self::Rgb) is
+/// cheap but non-perceptual, [`LabCie76`](Self::LabCie76) (default)
+/// is cheap and roughly perceptual, [`LabCie2000`](Self::LabCie2000)
+/// is the perceptual gold standard at ~5× the cost.
+///
+/// Exposed as a top-level type (rather than living inside the
+/// feature-gated `visual` module) so it can sit in
+/// [`VisualRegionTuning`] / [`VisualTextTuning`] fields without
+/// forcing every consumer to enable the `visual` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorDistance {
+    /// Raw RGB Euclidean squared distance — cheap, not perceptual.
+    Rgb,
+    /// CIE Lab ΔE\*76 squared — perceptual, cheap. The default.
+    LabCie76,
+    /// CIE Lab ΔE\*00 squared — perceptual gold standard, ~5×
+    /// slower than `LabCie76`.
+    LabCie2000,
+}
+
+impl Default for ColorDistance {
+    fn default() -> Self {
+        Self::LabCie76
+    }
+}
+
+/// Knobs for the visual region detection used by
+/// [`Locator::find_regions`](crate::Locator::find_regions) /
+/// [`first_region`](crate::Locator::first_region) /
+/// [`last_region`](crate::Locator::last_region). Set on the session
+/// at [`Session::start`] via [`SessionConfig::visual_region_tuning`].
+#[derive(Debug, Clone, Copy)]
+pub struct VisualRegionTuning {
+    /// RGB Euclidean distance threshold for "same region". Default 24.
+    /// Glyph antialiasing pixels typically jump 60+; subtle gradients
+    /// within a button surface stay under 20.
+    pub tolerance: u8,
+    /// Hard cap on the iteration chain so a high-frequency banded
+    /// image can't produce thousands of regions. Default 16; the
+    /// realistic widget tree depth is usually 3–5.
+    pub max_regions: usize,
+
+    /// Squared RGB distance below which the seed-pick uniformity
+    /// check considers a candidate seed and its 2px-out neighbour
+    /// "uniform" (i.e. safe to flood from). Default 100 → ~10 RGB
+    /// units of slack. Raise on noisy backgrounds, lower for very
+    /// strict uniformity.
+    pub seed_uniformity_threshold_sq: u32,
+
+    /// Minimum fill-ratio (pixel_count / bbox_area) for a flood with
+    /// all four corners inside to classify as
+    /// [`Shape::Rectangle`](crate::Shape). Default 0.97 — perfect
+    /// rectangles score 1.0; slight antialias fringe trims a small
+    /// fraction off.
+    pub shape_rectangle_min_ratio: f64,
+
+    /// Minimum fill-ratio for a flood with 0–1 corners inside to
+    /// classify as [`Shape::Pill`](crate::Shape). Default 0.82 —
+    /// typical Adw rounded buttons land 0.94–0.99.
+    pub shape_pill_min_ratio: f64,
+
+    /// Half-open fill-ratio range `[lo, hi)` for a flood with zero
+    /// corners inside to classify as [`Shape::Ellipse`](crate::Shape).
+    /// Default `(0.65, 0.83)` — a true circle scores π/4 ≈ 0.785.
+    pub shape_ellipse_ratio_range: (f64, f64),
+
+    /// Which colour-distance metric the flood-fill and seed-pick use
+    /// when comparing pixels.
+    /// [`ColorDistance::LabCie76`](crate::ColorDistance) (default) is
+    /// roughly perceptual at low cost; [`ColorDistance::Rgb`] matches
+    /// the original raw-RGB behaviour; [`ColorDistance::LabCie2000`]
+    /// is the gold-standard perceptual distance, ~5× slower.
+    pub color_distance: ColorDistance,
+}
+
+impl Default for VisualRegionTuning {
+    fn default() -> Self {
+        Self {
+            tolerance: 24,
+            max_regions: 16,
+            seed_uniformity_threshold_sq: 100,
+            shape_rectangle_min_ratio: 0.97,
+            shape_pill_min_ratio: 0.82,
+            shape_ellipse_ratio_range: (0.65, 0.83),
+            color_distance: ColorDistance::default(),
+        }
+    }
+}
+
+/// Knobs for OCR text-line grouping into multi-line blocks. Set on
+/// the session at [`Session::start`] via
+/// [`SessionConfig::visual_text_tuning`]. Two consecutive OCR lines
+/// join the same block when they are vertically close (paragraph
+/// spacing) and their x-ranges overlap; the thresholds here tune
+/// what "close" and "overlap" mean.
+#[derive(Debug, Clone, Copy)]
+pub struct VisualTextTuning {
+    /// Maximum vertical gap between consecutive OCR lines for them
+    /// to count as paragraph-mates, expressed as a multiple of the
+    /// upper line's height. Default `0.6` — lines whose top is
+    /// within 60% of the previous line's height count as part of
+    /// the same block.
+    ///
+    /// Increase for sparse, large-line-spacing UIs; decrease for
+    /// dense layouts where unrelated rows sit close together.
+    pub multiline_max_gap_factor: f32,
+
+    /// Slack (in pixels) added to the x-overlap requirement when
+    /// deciding whether two lines belong to the same block. With
+    /// `0`, lines must have strictly overlapping x-ranges. With
+    /// positive values, lines that almost-but-not-quite overlap
+    /// (a centred line whose ends differ slightly from a left-
+    /// aligned line above) still join. Default `4` — generous
+    /// enough for typical font metrics, tight enough to keep
+    /// separate columns apart.
+    pub multiline_x_slack_px: i32,
+
+    /// RGB Euclidean distance threshold for "same background
+    /// colour" when deciding whether the gap between two candidate-
+    /// merge lines crosses a visual boundary. Default 24, matching
+    /// the region-tolerance default. Set to `u8::MAX` to disable
+    /// the background-colour check entirely.
+    pub background_color_tolerance: u8,
+
+    /// When true (default), the grouper scans the gap between two
+    /// candidate-merge lines for a horizontal or vertical divider
+    /// stripe — a row or column of pixels whose colour differs
+    /// from both surrounding backgrounds. A divider veto'es the
+    /// merge. Disable on themes where shadow rasters or anti-
+    /// aliased streaks trip the heuristic.
+    pub divider_detection_enabled: bool,
+
+    /// Padding (in pixels) added to all four sides of the crop fed
+    /// to ocrs. The padding gives the recognition head visual
+    /// context that disambiguates small/low-contrast glyphs — without
+    /// it, e.g. `lazy-button` can read as `lazv-button`. Hits whose
+    /// bbox falls entirely inside the padding ring are filtered out
+    /// at the call site. Default 32. Set to 0 only when the caller
+    /// is explicitly scoping to text known to read cleanly without
+    /// context.
+    pub ocr_context_padding_px: i32,
+
+    /// Sample density per axis for the boundary-detection divider
+    /// scan. Each row in the gap between two candidate-merge OCR
+    /// lines is sampled at this many evenly-spaced x positions
+    /// (horizontal scan); each column gets this many y samples
+    /// (vertical scan). Default 16 — increase on very wide gaps
+    /// where a narrow divider could slip between sparse samples.
+    pub boundary_samples_per_axis: usize,
+
+    /// Fraction of samples that must be colour-different from BOTH
+    /// surrounding backgrounds for a gap row or column to count as
+    /// a divider. Default 0.8 — increase to require a more solid
+    /// stripe, decrease to be more lenient with broken/dotted
+    /// dividers.
+    pub boundary_majority_threshold: f32,
+
+    /// Radius (in pixels) of the square window averaged when
+    /// computing the "background colour" at a sample position
+    /// inside the boundary-detection check. A radius of `r`
+    /// averages a `(2r+1) × (2r+1)` window. Default 2 (5×5
+    /// window) — averaging smooths over single antialias-fringe
+    /// pixels that would skew a single-pixel sample. Set to 0
+    /// to fall back to a single-pixel sample.
+    pub background_sample_radius: u32,
+
+    /// Which colour-distance metric the boundary-detection check
+    /// uses when comparing background samples and divider-scan
+    /// pixels. [`ColorDistance::LabCie76`](crate::ColorDistance)
+    /// (default) is roughly perceptual at low cost; switch to
+    /// [`ColorDistance::Rgb`] to match the original raw-RGB
+    /// behaviour, or [`ColorDistance::LabCie2000`] for the
+    /// gold-standard perceptual distance (~5× slower).
+    pub color_distance: ColorDistance,
+
+    /// When true, the grouper runs a bounded flood-fill in the gap
+    /// between two candidate-merge OCR lines and refuses to merge
+    /// if the flood from the prev-line's background can't reach the
+    /// next-line's background. Catches "two cards on the same bg
+    /// colour, no visible divider, but each is boxed in by a thin
+    /// border" cases that the colour and divider checks miss.
+    /// Default `false` (off) — the most expensive of the boundary
+    /// checks; the cheap checks cover the common cases.
+    pub connectivity_check_enabled: bool,
+
+    /// Maximum pixels the connectivity-check flood-fill will visit
+    /// before giving up and vetoing the merge. Default 4096 — large
+    /// enough that a typical gap-region fits, small enough that a
+    /// pathological flood (seeded on the whole-screen background)
+    /// terminates quickly. Only consulted when
+    /// `connectivity_check_enabled == true`.
+    pub max_connectivity_pixels: usize,
+}
+
+impl Default for VisualTextTuning {
+    fn default() -> Self {
+        Self {
+            multiline_max_gap_factor: 0.6,
+            multiline_x_slack_px: 4,
+            background_color_tolerance: 24,
+            divider_detection_enabled: true,
+            ocr_context_padding_px: 32,
+            boundary_samples_per_axis: 16,
+            boundary_majority_threshold: 0.8,
+            background_sample_radius: 2,
+            color_distance: ColorDistance::default(),
+            connectivity_check_enabled: false,
+            max_connectivity_pixels: 4096,
+        }
+    }
+}
+
+/// Knobs for the headless-mutter cold-start pointer-routing
+/// workaround applied by
+/// [`VisualLocator::click`](crate::VisualLocator::click) and
+/// [`RegionLocator::click`](crate::RegionLocator::click).
+///
+/// Headless mutter has a documented cold-start race: the first
+/// `pointer_motion_absolute` after a fresh session start can be
+/// delivered before the compositor has bound pointer focus to the
+/// target surface, so a single motion+click pair silently does
+/// nothing. The workaround sends a warmup motion to a point just
+/// off the target, settles, motions to the target, settles, then
+/// presses the button (with its own settle between down and up).
+///
+/// Defaults match what the visual-locator first shipped with —
+/// known to defeat the race on stock headless mutter. On real
+/// hardware where the race doesn't apply, disable the warmup
+/// (`cold_start_warmup_enabled = false`) for a single
+/// motion + button-press round trip.
+#[derive(Debug, Clone, Copy)]
+pub struct VisualClickTuning {
+    /// When true (default), the warmup-motion-then-click sequence
+    /// runs before every visual click. Set to false to fall through
+    /// to a single motion + button-press, skipping all settles.
+    pub cold_start_warmup_enabled: bool,
+    /// Distance (in pixels) of the warmup motion from the target.
+    /// Far enough that mutter sees an actual motion delta on the
+    /// subsequent call, close enough that any pointer-enter event
+    /// fires for the right widget hierarchy. Default 4.
+    pub cold_start_warmup_offset_px: f64,
+    /// Sleep after each `pointer_motion_absolute` call in the
+    /// warmup sequence. Default 60ms — empirically reliable on
+    /// headless mutter; tighten on faster hosts.
+    pub cold_start_motion_settle: Duration,
+    /// Sleep between `pointer_button_down` and `pointer_button_up`.
+    /// Default 50ms — gives toolkits time to register a press as
+    /// a click rather than a stuck button.
+    pub cold_start_press_settle: Duration,
+}
+
+impl Default for VisualClickTuning {
+    fn default() -> Self {
+        Self {
+            cold_start_warmup_enabled: true,
+            cold_start_warmup_offset_px: 4.0,
+            cold_start_motion_settle: Duration::from_millis(60),
+            cold_start_press_settle: Duration::from_millis(50),
+        }
+    }
 }
 
 /// Buffer of lines emitted on the target app's stdout, with a Notify the
@@ -135,6 +437,30 @@ pub struct Session {
     /// leaving a stale handle behind; the reader also exits on its
     /// cancellation token, which is the cooperative path.
     stdout_reader: Option<JoinHandle<()>>,
+    /// Lazily-initialized ocrs `OcrEngine`, shared across all
+    /// [`VisualLocator`](crate::VisualLocator) calls in this session.
+    /// First caller (either the prewarm task or
+    /// [`Session::find_by_text`]) runs the init; concurrent callers
+    /// await the same `OnceCell` rather than duplicating work. The
+    /// stored value is a `Result` so a failed load short-circuits all
+    /// subsequent OCR attempts with the original error rather than
+    /// re-trying the load on every call.
+    #[cfg(feature = "visual")]
+    visual_engine: Arc<tokio::sync::OnceCell<crate::visual::EngineResult>>,
+    /// Region-detection tuning copied from [`SessionConfig`] at
+    /// session start. Read on every `Locator::find_regions` etc. call
+    /// so a runtime setter (future) can re-tune without invalidating
+    /// in-flight locators.
+    pub(crate) visual_region_tuning: VisualRegionTuning,
+    /// OCR block-grouping tuning copied from [`SessionConfig`] at
+    /// session start. Read every time `Substring`-mode matching
+    /// runs and every time `list_text` / `list_labelled_regions`
+    /// builds blocks.
+    pub(crate) visual_text_tuning: VisualTextTuning,
+    /// Visual click tuning copied from [`SessionConfig`] at session
+    /// start. Read by the cold-start warmup paths in
+    /// `VisualLocator::click` and `RegionLocator::click`.
+    pub(crate) visual_click_tuning: VisualClickTuning,
 }
 
 impl Session {
@@ -271,6 +597,23 @@ impl Session {
             None
         };
 
+        #[cfg(feature = "visual")]
+        let visual_engine = Arc::new(tokio::sync::OnceCell::new());
+
+        // Kick off the OCR engine load in the background if the caller
+        // opted in via `prewarm_visual`. The future is fire-and-forget;
+        // its result lands in `visual_engine` and the on-demand path in
+        // `find_by_text` reuses it. If the prewarm hasn't completed by
+        // the time `find_by_text` is called, the call awaits the same
+        // `OnceCell` initializer rather than starting a second load.
+        #[cfg(feature = "visual")]
+        if cfg.prewarm_visual {
+            let cell = visual_engine.clone();
+            tokio::spawn(async move {
+                let _ = cell.get_or_init(crate::visual::ensure_engine).await;
+            });
+        }
+
         let session = Session {
             id,
             app_name: cfg.app_name,
@@ -287,6 +630,11 @@ impl Session {
             compositor,
             stdout,
             stdout_reader,
+            #[cfg(feature = "visual")]
+            visual_engine,
+            visual_region_tuning: cfg.visual_region_tuning,
+            visual_text_tuning: cfg.visual_text_tuning,
+            visual_click_tuning: cfg.visual_click_tuning,
         };
 
         Ok(session)
@@ -663,6 +1011,87 @@ impl Session {
         self.locate(&find_by_name_xpath(name))
     }
 
+    /// OCR-backed visual locator. Use when a widget is drawn on screen
+    /// but absent from the AT-SPI tree (libadwaita's hidden-then-shown
+    /// `PreferencesGroup` inside an `AdwPreferencesPage` is the
+    /// motivating example) — *not* as a general fallback when an
+    /// XPath-based locator doesn't match.
+    ///
+    /// First call in a session is expensive (model load + inference,
+    /// hundreds of milliseconds to a few seconds). See
+    /// [`SessionConfig::prewarm_visual`] to move the load off the test's
+    /// critical path, and the [`crate::visual`] module docs for full
+    /// cost expectations.
+    #[cfg(feature = "visual")]
+    pub fn find_by_text(self: &Arc<Self>, text: &str) -> crate::visual::VisualLocator {
+        crate::visual::VisualLocator::new(self.clone(), text)
+    }
+
+    /// Find a reference image inside the current screen via classical
+    /// normalized cross-correlation (template matching). Returns an
+    /// [`ImageLocator`](crate::visual::ImageLocator); call `.click()`,
+    /// `.bounds()`, etc. on it.
+    ///
+    /// Use this for icon-only buttons that have no on-screen text
+    /// (the OCR-based [`find_by_text`](Self::find_by_text) won't find
+    /// them). The `png_bytes` are the contents of a reference PNG
+    /// captured against a screenshot of the same app — same DPI,
+    /// theme, antialias settings — committed alongside the test.
+    ///
+    /// Template matching is brittle: a theme swap or DPI change can
+    /// invalidate the reference. When AT-SPI exposes the widget, or
+    /// it has searchable text, prefer those paths.
+    ///
+    /// Requires the `visual` Cargo feature. The PNG is decoded once
+    /// at construction time and the screenshot is taken anew on each
+    /// terminal-method call, so the locator survives between calls.
+    #[cfg(feature = "visual")]
+    pub fn find_image(
+        self: &Arc<Self>,
+        png_bytes: &[u8],
+    ) -> Result<crate::visual::ImageLocator> {
+        crate::visual::ImageLocator::new(self.clone(), png_bytes, None)
+    }
+
+    /// Find the visual region containing the screen pixel `(x, y)`.
+    ///
+    /// Lowest-level entry point in the visual stack — no OCR, no
+    /// AT-SPI parent, just a flood-fill from the supplied pixel.
+    /// Useful when you already have coordinates (from a debugger,
+    /// a prior screenshot, a hard-coded layout assumption) and want
+    /// to address the widget at those coordinates rather than the
+    /// exact pixel.
+    ///
+    /// The pixel doesn't need to be the centre of the target region:
+    /// flood-fill is a BFS that recovers the same bbox / centroid /
+    /// shape from any starting point inside the region. The
+    /// constraint is just that `(x, y)` lands inside the region you
+    /// want — anywhere on a button's fill is fine, but a pixel on a
+    /// text glyph or on the gap between widgets gives you that
+    /// glyph's region or the gap's background.
+    ///
+    /// Requires the `visual` Cargo feature. Tolerance comes from
+    /// [`SessionConfig::visual_region_tuning`].
+    #[cfg(feature = "visual")]
+    pub async fn region_at(
+        self: &Arc<Self>,
+        x: i32,
+        y: i32,
+    ) -> Result<crate::visual::RegionLocator> {
+        let png = self.take_screenshot().await?;
+        crate::visual::__region_at_seed(self, (x, y), &png, self.visual_region_tuning)
+    }
+
+    /// Internal accessor for the shared ocrs engine cell. Used by
+    /// [`VisualLocator`](crate::VisualLocator) to fetch (and lazily
+    /// initialize) the engine.
+    #[cfg(feature = "visual")]
+    pub(crate) fn visual_engine(
+        &self,
+    ) -> &Arc<tokio::sync::OnceCell<crate::visual::EngineResult>> {
+        &self.visual_engine
+    }
+
     /// Locator matching an element by PascalCase role and accessible name.
     /// For example, `find_by_role_name("PushButton", "OK")` compiles to
     /// `//PushButton[@name='OK']`.
@@ -733,6 +1162,11 @@ impl Session {
             compositor,
             stdout: Arc::new(AppStdout::default()),
             stdout_reader: None,
+            #[cfg(feature = "visual")]
+            visual_engine: Arc::new(tokio::sync::OnceCell::new()),
+            visual_region_tuning: VisualRegionTuning::default(),
+            visual_text_tuning: VisualTextTuning::default(),
+            visual_click_tuning: VisualClickTuning::default(),
         }
     }
 

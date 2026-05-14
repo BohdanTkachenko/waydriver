@@ -75,6 +75,12 @@ pub enum Error {
         #[source]
         source: Option<BoxSource>,
     },
+
+    /// Visual-locator (OCR) failure: model-load failures, multi-match
+    /// disambiguation, or downloads that failed. Construct via
+    /// [`Error::visual`].
+    #[error("visual: {0}")]
+    Visual(String),
 }
 
 impl Error {
@@ -138,6 +144,11 @@ impl Error {
             message: format!("{operation}: {source}"),
             source: Some(Box::new(source)),
         }
+    }
+
+    /// Visual-locator failure with a free-form message.
+    pub fn visual(message: impl Into<String>) -> Self {
+        Error::Visual(message.into())
     }
 }
 

@@ -39,6 +39,28 @@ futures-util = "0.3"
 async-trait = "0.1"
 tempfile = "3"
 image = "0.25"
+# Pure-Rust OCR stack — gated to the `visual` feature on `waydriver`, so
+# this only compiles when a consumer opts in. See `crates/waydriver/src/visual/`.
+ocrs = "0.12"
+rten = "0.24"
+rten-imageproc = "0.24"
+# Pure-Rust HTTP client for downloading ocrs model files on first use.
+# Default features bring TLS via `rustls` so we avoid OpenSSL.
+ureq = "3"
+# Pure-Rust colour-space conversions used by the visual locator for
+# perceptual Lab/CIEDE2000 distance comparisons.
+palette = { version = "0.7", default-features = false, features = ["std"] }
+# Unicode normalization (NFKD + combining-mark stripping) used by the
+# visual locator's case-fold-and-accent-insensitive matcher.
+unicode-normalization = "0.1"
+# SHA-256 hashing for verifying downloaded ocrs model files.
+sha2 = "0.10"
+hex = "0.4"
+# Classical image processing — used by the visual locator's basic
+# template-matching path (`Locator::find_image`). Heavy-ish (~150kLoC
+# crate) but the most maintained option and the only one with a
+# tested NCC implementation we don't have to write ourselves.
+imageproc = { version = "0.25", default-features = false }
 gstreamer = "0.25"
 gstreamer-app = "0.25"
 sxd-document = "0.3"
