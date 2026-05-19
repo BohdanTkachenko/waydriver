@@ -1112,14 +1112,8 @@ fn block_haystack_variants(block: &OcrBlock) -> Vec<BlockVariant> {
             if wi > 0 {
                 let line_break_idx = line_starts.iter().skip(1).position(|&s| s == wi);
                 let joiner = match line_break_idx {
-                    Some(seam) => {
-                        if (mask >> seam) & 1 == 1 {
-                            ""
-                        } else {
-                            " "
-                        }
-                    }
-                    None => " ",
+                    Some(seam) if (mask >> seam) & 1 == 1 => "",
+                    _ => " ",
                 };
                 joined.push_str(joiner);
             }

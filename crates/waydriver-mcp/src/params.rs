@@ -270,6 +270,170 @@ pub struct PointerClickParams {
     pub button: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MovePointerAbsoluteParams {
+    /// Session ID
+    pub session_id: String,
+    /// Absolute screen X in logical pixels
+    pub x: f64,
+    /// Absolute screen Y in logical pixels
+    pub y: f64,
+}
+
+/// How OCR-recognised words are matched against the search text.
+///
+/// Wire form is snake_case so the JSON discriminator is rejected at
+/// serde-deserialise time instead of inside the tool body.
+#[derive(
+    Debug, Default, Deserialize, Serialize, schemars::JsonSchema, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchModeParam {
+    /// Case-insensitive substring (also accent-stripped). The default —
+    /// tolerates OCR noise better than `exact`.
+    #[default]
+    Substring,
+    /// Case-sensitive full-string equality on the recognised word.
+    /// Use when overlapping labels would substring-match (e.g. "Save"
+    /// matching both "Save" and "Save As").
+    Exact,
+}
+
+impl MatchModeParam {
+    pub fn to_waydriver(self) -> waydriver::MatchMode {
+        match self {
+            MatchModeParam::Substring => waydriver::MatchMode::Substring,
+            MatchModeParam::Exact => waydriver::MatchMode::Exact,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClickByTextParams {
+    /// Session ID
+    pub session_id: String,
+    /// Text to find on screen via OCR. Matched as a case-insensitive
+    /// substring against words/phrases the recogniser extracted from
+    /// the screenshot.
+    pub text: String,
+    /// Optional XPath of a parent element whose AT-SPI bounds restrict
+    /// the OCR search region. Faster (smaller crop) and more accurate
+    /// (no off-screen text confusing the recogniser). When omitted, the
+    /// whole screen is searched.
+    pub scope_xpath: Option<String>,
+    /// How OCR words are matched against `text`. Defaults to
+    /// `substring` (case-insensitive); pass `exact` when overlapping
+    /// labels in the same scope would substring-match each other.
+    #[serde(default)]
+    pub match_mode: Option<MatchModeParam>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClickTextRegionParams {
+    /// Session ID
+    pub session_id: String,
+    /// Text to find on screen via OCR.
+    pub text: String,
+    /// XPath of the surrounding container (a parent element with AT-SPI
+    /// bounds). Required because flood-fill needs a bounded region.
+    pub scope_xpath: String,
+    /// Which level of the enclosing-region chain to click. The chain is
+    /// ordered outermost-first (`0` = parent-adjacent ring, larger
+    /// indices = tighter regions around the text). Omit to click the
+    /// innermost region (typical for AdwButtonRow / AdwSwitchRow row
+    /// activation). Use a specific index after a `find_text_regions`
+    /// call has shown the chain.
+    #[serde(default)]
+    pub region_index: Option<usize>,
+    /// OCR match mode — see `click_by_text`. Defaults to `substring`.
+    #[serde(default)]
+    pub match_mode: Option<MatchModeParam>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindTextParams {
+    /// Session ID
+    pub session_id: String,
+    /// Text to find on screen via OCR. Matched as a case-insensitive
+    /// substring against words/phrases the recogniser extracted.
+    pub text: String,
+    /// Optional XPath of a parent element whose AT-SPI bounds restrict
+    /// the OCR search region. Faster (smaller crop) and more accurate
+    /// (no off-screen text). When omitted, the whole screen is searched.
+    pub scope_xpath: Option<String>,
+    /// OCR match mode — see `click_by_text`. Defaults to `substring`.
+    #[serde(default)]
+    pub match_mode: Option<MatchModeParam>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindTextRegionsParams {
+    /// Session ID
+    pub session_id: String,
+    /// Text to find on screen via OCR.
+    pub text: String,
+    /// XPath of the surrounding container (must expose AT-SPI bounds).
+    /// Required because the region chain walk needs a bounded scope.
+    pub scope_xpath: String,
+    /// OCR match mode — see `click_by_text`. Defaults to `substring`.
+    #[serde(default)]
+    pub match_mode: Option<MatchModeParam>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListTextParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath of a parent element whose AT-SPI bounds restrict the OCR
+    /// region. Defaults to the first element with bounds (the toplevel
+    /// widget area) when omitted.
+    pub scope_xpath: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ElementScreenshotParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath of the element to screenshot. The full-frame capture is
+    /// cropped to the element's AT-SPI bounds.
+    pub xpath: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ImageMatchParams {
+    /// Session ID
+    pub session_id: String,
+    /// Filesystem path to a reference PNG. The image is read once at
+    /// call time and matched against the current screenshot using
+    /// normalized cross-correlation. Paths are resolved relative to
+    /// the MCP server's working directory.
+    pub png_path: String,
+    /// Optional XPath of a parent element whose AT-SPI bounds restrict
+    /// the template-match region. Faster and more accurate when set.
+    pub scope_xpath: Option<String>,
+    /// NCC match threshold in [0, 1]. Higher = stricter. Library
+    /// default is 0.9 when omitted.
+    pub threshold: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WaitForStdoutLineParams {
+    /// Session ID
+    pub session_id: String,
+    /// Substring the matching line must contain (case-sensitive).
+    pub contains: String,
+    /// How long to wait before giving up, in milliseconds. Defaults to 5000.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Buffer-position cursor returned by a prior `wait_for_stdout_line` call
+    /// (or 0 to scan from the start). Use to skip lines emitted before the
+    /// action you're waiting on, so a repeated event-string can't match its
+    /// own past occurrence. Omitted = start from the current end of the
+    /// buffer (only new lines count).
+    #[serde(default)]
+    pub after: Option<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

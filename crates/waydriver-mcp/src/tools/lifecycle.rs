@@ -142,9 +142,11 @@ impl UiTestServer {
                 video_output: video_path.clone(),
                 video_bitrate: Some(resolved_bitrate),
                 video_fps: None,
-                // MCP sessions don't use the visual locator; leave the
-                // ocrs engine cold (ignored unless `visual` feature is on).
-                prewarm_visual: false,
+                // Visual tools (`click_by_text`) are exposed by this
+                // server, so kick off the ocrs model load in the
+                // background — keeps the first OCR call from paying
+                // the ~1-2s cold-start cost.
+                prewarm_visual: true,
                 visual_region_tuning: Default::default(),
                 visual_text_tuning: Default::default(),
                 visual_click_tuning: Default::default(),
