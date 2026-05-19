@@ -31,8 +31,8 @@
 //! `set_text`, `focus`, or any `is_<state>` predicate — those require
 //! AT-SPI handles, and faking them visually would mask real bugs.
 
-mod engine;
 mod color;
+mod engine;
 mod models;
 mod region;
 mod template;
@@ -80,9 +80,9 @@ pub use template::ImageLocator;
 // `Locator` can call them without breaking `region`'s pub(crate)
 // boundary. The double-underscore signals "implementation detail, not
 // part of the public crate API."
-pub(crate) use region::sweep_regions as __region_sweep;
 pub(crate) use region::last_region_only as __region_last_only;
 pub(crate) use region::region_at_seed as __region_at_seed;
+pub(crate) use region::sweep_regions as __region_sweep;
 
 // Locator::list_text and Locator::list_labelled_regions reach into
 // the visual module through these re-exports.
@@ -281,12 +281,9 @@ impl VisualLocator {
                         for (m_start, m_end) in
                             find_matches(&variant.joined, &needle, MatchMode::Substring)
                         {
-                            if let Some(rect) = union_bbox_for_match(
-                                &block.words,
-                                &variant.spans,
-                                m_start,
-                                m_end,
-                            ) {
+                            if let Some(rect) =
+                                union_bbox_for_match(&block.words, &variant.spans, m_start, m_end)
+                            {
                                 if let Some(scope) = self.region {
                                     if !rect.is_inside(&scope) {
                                         continue;
@@ -313,7 +310,9 @@ impl VisualLocator {
     /// after auto-wait, or when multiple matches found.
     pub async fn bounds(&self) -> Result<Rect> {
         let deadline = std::time::Instant::now()
-            + self.timeout.unwrap_or_else(|| self.session.default_timeout());
+            + self
+                .timeout
+                .unwrap_or_else(|| self.session.default_timeout());
         loop {
             let hits = self.matches().await?;
             match hits.len() {
@@ -340,9 +339,11 @@ impl VisualLocator {
     /// Wait until at least one match exists, or the timeout elapses.
     pub async fn wait_for_exists(&self) -> Result<()> {
         let deadline = std::time::Instant::now()
-            + self.timeout.unwrap_or_else(|| self.session.default_timeout());
+            + self
+                .timeout
+                .unwrap_or_else(|| self.session.default_timeout());
         loop {
-            if self.matches().await?.len() >= 1 {
+            if !self.matches().await?.is_empty() {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -563,9 +564,7 @@ fn merge_passes_boundary_check(
                         }
                     }
                 }
-                if sampled > 0
-                    && (differing as f32) / (sampled as f32) >= majority_threshold
-                {
+                if sampled > 0 && (differing as f32) / (sampled as f32) >= majority_threshold {
                     return false; // horizontal divider row
                 }
             }
@@ -590,9 +589,7 @@ fn merge_passes_boundary_check(
                         }
                     }
                 }
-                if sampled > 0
-                    && (differing as f32) / (sampled as f32) >= majority_threshold
-                {
+                if sampled > 0 && (differing as f32) / (sampled as f32) >= majority_threshold {
                     return false; // vertical divider column
                 }
             }
@@ -901,10 +898,10 @@ async fn ocr_lines(
                     let text: String = w.chars().iter().map(|c| c.char).collect();
                     let r = w.bounding_rect();
                     let rect = Rect {
-                        x: r.left() as i32 + origin_x,
-                        y: r.top() as i32 + origin_y,
-                        width: r.width() as i32,
-                        height: r.height() as i32,
+                        x: r.left() + origin_x,
+                        y: r.top() + origin_y,
+                        width: r.width(),
+                        height: r.height(),
                     };
                     (text, rect)
                 })
@@ -978,11 +975,7 @@ pub(crate) async fn list_text(
         image: &ocr.image,
         crop_origin: ocr.crop_origin,
     };
-    let blocks = group_lines_into_blocks(
-        ocr.lines,
-        session.visual_text_tuning,
-        Some(boundary),
-    );
+    let blocks = group_lines_into_blocks(ocr.lines, session.visual_text_tuning, Some(boundary));
     Ok(blocks
         .into_iter()
         .filter(|block| block.bbox.is_inside(&scope))
@@ -1011,11 +1004,7 @@ pub(crate) async fn list_labelled_regions(
         image: &ocr.image,
         crop_origin: ocr.crop_origin,
     };
-    let blocks = group_lines_into_blocks(
-        ocr.lines,
-        session.visual_text_tuning,
-        Some(boundary),
-    );
+    let blocks = group_lines_into_blocks(ocr.lines, session.visual_text_tuning, Some(boundary));
     let mut pairs = Vec::new();
     for block in blocks {
         if !block.bbox.is_inside(&scope) {
@@ -1231,9 +1220,7 @@ fn union_bbox_for_match(
 fn text_matches(haystack: &str, needle: &str, mode: MatchMode) -> bool {
     match mode {
         MatchMode::Exact => haystack == needle,
-        MatchMode::Substring => haystack
-            .to_lowercase()
-            .contains(&needle.to_lowercase()),
+        MatchMode::Substring => haystack.to_lowercase().contains(&needle.to_lowercase()),
     }
 }
 
@@ -1360,7 +1347,7 @@ mod tests {
         // the single space-join variant.
         let lines: Vec<OcrLine> = (0..6)
             .map(|i| {
-                let y = (i * 14) as i32;
+                let y = i * 14;
                 make_line(vec![("word", rect(0, y, 40, 10))])
             })
             .collect();
@@ -1372,7 +1359,11 @@ mod tests {
             let n_lines = block.line_break_word_indices.len() + 1;
             if n_lines > MAX_VARIANT_LINES {
                 let variants = block_haystack_variants(block);
-                assert_eq!(variants.len(), 1, "expected fallback to single-variant for {n_lines}-line block");
+                assert_eq!(
+                    variants.len(),
+                    1,
+                    "expected fallback to single-variant for {n_lines}-line block"
+                );
             }
         }
     }
@@ -1448,10 +1439,7 @@ mod tests {
             width: max_x - min_x,
             height: max_y - min_y,
         };
-        let words = words
-            .into_iter()
-            .map(|(t, r)| (t.to_string(), r))
-            .collect();
+        let words = words.into_iter().map(|(t, r)| (t.to_string(), r)).collect();
         OcrLine {
             joined,
             bbox,
@@ -1610,16 +1598,18 @@ mod tests {
             image: &img,
             crop_origin: (0, 0),
         };
-        let blocks =
-            group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
-        assert_eq!(blocks.len(), 2, "expected separate blocks on bg-colour change");
+        let blocks = group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected separate blocks on bg-colour change"
+        );
 
         // Sanity: without the boundary context, the same two lines
         // DO merge (geometric test alone is permissive).
         let line_a2 = make_line(vec![("Top", rect(0, 2, 60, 6))]);
         let line_b2 = make_line(vec![("Bot", rect(0, 18, 60, 6))]);
-        let blocks_no_check =
-            group_lines_into_blocks(vec![line_a2, line_b2], tuning, None);
+        let blocks_no_check = group_lines_into_blocks(vec![line_a2, line_b2], tuning, None);
         assert_eq!(
             blocks_no_check.len(),
             1,
@@ -1646,8 +1636,7 @@ mod tests {
             image: &img,
             crop_origin: (0, 0),
         };
-        let blocks =
-            group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
+        let blocks = group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
         assert_eq!(blocks.len(), 2, "horizontal divider should veto merge");
     }
 
@@ -1673,8 +1662,7 @@ mod tests {
             image: &img,
             crop_origin: (0, 0),
         };
-        let blocks =
-            group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
+        let blocks = group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
         assert_eq!(blocks.len(), 2, "vertical divider should veto merge");
     }
 
@@ -1724,8 +1712,7 @@ mod tests {
             image: &img,
             crop_origin: (0, 0),
         };
-        let blocks =
-            group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
+        let blocks = group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
         assert_eq!(
             blocks.len(),
             2,
@@ -1748,8 +1735,7 @@ mod tests {
             image: &img,
             crop_origin: (0, 0),
         };
-        let blocks =
-            group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
+        let blocks = group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
         assert_eq!(
             blocks.len(),
             1,
@@ -1771,8 +1757,7 @@ mod tests {
             image: &img,
             crop_origin: (0, 0),
         };
-        let blocks =
-            group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
+        let blocks = group_lines_into_blocks(vec![line_a, line_b], tuning, Some(ctx));
         assert_eq!(blocks.len(), 1, "clean paragraph should still merge");
         assert_eq!(blocks[0].joined, "Top Bot");
     }

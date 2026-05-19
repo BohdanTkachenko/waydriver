@@ -54,12 +54,10 @@ const RECOGNITION_ENV: &str = "WAYDRIVER_OCRS_RECOGNITION_MODEL";
 /// Expected SHA-256 of the `text-detection.rten` file as published on
 /// ocrs's S3 bucket. Captured 2026-05-16. Bump when upstream rebuilds
 /// the model (see module docs).
-const DETECTION_SHA256: &str =
-    "f15cfb56bd02c4bf478a20343986504a1f01e1665c2b3a0ad66340f054b1b5ca";
+const DETECTION_SHA256: &str = "f15cfb56bd02c4bf478a20343986504a1f01e1665c2b3a0ad66340f054b1b5ca";
 /// Expected SHA-256 of the `text-recognition.rten` file. Captured
 /// 2026-05-16. Bump when upstream rebuilds.
-const RECOGNITION_SHA256: &str =
-    "e484866d4cce403175bd8d00b128feb08ab42e208de30e42cd9889d8f1735a6e";
+const RECOGNITION_SHA256: &str = "e484866d4cce403175bd8d00b128feb08ab42e208de30e42cd9889d8f1735a6e";
 
 /// Resolve both `.rten` paths, downloading them if needed. Blocking I/O —
 /// call from `spawn_blocking` rather than directly on the runtime.
@@ -78,12 +76,7 @@ pub(super) fn ensure_models() -> Result<(PathBuf, PathBuf)> {
     let detection_path = cache_dir.join(DETECTION_FILENAME);
     let recognition_path = cache_dir.join(RECOGNITION_FILENAME);
 
-    ensure_one_model(
-        &cache_dir,
-        &detection_path,
-        DETECTION_URL,
-        DETECTION_SHA256,
-    )?;
+    ensure_one_model(&cache_dir, &detection_path, DETECTION_URL, DETECTION_SHA256)?;
     ensure_one_model(
         &cache_dir,
         &recognition_path,
@@ -100,7 +93,12 @@ pub(super) fn ensure_models() -> Result<(PathBuf, PathBuf)> {
 ///   stale cache), delete and re-download.
 /// - If the file doesn't exist, download to a `*.partial` sibling,
 ///   hash, and only rename to the final name when the hash matches.
-fn ensure_one_model(cache_dir: &std::path::Path, dest: &std::path::Path, url: &str, expected_sha256: &str) -> Result<()> {
+fn ensure_one_model(
+    cache_dir: &std::path::Path,
+    dest: &std::path::Path,
+    url: &str,
+    expected_sha256: &str,
+) -> Result<()> {
     if dest.exists() {
         match verify_sha256(dest, expected_sha256) {
             Ok(()) => return Ok(()),
@@ -136,9 +134,12 @@ pub(super) fn verify_sha256(path: &std::path::Path, expected_hex: &str) -> Resul
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| Error::visual(format!("read error during SHA-256 of {}: {e}", path.display())))?;
+        let n = f.read(&mut buf).map_err(|e| {
+            Error::visual(format!(
+                "read error during SHA-256 of {}: {e}",
+                path.display()
+            ))
+        })?;
         if n == 0 {
             break;
         }
@@ -199,12 +200,8 @@ fn download_to(url: &str, dest_path: &std::path::Path, expected_hex: &str) -> Re
         .call()
         .map_err(|e| Error::visual(format!("failed to fetch {url}: {e}")))?;
 
-    let mut out = std::fs::File::create(&partial).map_err(|e| {
-        Error::visual(format!(
-            "failed to create {}: {e}",
-            partial.display()
-        ))
-    })?;
+    let mut out = std::fs::File::create(&partial)
+        .map_err(|e| Error::visual(format!("failed to create {}: {e}", partial.display())))?;
     let mut reader = response.into_body().into_reader();
     let mut buf = [0u8; 64 * 1024];
     let mut total = 0u64;

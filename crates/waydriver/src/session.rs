@@ -116,21 +116,16 @@ pub struct SessionConfig {
 /// feature-gated `visual` module) so it can sit in
 /// [`VisualRegionTuning`] / [`VisualTextTuning`] fields without
 /// forcing every consumer to enable the `visual` feature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorDistance {
     /// Raw RGB Euclidean squared distance — cheap, not perceptual.
     Rgb,
     /// CIE Lab ΔE\*76 squared — perceptual, cheap. The default.
+    #[default]
     LabCie76,
     /// CIE Lab ΔE\*00 squared — perceptual gold standard, ~5×
     /// slower than `LabCie76`.
     LabCie2000,
-}
-
-impl Default for ColorDistance {
-    fn default() -> Self {
-        Self::LabCie76
-    }
 }
 
 /// Knobs for the visual region detection used by
@@ -1046,10 +1041,7 @@ impl Session {
     /// at construction time and the screenshot is taken anew on each
     /// terminal-method call, so the locator survives between calls.
     #[cfg(feature = "visual")]
-    pub fn find_image(
-        self: &Arc<Self>,
-        png_bytes: &[u8],
-    ) -> Result<crate::visual::ImageLocator> {
+    pub fn find_image(self: &Arc<Self>, png_bytes: &[u8]) -> Result<crate::visual::ImageLocator> {
         crate::visual::ImageLocator::new(self.clone(), png_bytes, None)
     }
 
@@ -1086,9 +1078,7 @@ impl Session {
     /// [`VisualLocator`](crate::VisualLocator) to fetch (and lazily
     /// initialize) the engine.
     #[cfg(feature = "visual")]
-    pub(crate) fn visual_engine(
-        &self,
-    ) -> &Arc<tokio::sync::OnceCell<crate::visual::EngineResult>> {
+    pub(crate) fn visual_engine(&self) -> &Arc<tokio::sync::OnceCell<crate::visual::EngineResult>> {
         &self.visual_engine
     }
 

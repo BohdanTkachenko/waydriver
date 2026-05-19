@@ -83,7 +83,11 @@ impl std::fmt::Debug for ImageLocator {
 impl ImageLocator {
     /// Decode the PNG bytes into an RGB template ready for matching.
     /// Errors if the bytes aren't a valid image.
-    pub(crate) fn new(session: Arc<Session>, png_bytes: &[u8], region: Option<Rect>) -> Result<Self> {
+    pub(crate) fn new(
+        session: Arc<Session>,
+        png_bytes: &[u8],
+        region: Option<Rect>,
+    ) -> Result<Self> {
         let img = image::load_from_memory(png_bytes)
             .map_err(|e| Error::visual(format!("decode template image: {e}")))?;
         let rgb = img.into_rgb8();
@@ -146,13 +150,7 @@ impl ImageLocator {
             } else {
                 (full.into_rgb8(), 0, 0)
             };
-            find_template_matches(
-                &haystack_rgb,
-                &template,
-                threshold,
-                origin_x,
-                origin_y,
-            )
+            find_template_matches(&haystack_rgb, &template, threshold, origin_x, origin_y)
         })
         .await
         .map_err(|e| Error::visual(format!("template-matching task panicked: {e}")))?
@@ -168,17 +166,16 @@ impl ImageLocator {
     /// multiple equally-good matches are found.
     pub async fn bounds(&self) -> Result<Rect> {
         let deadline = std::time::Instant::now()
-            + self.timeout.unwrap_or_else(|| self.session.default_timeout());
+            + self
+                .timeout
+                .unwrap_or_else(|| self.session.default_timeout());
         loop {
             let hits = self.matches().await?;
             match hits.len() {
                 0 => {
                     if std::time::Instant::now() >= deadline {
                         return Err(Error::ElementNotFound {
-                            xpath: format!(
-                                "image-template (threshold={})",
-                                self.threshold
-                            ),
+                            xpath: format!("image-template (threshold={})", self.threshold),
                         });
                     }
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -198,7 +195,9 @@ impl ImageLocator {
     /// Wait until at least one match exists, or the timeout elapses.
     pub async fn wait_for_visible(&self) -> Result<()> {
         let deadline = std::time::Instant::now()
-            + self.timeout.unwrap_or_else(|| self.session.default_timeout());
+            + self
+                .timeout
+                .unwrap_or_else(|| self.session.default_timeout());
         loop {
             if !self.matches().await?.is_empty() {
                 return Ok(());
@@ -296,10 +295,9 @@ fn find_template_matches(
     let mut out: Vec<Rect> = Vec::new();
     for (_, x, y) in peaks {
         let (xi, yi) = (x as i32, y as i32);
-        if accepted
-            .iter()
-            .any(|&(ax, ay)| (ax as i32 - xi).abs() <= nms_radius && (ay as i32 - yi).abs() <= nms_radius)
-        {
+        if accepted.iter().any(|&(ax, ay)| {
+            (ax as i32 - xi).abs() <= nms_radius && (ay as i32 - yi).abs() <= nms_radius
+        }) {
             continue;
         }
         accepted.push((x, y));
@@ -367,8 +365,7 @@ mod tests {
             template.put_pixel(x, 4, Rgb([255, 255, 255]));
         }
         let haystack = embed(200, 100, &template, 73, 41);
-        let hits =
-            find_template_matches(&haystack, &template, 0.95, 0, 0).expect("matching ok");
+        let hits = find_template_matches(&haystack, &template, 0.95, 0, 0).expect("matching ok");
         assert_eq!(hits.len(), 1, "expected exactly one peak above threshold");
         let r = hits[0];
         assert_eq!(r.x, 73);
@@ -385,8 +382,7 @@ mod tests {
         }
         // Haystack is a totally different colour with no structure.
         let haystack = solid(200, 100, [10, 10, 10]);
-        let hits =
-            find_template_matches(&haystack, &template, 0.95, 0, 0).expect("matching ok");
+        let hits = find_template_matches(&haystack, &template, 0.95, 0, 0).expect("matching ok");
         assert!(hits.is_empty(), "expected no peaks; got {hits:?}");
     }
 
@@ -399,8 +395,8 @@ mod tests {
         // Embed at (20, 30) inside a cropped haystack; origin
         // claims the crop started at screen (500, 600).
         let haystack = embed(100, 100, &template, 20, 30);
-        let hits = find_template_matches(&haystack, &template, 0.95, 500, 600)
-            .expect("matching ok");
+        let hits =
+            find_template_matches(&haystack, &template, 0.95, 500, 600).expect("matching ok");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].x, 520);
         assert_eq!(hits[0].y, 630);
@@ -432,9 +428,12 @@ mod tests {
         // High threshold filters out the pseudo-noise structural
         // false-positives; the only above-0.95 peaks live near the
         // real embedding at (50, 50).
-        let hits =
-            find_template_matches(&haystack, &template, 0.95, 0, 0).expect("matching ok");
-        assert_eq!(hits.len(), 1, "NMS should collapse near-peaks; got {hits:?}");
+        let hits = find_template_matches(&haystack, &template, 0.95, 0, 0).expect("matching ok");
+        assert_eq!(
+            hits.len(),
+            1,
+            "NMS should collapse near-peaks; got {hits:?}"
+        );
         assert_eq!(hits[0].x, 50);
         assert_eq!(hits[0].y, 50);
     }

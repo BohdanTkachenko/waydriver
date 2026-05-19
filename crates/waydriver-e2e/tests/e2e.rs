@@ -488,8 +488,7 @@ async fn lazy_a11y_non_initial_prefs_page_missing_from_atspi() -> anyhow::Result
 /// stdout event.
 #[tokio::test]
 #[ignore = "spawns mutter + pipewire; downloads ocrs models on first run"]
-async fn lazy_a11y_non_initial_prefs_page_switchable_via_visual_locator(
-) -> anyhow::Result<()> {
+async fn lazy_a11y_non_initial_prefs_page_switchable_via_visual_locator() -> anyhow::Result<()> {
     init_tracing();
     let (session, _state) = start_fixture_session("lazy-a11y").await?;
 

@@ -919,10 +919,7 @@ impl Locator {
     /// the parent dialog is queryable, the populated row is not).
     /// Requires the `visual` Cargo feature on `waydriver`.
     #[cfg(feature = "visual")]
-    pub async fn find_by_text(
-        &self,
-        text: &str,
-    ) -> Result<crate::visual::VisualLocator> {
+    pub async fn find_by_text(&self, text: &str) -> Result<crate::visual::VisualLocator> {
         let info = self.wait_for_existing().await?;
         let bounds = info.bounds.ok_or_else(|| {
             Error::atspi(format!(
@@ -946,10 +943,7 @@ impl Locator {
     /// [`find_by_text`](Self::find_by_text). Requires the `visual`
     /// Cargo feature.
     #[cfg(feature = "visual")]
-    pub async fn find_image(
-        &self,
-        png_bytes: &[u8],
-    ) -> Result<crate::visual::ImageLocator> {
+    pub async fn find_image(&self, png_bytes: &[u8]) -> Result<crate::visual::ImageLocator> {
         let info = self.wait_for_existing().await?;
         let bounds = info.bounds.ok_or_else(|| {
             Error::atspi(format!(
@@ -959,10 +953,7 @@ impl Locator {
                 self.xpath
             ))
         })?;
-        Ok(self
-            .session
-            .find_image(png_bytes)?
-            .within(bounds))
+        Ok(self.session.find_image(png_bytes)?.within(bounds))
     }
 
     /// Find all visually-distinct enclosing regions around `inner`,
@@ -1514,8 +1505,7 @@ pub(crate) fn decode_screenshot_png(bytes: &[u8]) -> Result<image::DynamicImage>
     // chunk before the PNG magic on some builds; the existing e2e
     // tests handle that via `extract_png` at the test layer. We don't
     // strip here — capture backends are expected to return clean PNGs.
-    image::load_from_memory(bytes)
-        .map_err(|e| Error::screenshot_with("decode screenshot PNG", e))
+    image::load_from_memory(bytes).map_err(|e| Error::screenshot_with("decode screenshot PNG", e))
 }
 
 /// Crop `img` to the screen-rectangle in `bounds`. Returns an error
@@ -1953,20 +1943,14 @@ mod tests {
         // `//Menu` inside a sub-locator is descendant-of-current,
         // matching Selenium/Playwright convention rather than the
         // strict-XPath "anywhere in the document" reading.
-        assert_eq!(
-            dialog.locate("//Menu").xpath(),
-            "(//Dialog)//Menu"
-        );
+        assert_eq!(dialog.locate("//Menu").xpath(), "(//Dialog)//Menu");
     }
 
     #[tokio::test]
     async fn locator_locate_dot_slash_composes_descendant() {
         let s = test_session();
         let dialog = s.locate("//Dialog");
-        assert_eq!(
-            dialog.locate(".//Menu").xpath(),
-            "(//Dialog)//Menu"
-        );
+        assert_eq!(dialog.locate(".//Menu").xpath(), "(//Dialog)//Menu");
     }
 
     #[tokio::test]

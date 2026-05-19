@@ -132,7 +132,13 @@ pub(crate) fn sweep_regions(
     let max_pixels = (img_bounds.width as usize) * (img_bounds.height as usize);
 
     for _ in 0..tuning.max_regions {
-        let flood = flood_fill(&cropped, seed, tuning.tolerance, max_pixels, tuning.color_distance);
+        let flood = flood_fill(
+            &cropped,
+            seed,
+            tuning.tolerance,
+            max_pixels,
+            tuning.color_distance,
+        );
         let bbox_screen = translate_to_screen(flood.bbox, parent_bounds);
         let centroid_screen = (
             flood.centroid.0 + parent_bounds.x,
@@ -200,7 +206,13 @@ pub(crate) fn region_at_seed(
     }
 
     let max_pixels = (w as usize) * (h as usize);
-    let flood = flood_fill(&rgb, seed, tuning.tolerance, max_pixels, tuning.color_distance);
+    let flood = flood_fill(
+        &rgb,
+        seed,
+        tuning.tolerance,
+        max_pixels,
+        tuning.color_distance,
+    );
     let shape = classify_shape(flood.bbox, flood.pixel_count, flood.corners_inside, tuning);
     Ok(RegionLocator {
         session: session.clone(),
@@ -231,7 +243,13 @@ pub(crate) fn last_region_only(
     };
 
     let max_pixels = (img_bounds.width as usize) * (img_bounds.height as usize);
-    let flood = flood_fill(&cropped, seed, tuning.tolerance, max_pixels, tuning.color_distance);
+    let flood = flood_fill(
+        &cropped,
+        seed,
+        tuning.tolerance,
+        max_pixels,
+        tuning.color_distance,
+    );
     let shape = classify_shape(flood.bbox, flood.pixel_count, flood.corners_inside, tuning);
     Ok(RegionLocator {
         session: session.clone(),
@@ -463,7 +481,7 @@ fn count_corners_inside(
 /// - Perfect rectangle: ratio 1.0, 4 corners inside.
 /// - Perfect circle:    ratio π/4 ≈ 0.785, 0 corners inside.
 /// - Typical Adw pill:  ratio 0.94–0.99, 0 corners inside (small
-///                      radius trims the corners off).
+///   radius trims the corners off).
 /// - Capsule (rounded ends, w >> h): ratio close to 0.96.
 ///
 /// "Pill" covers the broad rounded-rectangle family (Adw rows,
@@ -602,7 +620,13 @@ mod tests {
     fn flood_fill_grows_to_pill_boundary() {
         let img = synthetic_card_pill_glyph();
         // Seed inside the pill but outside the glyph: just left of glyph.
-        let res = flood_fill(&img, (40, 50), 24, 100 * 100, crate::session::ColorDistance::Rgb);
+        let res = flood_fill(
+            &img,
+            (40, 50),
+            24,
+            100 * 100,
+            crate::session::ColorDistance::Rgb,
+        );
         // Pill bbox: x ∈ [20, 79], y ∈ [35, 64], so width=60, height=30.
         // Flood may include all pill pixels (it excludes glyph pixels
         // since they're outside tolerance against pill grey).
@@ -622,9 +646,20 @@ mod tests {
         // classify as Rectangle, not Pill. This sanity-checks the
         // classifier's "4 corners inside + ratio ≈ 1" branch.
         let img = synthetic_card_pill_glyph();
-        let res = flood_fill(&img, (40, 50), 24, 100 * 100, crate::session::ColorDistance::Rgb);
+        let res = flood_fill(
+            &img,
+            (40, 50),
+            24,
+            100 * 100,
+            crate::session::ColorDistance::Rgb,
+        );
         assert_eq!(res.corners_inside, 4);
-        let shape = classify_shape(res.bbox, res.pixel_count, res.corners_inside, VisualRegionTuning::default());
+        let shape = classify_shape(
+            res.bbox,
+            res.pixel_count,
+            res.corners_inside,
+            VisualRegionTuning::default(),
+        );
         assert_eq!(shape, Shape::Rectangle);
     }
 
@@ -646,10 +681,8 @@ mod tests {
                 // Distance from nearest corner-centre. If we're in a
                 // corner box and farther than r from its centre, leave
                 // as background.
-                let in_corner_box = (x < corner_r && y < corner_r)
-                    || (x >= 60 - corner_r && y < corner_r)
-                    || (x < corner_r && y >= 30 - corner_r)
-                    || (x >= 60 - corner_r && y >= 30 - corner_r);
+                let in_corner_box =
+                    (x < corner_r || x >= 60 - corner_r) && (y < corner_r || y >= 30 - corner_r);
                 if in_corner_box {
                     let (cx, cy) = (
                         if x < corner_r {
@@ -663,8 +696,8 @@ mod tests {
                             30 - corner_r - 1
                         },
                     );
-                    let dx = x as i32 - cx;
-                    let dy = y as i32 - cy;
+                    let dx = x - cx;
+                    let dy = y - cy;
                     if dx * dx + dy * dy > corner_r * corner_r {
                         continue;
                     }
@@ -679,14 +712,30 @@ mod tests {
     fn rounded_pill_classifies_as_pill() {
         let img = synthetic_rounded_pill(6);
         // Seed at the centre — definitely inside the fill.
-        let res = flood_fill(&img, (30, 15), 24, 60 * 30, crate::session::ColorDistance::Rgb);
+        let res = flood_fill(
+            &img,
+            (30, 15),
+            24,
+            60 * 30,
+            crate::session::ColorDistance::Rgb,
+        );
         // All four bbox corners are background-coloured, so the
         // colour-based corner check should see 0 inside.
         assert_eq!(res.corners_inside, 0);
-        let shape = classify_shape(res.bbox, res.pixel_count, res.corners_inside, VisualRegionTuning::default());
-        assert_eq!(shape, Shape::Pill, "fill ratio = {} ({} / {})",
+        let shape = classify_shape(
+            res.bbox,
+            res.pixel_count,
+            res.corners_inside,
+            VisualRegionTuning::default(),
+        );
+        assert_eq!(
+            shape,
+            Shape::Pill,
+            "fill ratio = {} ({} / {})",
             res.pixel_count as f64 / (res.bbox.width * res.bbox.height) as f64,
-            res.pixel_count, res.bbox.width * res.bbox.height);
+            res.pixel_count,
+            res.bbox.width * res.bbox.height
+        );
     }
 
     /// Build a filled ellipse / circle approximation in a square box.
@@ -723,9 +772,21 @@ mod tests {
         // the "any point inside the region works" property.
         let img = synthetic_card_pill_glyph();
         // Just below the glyph but still in the pill.
-        let near_glyph = flood_fill(&img, (49, 60), 24, 100 * 100, crate::session::ColorDistance::Rgb);
+        let near_glyph = flood_fill(
+            &img,
+            (49, 60),
+            24,
+            100 * 100,
+            crate::session::ColorDistance::Rgb,
+        );
         // Top-left interior of the pill.
-        let cornerish = flood_fill(&img, (22, 37), 24, 100 * 100, crate::session::ColorDistance::Rgb);
+        let cornerish = flood_fill(
+            &img,
+            (22, 37),
+            24,
+            100 * 100,
+            crate::session::ColorDistance::Rgb,
+        );
         assert_eq!(near_glyph.bbox, cornerish.bbox);
         assert_eq!(near_glyph.centroid, cornerish.centroid);
         assert_eq!(near_glyph.pixel_count, cornerish.pixel_count);
@@ -738,7 +799,13 @@ mod tests {
         // seed pixel falls in — the corollary to the
         // arbitrary-point-inside-region test above.
         let img = synthetic_card_pill_glyph();
-        let on_glyph = flood_fill(&img, (49, 49), 24, 100 * 100, crate::session::ColorDistance::Rgb);
+        let on_glyph = flood_fill(
+            &img,
+            (49, 49),
+            24,
+            100 * 100,
+            crate::session::ColorDistance::Rgb,
+        );
         // Glyph rect: x=45..54, y=48..51, so bbox is 10 wide × 4 tall.
         assert_eq!(on_glyph.bbox.x, 45);
         assert_eq!(on_glyph.bbox.y, 48);
@@ -749,10 +816,21 @@ mod tests {
     #[test]
     fn circle_classifies_as_ellipse() {
         let img = synthetic_ellipse(40);
-        let res = flood_fill(&img, (20, 20), 24, 40 * 40, crate::session::ColorDistance::Rgb);
+        let res = flood_fill(
+            &img,
+            (20, 20),
+            24,
+            40 * 40,
+            crate::session::ColorDistance::Rgb,
+        );
         // Circle corners are all in the background, so 0 inside.
         assert_eq!(res.corners_inside, 0);
-        let shape = classify_shape(res.bbox, res.pixel_count, res.corners_inside, VisualRegionTuning::default());
+        let shape = classify_shape(
+            res.bbox,
+            res.pixel_count,
+            res.corners_inside,
+            VisualRegionTuning::default(),
+        );
         assert_eq!(shape, Shape::Ellipse);
     }
 
@@ -760,7 +838,13 @@ mod tests {
     fn flood_fill_grows_to_card_when_seeded_outside_pill() {
         let img = synthetic_card_pill_glyph();
         // Seed in the card area outside the pill (top-left corner).
-        let res = flood_fill(&img, (5, 5), 24, 100 * 100, crate::session::ColorDistance::Rgb);
+        let res = flood_fill(
+            &img,
+            (5, 5),
+            24,
+            100 * 100,
+            crate::session::ColorDistance::Rgb,
+        );
         // Card minus pill: bbox covers the full 100×100 minus the
         // pill interior. The BBOX, however, is still 100×100 because
         // the flood wraps around the pill.
@@ -786,7 +870,8 @@ mod tests {
             width: 100,
             height: 100,
         };
-        let seed = pick_seed_outside(inner, img_bounds, &img, VisualRegionTuning::default()).unwrap();
+        let seed =
+            pick_seed_outside(inner, img_bounds, &img, VisualRegionTuning::default()).unwrap();
         // Seed should land on the pill (grey 120) — i.e. between glyph
         // and pill boundary.
         let p = img.get_pixel(seed.0 as u32, seed.1 as u32);
