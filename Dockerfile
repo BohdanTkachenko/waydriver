@@ -1,3 +1,10 @@
+# Stage 0: Model downloader for OCR-backed visual locator
+FROM fedora:42 AS model-downloader
+RUN dnf install -y curl && dnf clean all
+RUN mkdir -p /models \
+    && curl -sL https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.rten -o /models/text-detection.rten \
+    && curl -sL https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten -o /models/text-recognition.rten
+
 # Stage 1: Publishable builder base image
 # Fedora 42 matches the runtime image, so binaries built here are ABI-compatible
 # with the runtime. Users extend this image to build their own GTK4 apps for
@@ -33,6 +40,10 @@ RUN dnf install -y \
     gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good \
     gsettings-desktop-schemas \
     && dnf clean all
+
+COPY --from=model-downloader /models /usr/share/waydriver/ocrs-models
+ENV WAYDRIVER_OCRS_DETECTION_MODEL=/usr/share/waydriver/ocrs-models/text-detection.rten
+ENV WAYDRIVER_OCRS_RECOGNITION_MODEL=/usr/share/waydriver/ocrs-models/text-recognition.rten
 
 COPY --from=builder /src/target/release/waydriver-mcp /usr/local/bin/
 COPY docker-entrypoint.sh /usr/local/bin/
