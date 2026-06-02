@@ -6,236 +6,266 @@
   outputs =
     { self, nixpkgs }:
     let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
-
-      gstPluginPath = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [
-        pkgs.gst_all_1.gstreamer.out
-        pkgs.gst_all_1.gst-plugins-base
-        pkgs.gst_all_1.gst-plugins-good
-        pkgs.pipewire
+      # The runtime stack (mutter, pipewire, at-spi2-core, GStreamer) is
+      # Linux-only, so we build for the Linux ABIs we care about. Adding a
+      # new arch here is all it takes to fan the outputs out to it.
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
       ];
 
-      devPackages = with pkgs; [
-        cargo
-        rustc
-        rustfmt
-        clippy
-        rust-analyzer
-        pkg-config
-        dbus
-        at-spi2-core
-        mutter
-        pipewire
-        wireplumber
-        gst_all_1.gstreamer
-        gst_all_1.gst-plugins-base
-        gst_all_1.gst-plugins-good
-        # GTK4 + its pkg-config-advertised transitive deps — linked against
-        # by the waydriver-fixture-gtk demo crate. `buildEnv` doesn't follow
-        # propagated inputs, so every pc dep GTK4 declares has to appear
-        # here by name. `out` is needed at runtime; `dev` carries .pc files.
-        gtk4
-        gtk4.dev
-        pango.dev
-        cairo.dev
-        gdk-pixbuf.dev
-        harfbuzz.dev
-        libepoxy.dev
-        fribidi.dev
-        libxkbcommon.dev
-        wayland.dev
-        vulkan-headers
-        vulkan-loader.dev
-        # libadwaita — the GNOME HIG widget layer on top of GTK4. The
-        # fixture uses Adw widgets alongside raw GTK4 ones so we can
-        # isolate AT-SPI behavior to whichever layer actually produces
-        # the output for a given test.
-        libadwaita
-        libadwaita.dev
-        appstream.dev
-        # CI / release verification tooling
-        actionlint
-        act
-        release-plz
-      ];
+      # Build the full output set once per system, then project each
+      # attribute category out below. Keeping it in a single per-system
+      # `let` means the shared bindings (gstPluginPath, devPackages,
+      # refresh) are defined once per arch rather than repeated per output.
+      perSystem = nixpkgs.lib.genAttrs systems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
 
-      refresh = pkgs.writeShellScriptBin "refresh" ''
-        nix build .#packages.${system}.dev-profile --out-link .nix-profile
-      '';
-    in
-    {
-      packages.${system} = {
-        default = pkgs.rustPlatform.buildRustPackage {
-          pname = "waydriver";
-          version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+          gstPluginPath = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [
+            pkgs.gst_all_1.gstreamer.out
+            pkgs.gst_all_1.gst-plugins-base
+            pkgs.gst_all_1.gst-plugins-good
+            pkgs.pipewire
+          ];
 
-          nativeBuildInputs = with pkgs; [ pkg-config ];
-          buildInputs = with pkgs; [
+          devPackages = with pkgs; [
+            cargo
+            rustc
+            rustfmt
+            clippy
+            rust-analyzer
+            pkg-config
             dbus
             at-spi2-core
+            mutter
+            pipewire
+            wireplumber
             gst_all_1.gstreamer
             gst_all_1.gst-plugins-base
             gst_all_1.gst-plugins-good
-            pipewire
+            # GTK4 + its pkg-config-advertised transitive deps — linked against
+            # by the waydriver-fixture-gtk demo crate. `buildEnv` doesn't follow
+            # propagated inputs, so every pc dep GTK4 declares has to appear
+            # here by name. `out` is needed at runtime; `dev` carries .pc files.
+            gtk4
+            gtk4.dev
+            pango.dev
+            cairo.dev
+            gdk-pixbuf.dev
+            harfbuzz.dev
+            libepoxy.dev
+            fribidi.dev
+            libxkbcommon.dev
+            wayland.dev
+            vulkan-headers
+            vulkan-loader.dev
+            # libadwaita — the GNOME HIG widget layer on top of GTK4. The
+            # fixture uses Adw widgets alongside raw GTK4 ones so we can
+            # isolate AT-SPI behavior to whichever layer actually produces
+            # the output for a given test.
+            libadwaita
+            libadwaita.dev
+            appstream.dev
+            # CI / release verification tooling
+            actionlint
+            act
+            release-plz
           ];
-        };
 
-        dev-profile = pkgs.buildEnv {
-          name = "waydriver-dev-profile";
-          paths = devPackages ++ [ refresh ];
-        };
+          refresh = pkgs.writeShellScriptBin "refresh" ''
+            nix build .#packages.${system}.dev-profile --out-link .nix-profile
+          '';
+        in
+        {
+          packages = {
+            default = pkgs.rustPlatform.buildRustPackage {
+              pname = "waydriver";
+              version = "0.1.0";
+              src = ./.;
+              cargoLock.lockFile = ./Cargo.lock;
 
-      };
+              # Build just the MCP server — the actual shipped product, and the
+              # binary the `mcp` app below wraps. The workspace also contains
+              # the GTK4 fixture/examples crates, but those are test scaffolding
+              # (built in the dev shell / Docker e2e stages with the full GTK4
+              # dev stack); compiling them here would drag in gdk-pixbuf, pango,
+              # libadwaita, &c. that the server itself doesn't link.
+              cargoBuildFlags = [ "-p" "waydriver-mcp" ];
+              cargoTestFlags = [ "-p" "waydriver-mcp" ];
 
-      apps.${system} = {
-        coverage = {
-        type = "app";
-        program =
-          let
-            script = pkgs.writeShellScriptBin "waydriver-coverage" ''
-              export PATH="${
-                pkgs.lib.makeBinPath [
-                  pkgs.cargo
-                  pkgs.rustc
-                  pkgs.pkg-config
-                  pkgs.cargo-tarpaulin
-                  pkgs.dbus
-                  pkgs.at-spi2-core
-                  pkgs.mutter
-                  pkgs.pipewire
-                  pkgs.wireplumber
-                  pkgs.gst_all_1.gstreamer
-                  pkgs.gst_all_1.gst-plugins-base
-                  pkgs.gst_all_1.gst-plugins-good
-                ]
-              }:$PATH"
+              nativeBuildInputs = with pkgs; [ pkg-config ];
+              buildInputs = with pkgs; [
+                dbus
+                at-spi2-core
+                gst_all_1.gstreamer
+                gst_all_1.gst-plugins-base
+                gst_all_1.gst-plugins-good
+                pipewire
+              ];
+            };
+
+            dev-profile = pkgs.buildEnv {
+              name = "waydriver-dev-profile";
+              paths = devPackages ++ [ refresh ];
+            };
+          };
+
+          apps = {
+            coverage = {
+              type = "app";
+              program =
+                let
+                  script = pkgs.writeShellScriptBin "waydriver-coverage" ''
+                    export PATH="${
+                      pkgs.lib.makeBinPath [
+                        pkgs.cargo
+                        pkgs.rustc
+                        pkgs.pkg-config
+                        pkgs.cargo-tarpaulin
+                        pkgs.dbus
+                        pkgs.at-spi2-core
+                        pkgs.mutter
+                        pkgs.pipewire
+                        pkgs.wireplumber
+                        pkgs.gst_all_1.gstreamer
+                        pkgs.gst_all_1.gst-plugins-base
+                        pkgs.gst_all_1.gst-plugins-good
+                      ]
+                    }:$PATH"
+                    export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
+                    export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${pkgs.gsettings-desktop-schemas}/share:''${XDG_DATA_DIRS:-/run/current-system/sw/share}"
+                    export GST_PLUGIN_PATH="${gstPluginPath}"
+                    exec cargo tarpaulin --workspace --skip-clean --out stdout "$@"
+                  '';
+                in
+                "${script}/bin/waydriver-coverage";
+            };
+
+            # nix run .#docker-build — builds the production Docker image
+            docker-build = {
+              type = "app";
+              program =
+                let
+                  script = pkgs.writeShellScriptBin "waydriver-docker-build" ''
+                    exec docker build -t waydriver-mcp "$@" .
+                  '';
+                in
+                "${script}/bin/waydriver-docker-build";
+            };
+
+            # nix run .#docker-build-e2e — builds the e2e Docker image (adds the
+            # waydriver-fixture-gtk binary and its GTK4/libadwaita runtime libs).
+            docker-build-e2e = {
+              type = "app";
+              program =
+                let
+                  script = pkgs.writeShellScriptBin "waydriver-docker-build-e2e" ''
+                    exec docker build --target runtime-e2e -t waydriver-mcp-e2e "$@" .
+                  '';
+                in
+                "${script}/bin/waydriver-docker-build-e2e";
+            };
+
+            # nix run .# — launches the MCP server with runtime deps on PATH
+            mcp = {
+              type = "app";
+              program =
+                let
+                  wrapper = pkgs.writeShellScriptBin "waydriver-mcp" ''
+                    export PATH="${
+                      pkgs.lib.makeBinPath [
+                        pkgs.dbus
+                        pkgs.at-spi2-core
+                        pkgs.mutter
+                        pkgs.pipewire
+                        pkgs.wireplumber
+                        pkgs.gst_all_1.gstreamer
+                        pkgs.gst_all_1.gst-plugins-base
+                        pkgs.gst_all_1.gst-plugins-good
+                      ]
+                    }:$PATH"
+                    # at-spi-bus-launcher lives in libexec
+                    export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
+                    # D-Bus service files for AT-SPI registry auto-activation
+                    export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${
+                      pkgs.lib.concatStringsSep ":" [
+                        "${pkgs.gsettings-desktop-schemas}/share"
+                      ]
+                    }:''${XDG_DATA_DIRS:-/run/current-system/sw/share}"
+                    # GStreamer plugin paths (core, base, good, pipewire)
+                    export GST_PLUGIN_PATH="${gstPluginPath}"
+                    exec ${self.packages.${system}.default}/bin/waydriver-mcp "$@"
+                  '';
+                in
+                "${wrapper}/bin/waydriver-mcp";
+            };
+          };
+
+          checks.tests = pkgs.rustPlatform.buildRustPackage {
+            pname = "waydriver-tests";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = with pkgs; [
+              dbus
+              at-spi2-core
+              gst_all_1.gstreamer
+              gst_all_1.gst-plugins-base
+              gst_all_1.gst-plugins-good
+              pipewire
+            ];
+
+            nativeCheckInputs = with pkgs; [
+              dbus
+              at-spi2-core
+              mutter
+              pipewire
+              wireplumber
+              gst_all_1.gstreamer
+              gst_all_1.gst-plugins-base
+              gst_all_1.gst-plugins-good
+            ];
+
+            checkPhase = ''
+              export HOME=$(mktemp -d)
+              export XDG_RUNTIME_DIR=$(mktemp -d)
+              export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
+              export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${pkgs.gsettings-desktop-schemas}/share:''${XDG_DATA_DIRS:-}"
+              export GST_PLUGIN_PATH="${gstPluginPath}"
+              cargo test --workspace
+            '';
+          };
+
+          devShells.default = pkgs.mkShell {
+            packages = devPackages ++ [ refresh ];
+
+            shellHook = ''
+              refresh
+              export PATH="$PWD/.nix-profile/bin:$PATH"
+              # at-spi-bus-launcher lives in libexec (not exposed by buildEnv)
               export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
               export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${pkgs.gsettings-desktop-schemas}/share:''${XDG_DATA_DIRS:-/run/current-system/sw/share}"
               export GST_PLUGIN_PATH="${gstPluginPath}"
-              exec cargo tarpaulin --workspace --skip-clean --out stdout "$@"
+              # pkg-config lookup for packages that only ship their .pc files
+              # under the dev-profile (GTK4's `.dev` output is pulled in via
+              # devPackages but buildEnv concatenates pkgconfig dirs here):
+              export PKG_CONFIG_PATH="$PWD/.nix-profile/lib/pkgconfig:$PWD/.nix-profile/share/pkgconfig:''${PKG_CONFIG_PATH:-}"
+              # nixpkgs' rustc doesn't ship the stdlib source tree, so rust-analyzer
+              # can't resolve `std`/`core` without this pointer.
+              export RUST_SRC_PATH="${pkgs.rustPlatform.rustLibSrc}"
             '';
-          in
-          "${script}/bin/waydriver-coverage";
-      };
-
-        # nix run .#docker-build — builds the production Docker image
-        docker-build = {
-          type = "app";
-          program =
-            let
-              script = pkgs.writeShellScriptBin "waydriver-docker-build" ''
-                exec docker build -t waydriver-mcp "$@" .
-              '';
-            in
-            "${script}/bin/waydriver-docker-build";
-        };
-
-        # nix run .#docker-build-e2e — builds the e2e Docker image (adds the
-        # waydriver-fixture-gtk binary and its GTK4/libadwaita runtime libs).
-        docker-build-e2e = {
-          type = "app";
-          program =
-            let
-              script = pkgs.writeShellScriptBin "waydriver-docker-build-e2e" ''
-                exec docker build --target runtime-e2e -t waydriver-mcp-e2e "$@" .
-              '';
-            in
-            "${script}/bin/waydriver-docker-build-e2e";
-        };
-
-        # nix run .# — launches the MCP server with runtime deps on PATH
-        mcp = {
-        type = "app";
-        program =
-          let
-            wrapper = pkgs.writeShellScriptBin "waydriver-mcp" ''
-              export PATH="${
-                pkgs.lib.makeBinPath [
-                  pkgs.dbus
-                  pkgs.at-spi2-core
-                  pkgs.mutter
-                  pkgs.pipewire
-                  pkgs.wireplumber
-                  pkgs.gst_all_1.gstreamer
-                  pkgs.gst_all_1.gst-plugins-base
-                  pkgs.gst_all_1.gst-plugins-good
-                ]
-              }:$PATH"
-              # at-spi-bus-launcher lives in libexec
-              export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
-              # D-Bus service files for AT-SPI registry auto-activation
-              export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${
-                pkgs.lib.concatStringsSep ":" [
-                  "${pkgs.gsettings-desktop-schemas}/share"
-                ]
-              }:''${XDG_DATA_DIRS:-/run/current-system/sw/share}"
-              # GStreamer plugin paths (core, base, good, pipewire)
-              export GST_PLUGIN_PATH="${gstPluginPath}"
-              exec ${self.packages.${system}.default}/bin/waydriver-mcp "$@"
-            '';
-          in
-          "${wrapper}/bin/waydriver-mcp";
-        };
-      };
-
-      checks.${system}.tests = pkgs.rustPlatform.buildRustPackage {
-        pname = "waydriver-tests";
-        version = "0.1.0";
-        src = ./.;
-        cargoLock.lockFile = ./Cargo.lock;
-
-        nativeBuildInputs = with pkgs; [ pkg-config ];
-        buildInputs = with pkgs; [
-          dbus
-          at-spi2-core
-          gst_all_1.gstreamer
-          gst_all_1.gst-plugins-base
-          gst_all_1.gst-plugins-good
-          pipewire
-        ];
-
-        nativeCheckInputs = with pkgs; [
-          dbus
-          at-spi2-core
-          mutter
-          pipewire
-          wireplumber
-          gst_all_1.gstreamer
-          gst_all_1.gst-plugins-base
-          gst_all_1.gst-plugins-good
-        ];
-
-        checkPhase = ''
-          export HOME=$(mktemp -d)
-          export XDG_RUNTIME_DIR=$(mktemp -d)
-          export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
-          export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${pkgs.gsettings-desktop-schemas}/share:''${XDG_DATA_DIRS:-}"
-          export GST_PLUGIN_PATH="${gstPluginPath}"
-          cargo test --workspace
-        '';
-      };
-
-      devShells.${system}.default = pkgs.mkShell {
-        packages = devPackages ++ [ refresh ];
-
-        shellHook = ''
-          refresh
-          export PATH="$PWD/.nix-profile/bin:$PATH"
-          # at-spi-bus-launcher lives in libexec (not exposed by buildEnv)
-          export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
-          export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${pkgs.gsettings-desktop-schemas}/share:''${XDG_DATA_DIRS:-/run/current-system/sw/share}"
-          export GST_PLUGIN_PATH="${gstPluginPath}"
-          # pkg-config lookup for packages that only ship their .pc files
-          # under the dev-profile (GTK4's `.dev` output is pulled in via
-          # devPackages but buildEnv concatenates pkgconfig dirs here):
-          export PKG_CONFIG_PATH="$PWD/.nix-profile/lib/pkgconfig:$PWD/.nix-profile/share/pkgconfig:''${PKG_CONFIG_PATH:-}"
-          # nixpkgs' rustc doesn't ship the stdlib source tree, so rust-analyzer
-          # can't resolve `std`/`core` without this pointer.
-          export RUST_SRC_PATH="${pkgs.rustPlatform.rustLibSrc}"
-        '';
-      };
+          };
+        }
+      );
+    in
+    {
+      packages = nixpkgs.lib.mapAttrs (_: v: v.packages) perSystem;
+      apps = nixpkgs.lib.mapAttrs (_: v: v.apps) perSystem;
+      checks = nixpkgs.lib.mapAttrs (_: v: v.checks) perSystem;
+      devShells = nixpkgs.lib.mapAttrs (_: v: v.devShells) perSystem;
     };
 }

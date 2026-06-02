@@ -20,13 +20,23 @@ permissions:
   contents: read
   packages: write
 
-jobs:
-  publish:
-    name: Build and push to ghcr.io
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+env:
+  RUNTIME_IMAGE: waydriver-mcp
+  BUILDER_IMAGE: waydriver-mcp-builder
 
+jobs:
+  # Resolve the version/tag scheme and image owner once, then share with the
+  # per-arch build matrix and the manifest-merge job below.
+  prepare:
+    name: Resolve version and owner
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.version.outputs.kind }}
+      full: ${{ steps.version.outputs.full }}
+      major: ${{ steps.version.outputs.major }}
+      minor: ${{ steps.version.outputs.minor }}
+      owner: ${{ steps.owner.outputs.value }}
+    steps:
       - name: Determine version
         id: version
         run: |
@@ -49,6 +59,31 @@ jobs:
         id: owner
         run: echo "value=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
+  # Build each architecture on its own native runner (no QEMU emulation — the
+  # Rust + GTK4 compile is far too heavy for that) and push by digest. The
+  # manifest list that ties the per-arch digests together is assembled in the
+  # `merge` job. Both the publishable builder-base image and the runtime image
+  # are produced here so they ship the same set of architectures.
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Platform pair label
+        id: platform
+        # linux/amd64 -> linux-amd64 (usable in artifact names and cache scopes)
+        run: echo "pair=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to ghcr.io
@@ -58,57 +93,121 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (runtime)
-        id: meta-runtime
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ steps.owner.outputs.value }}/waydriver-mcp
-          tags: |
-            type=raw,value=latest,enable=${{ steps.version.outputs.kind == 'release' }}
-            type=raw,value=${{ steps.version.outputs.full }},enable=${{ steps.version.outputs.kind == 'release' }}
-            type=raw,value=${{ steps.version.outputs.minor }},enable=${{ steps.version.outputs.kind == 'release' }}
-            type=raw,value=${{ steps.version.outputs.major }},enable=${{ steps.version.outputs.kind == 'release' }}
-            type=raw,value=main,enable=${{ steps.version.outputs.kind == 'main' }}
-          labels: |
-            org.opencontainers.image.title=waydriver-mcp
-            org.opencontainers.image.description=MCP server for headless Wayland UI testing
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-
-      - name: Extract metadata (builder)
-        id: meta-builder
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ steps.owner.outputs.value }}/waydriver-mcp-builder
-          tags: |
-            type=raw,value=latest,enable=${{ steps.version.outputs.kind == 'release' }}
-            type=raw,value=${{ steps.version.outputs.full }},enable=${{ steps.version.outputs.kind == 'release' }}
-            type=raw,value=${{ steps.version.outputs.minor }},enable=${{ steps.version.outputs.kind == 'release' }}
-            type=raw,value=${{ steps.version.outputs.major }},enable=${{ steps.version.outputs.kind == 'release' }}
-            type=raw,value=main,enable=${{ steps.version.outputs.kind == 'main' }}
-          labels: |
-            org.opencontainers.image.title=waydriver-mcp-builder
-            org.opencontainers.image.description=Build environment for apps tested with waydriver-mcp (Fedora + Rust + GTK4 dev headers)
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-
-      - name: Build and push builder
+      - name: Build and push builder by digest
+        id: build-builder
         uses: docker/build-push-action@v6
         with:
           context: .
           target: builder-base
-          push: true
-          tags: ${{ steps.meta-builder.outputs.tags }}
-          labels: ${{ steps.meta-builder.outputs.labels }}
-          cache-from: type=gha,scope=builder
-          cache-to: type=gha,mode=max,scope=builder
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=waydriver-mcp-builder
+            org.opencontainers.image.description=Build environment for apps tested with waydriver-mcp (Fedora + Rust + GTK4 dev headers)
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          outputs: type=image,name=ghcr.io/${{ needs.prepare.outputs.owner }}/${{ env.BUILDER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=builder-${{ steps.platform.outputs.pair }}
+          cache-to: type=gha,mode=max,scope=builder-${{ steps.platform.outputs.pair }}
 
-      - name: Build and push runtime
+      - name: Build and push runtime by digest
+        id: build-runtime
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta-runtime.outputs.tags }}
-          labels: ${{ steps.meta-runtime.outputs.labels }}
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=waydriver-mcp
+            org.opencontainers.image.description=MCP server for headless Wayland UI testing
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          outputs: type=image,name=ghcr.io/${{ needs.prepare.outputs.owner }}/${{ env.RUNTIME_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: |
-            type=gha,scope=runtime
-            type=gha,scope=builder
-          cache-to: type=gha,mode=max,scope=runtime
+            type=gha,scope=runtime-${{ steps.platform.outputs.pair }}
+            type=gha,scope=builder-${{ steps.platform.outputs.pair }}
+          cache-to: type=gha,mode=max,scope=runtime-${{ steps.platform.outputs.pair }}
+
+      - name: Export digests
+        run: |
+          mkdir -p /tmp/digests/builder /tmp/digests/runtime
+          builder_digest="${{ steps.build-builder.outputs.digest }}"
+          runtime_digest="${{ steps.build-runtime.outputs.digest }}"
+          touch "/tmp/digests/builder/${builder_digest#sha256:}"
+          touch "/tmp/digests/runtime/${runtime_digest#sha256:}"
+
+      - name: Upload builder digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-builder-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests/builder/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload runtime digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-runtime-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests/runtime/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble the per-arch digests into a single multi-arch manifest list per
+  # image and apply the human-facing tags (latest / X / X.Y / X.Y.Z / main).
+  merge:
+    name: Merge ${{ matrix.image }} manifest
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: waydriver-mcp
+            artifact: runtime
+            title: waydriver-mcp
+            description: MCP server for headless Wayland UI testing
+          - image: waydriver-mcp-builder
+            artifact: builder
+            title: waydriver-mcp-builder
+            description: Build environment for apps tested with waydriver-mcp (Fedora + Rust + GTK4 dev headers)
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.artifact }}-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ needs.prepare.outputs.owner }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.kind == 'release' }}
+            type=raw,value=${{ needs.prepare.outputs.full }},enable=${{ needs.prepare.outputs.kind == 'release' }}
+            type=raw,value=${{ needs.prepare.outputs.minor }},enable=${{ needs.prepare.outputs.kind == 'release' }}
+            type=raw,value=${{ needs.prepare.outputs.major }},enable=${{ needs.prepare.outputs.kind == 'release' }}
+            type=raw,value=main,enable=${{ needs.prepare.outputs.kind == 'main' }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          # shellcheck disable=SC2046  # intentional split into -t/digest args
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ needs.prepare.outputs.owner }}/${{ matrix.image }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect \
+            ghcr.io/${{ needs.prepare.outputs.owner }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
