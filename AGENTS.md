@@ -177,9 +177,10 @@ let session = Session::start(Box::new(compositor), Box::new(input), Box::new(cap
 1. Abort + await the **stdout reader** `JoinHandle` — drops the `Arc<AppStdout>` even when a leaked grandchild has inherited the app's stdout pipe.
 2. Kill the **app** — its Wayland connection holds a reference into mutter.
 3. **Stop the video recorder** (if any) — sends EOS so `webmmux` writes the seekhead before the source disappears.
-4. **Stop the keepalive ScreenCast stream** — must run before the backends drop, while mutter and the PipeWire node are still alive.
-5. Call **`compositor.stop()`** — kills mutter/pipewire/wireplumber, terminates the private dbus-daemon, removes the runtime dir.
-6. `self` drops: input/capture release their `Arc<MutterState>` refs after the compositor is already down (harmless).
+4. **Stop the recorder's dedicated ScreenCast stream** (if any) — after the encoder has flushed; independent of the keepalive stream.
+5. **Stop the keepalive ScreenCast stream** — must run before the backends drop, while mutter and the PipeWire node are still alive.
+6. Call **`compositor.stop()`** — kills mutter/pipewire/wireplumber, terminates the private dbus-daemon, removes the runtime dir.
+7. `self` drops: input/capture release their `Arc<MutterState>` refs after the compositor is already down (harmless).
 
 The `Session` struct's field declaration order mirrors this sequence so the implicit `Drop` path (used when `kill` was never called or panicked mid-shutdown) is also safe. **Do not reorder the fields.** `Drop` itself only cancels the token, aborts the reader handle, and `start_kill`s the app — async cleanup belongs in `kill`.
 
@@ -217,7 +218,9 @@ The signal subscription must happen **before** `Session.Start` — mutter emits 
 
 ### Video recording pipeline
 
-When `SessionConfig::video_output` is set, `Session::start` opens a second long-lived GStreamer pipeline on the same PipeWire node as the keepalive stream: `pipewiresrc ! videoconvert ! videorate ! video/x-raw,framerate=15/1 ! vp8enc ! webmmux ! filesink`. The `VideoRecorder` handle lives on `Session` and is stopped by `Session::kill` **before** the keepalive stream is torn down, so the encoder/muxer still have a live source to flush through.
+When `SessionConfig::video_output` is set, `Session::start` opens a **dedicated** ScreenCast stream for recording via `CaptureBackend::start_recording_stream` (a separate `recorder_stream` on `Session`, distinct from the keepalive node) and runs a long-lived GStreamer pipeline on *that* node: `pipewiresrc ! videoconvert ! videorate ! video/x-raw,framerate=15/1 ! vp8enc ! webmmux ! filesink`. The `VideoRecorder` handle lives on `Session` and is stopped by `Session::kill` **before** its stream is torn down, so the encoder/muxer still have a live source to flush through.
+
+The recorder must **not** share the keepalive node with the screenshot path. Mutter negotiates the screencast stream at `framerate=0/1` (emit-on-damage) and only delivers the initial frame to a node's first/triggering consumer. A continuous recorder consumer on the shared node leaves a later-attaching `take_screenshot` consumer waiting for damage that a static app never produces — it times out with `screenshot: timed out waiting for PNG frame`. Giving the recorder its own stream keeps the screenshot consumer the keepalive node's first/triggering consumer (the reliable recording-off path). On mutter, the recorder's stream is **standalone** (not linked to the RemoteDesktop session) — it needs only pixels, is started via `ScreenCast.Session.Start` directly, and does not publish itself as the active-stream path used for pointer routing.
 
 Stopping sends `EOS` on the pipeline and waits on the bus for `EOS`/`Error` (10 s timeout) before `set_state(Null)`. This is load-bearing: `webmmux` only writes the cues/seekhead on EOS, so a pipeline that's just set to `Null` produces a playable-but-unseekable WebM. `VideoRecorder::Drop` logs a warning and does the best-effort `Null` fallback — callers should always go through `Session::kill`.
 

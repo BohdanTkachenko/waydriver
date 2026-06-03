@@ -53,9 +53,11 @@ pub struct SessionConfig {
     /// Accessible name used to look the app up in the AT-SPI registry.
     pub app_name: String,
     /// If set, the session records a continuous WebM video of the display to
-    /// this path. Recording starts right after the keepalive stream is open
-    /// and stops right before it is torn down in [`Session::kill`]. When
-    /// `None`, no recording pipeline is started.
+    /// this path. Recording runs on its own dedicated ScreenCast stream,
+    /// opened during [`Session::start`] and torn down in [`Session::kill`]
+    /// right after the encoder is flushed — kept off the keepalive node so it
+    /// can't starve the screenshot path. When `None`, no recording stream or
+    /// pipeline is started.
     pub video_output: Option<PathBuf>,
     /// VP8 target bitrate in bits/sec for the recording pipeline. Only
     /// consulted when `video_output` is `Some`. When `None`, falls back to
@@ -407,10 +409,20 @@ pub struct Session {
     /// sends Wayland frame callbacks and GTK4 apps cannot repaint after
     /// their initial render.
     keepalive_stream: Option<crate::backend::PipeWireStream>,
-    /// Optional long-lived WebM recording that shares the keepalive
-    /// ScreenCast node. Declared after `keepalive_stream` so implicit drop
-    /// order matches the explicit shutdown sequence in [`Session::kill`]:
-    /// flush the recording before releasing the ScreenCast token.
+    /// Dedicated ScreenCast stream backing [`video_recorder`], separate from
+    /// `keepalive_stream`. The recorder must not share the keepalive node with
+    /// the screenshot path: a recording pipeline is a continuous consumer, and
+    /// on mutter's on-damage (`framerate=0/1`) screencast node a screenshot
+    /// consumer that attaches after the recorder never receives a frame for a
+    /// static app and times out. Its own node keeps the screenshot consumer
+    /// the keepalive node's first/triggering consumer. `Some` only while
+    /// recording; torn down in [`Session::kill`] right after the recorder is
+    /// flushed.
+    recorder_stream: Option<crate::backend::PipeWireStream>,
+    /// Optional long-lived WebM recording that reads from `recorder_stream`.
+    /// Declared after the streams so implicit drop order matches the explicit
+    /// shutdown sequence in [`Session::kill`]: flush the recording before
+    /// releasing the ScreenCast tokens.
     video_recorder: Option<VideoRecorder>,
     input: Box<dyn InputBackend>,
     capture: Box<dyn CaptureBackend>,
@@ -574,22 +586,24 @@ impl Session {
             );
         }
 
-        // If the caller requested a recording, start a second GStreamer
-        // pipeline on the same PipeWire node. Failure here aborts session
-        // startup: the caller explicitly opted in, so silently skipping
-        // would be surprising.
-        let video_recorder = if let Some(ref path) = cfg.video_output {
+        // If the caller requested a recording, open a *dedicated* ScreenCast
+        // stream for it and run the encoder against that node — never the
+        // keepalive node the screenshot path uses. Sharing the node makes the
+        // recorder a continuous consumer that starves a later-attaching
+        // screenshot consumer on mutter's on-damage stream (see
+        // `recorder_stream` / `CaptureBackend::start_recording_stream`).
+        // Failure here aborts session startup: the caller explicitly opted in,
+        // so silently skipping would be surprising.
+        let (recorder_stream, video_recorder) = if let Some(ref path) = cfg.video_output {
             let bitrate = cfg
                 .video_bitrate
                 .unwrap_or(crate::capture::DEFAULT_VIDEO_BITRATE);
             let fps = cfg.video_fps.unwrap_or(crate::capture::DEFAULT_VIDEO_FPS);
-            Some(
-                capture
-                    .start_recording(&keepalive_stream, path, bitrate, fps)
-                    .await?,
-            )
+            let stream = capture.start_recording_stream().await?;
+            let recorder = capture.start_recording(&stream, path, bitrate, fps).await?;
+            (Some(stream), Some(recorder))
         } else {
-            None
+            (None, None)
         };
 
         #[cfg(feature = "visual")]
@@ -619,6 +633,7 @@ impl Session {
             cancellation,
             app,
             keepalive_stream: Some(keepalive_stream),
+            recorder_stream,
             video_recorder,
             input,
             capture,
@@ -675,13 +690,21 @@ impl Session {
             let _ = self.app.kill().await;
             let _ = self.app.wait().await;
 
-            // Finalize the recording before tearing down the ScreenCast
+            // Finalize the recording before tearing down its ScreenCast
             // stream so the muxer still has a live PipeWire node to
             // flush through. Errors are logged but don't block teardown.
             if let Some(recorder) = self.video_recorder.take() {
                 if let Err(e) = self.capture.stop_recording(recorder).await {
                     tracing::warn!(error = %e, "stop_recording failed");
                 }
+            }
+
+            // Tear down the recorder's dedicated stream now that the encoder
+            // has flushed. Done before the keepalive stream for symmetry; the
+            // two are independent ScreenCast sessions so order is not
+            // load-bearing between them.
+            if let Some(stream) = self.recorder_stream.take() {
+                let _ = self.capture.stop_recording_stream(stream).await;
             }
 
             // Stop the keepalive ScreenCast stream before dropping backends.
@@ -1146,6 +1169,7 @@ impl Session {
             cancellation: CancellationToken::new(),
             app,
             keepalive_stream: None,
+            recorder_stream: None,
             video_recorder: None,
             input,
             capture,
@@ -1176,9 +1200,10 @@ impl Drop for Session {
     fn drop(&mut self) {
         // Best-effort kill when dropped without calling kill().
         // After this returns, fields drop in declaration order:
-        // app → keepalive_stream → video_recorder → input → capture →
-        // compositor. A video_recorder dropped without explicit stop()
-        // leaves a truncated WebM (no seekhead) — see VideoRecorder::Drop.
+        // app → keepalive_stream → recorder_stream → video_recorder → input →
+        // capture → compositor. A video_recorder dropped without explicit
+        // stop() leaves a truncated WebM (no seekhead) — see
+        // VideoRecorder::Drop.
         // Cancel the token so a still-running stdout reader exits
         // cooperatively; abort the JoinHandle as a hard fallback for
         // the leaked-grandchild case where the read syscall never

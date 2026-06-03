@@ -436,15 +436,16 @@ graph LR
 graph LR
     screencast["Mutter ScreenCast API"]
     monitor["RecordMonitor\n(virtual monitor)"]
-    pipewire["PipeWire stream\n(keepalive)"]
+    pw_keep["PipeWire stream\n(keepalive — screenshots)"]
+    pw_rec["PipeWire stream\n(dedicated — recording)"]
     gst_shot["On-demand GStreamer pipeline\n(pngenc snapshot=true)"]
     gst_rec["Long-lived GStreamer pipeline\n(vp8enc + webmmux)"]
     png["PNG bytes"]
     webm["WebM file"]
 
-    screencast --> monitor --> pipewire
-    pipewire --> gst_shot --> png
-    pipewire --> gst_rec --> webm
+    screencast --> monitor
+    monitor --> pw_keep --> gst_shot --> png
+    monitor --> pw_rec --> gst_rec --> webm
 ```
 
-The keepalive PipeWire stream doubles as the capture source for both paths. `take_screenshot` spins up a transient pngenc pipeline on each call; recording runs a single `vp8enc ! webmmux ! filesink` pipeline for the session's lifetime, flushed with EOS on `Session::kill` so the WebM is seekable. Both use the GStreamer Rust bindings (`gstreamer` + `gstreamer-app` crates) and only `gst-plugins-good` (no `-bad`/`-ugly`).
+Screenshots and recording use **separate** ScreenCast streams. `take_screenshot` spins up a transient pngenc pipeline on the keepalive stream on each call; recording runs a single `vp8enc ! webmmux ! filesink` pipeline for the session's lifetime on its own dedicated stream, flushed with EOS on `Session::kill` so the WebM is seekable. They must not share a node: mutter's screencast node only emits frames on screen damage (`framerate=0/1`), and a continuous recorder consumer would starve a later-attaching screenshot consumer of the initial frame on a static app — so the recorder gets its own stream and the screenshot path stays the keepalive node's first/triggering consumer. Both use the GStreamer Rust bindings (`gstreamer` + `gstreamer-app` crates) and only `gst-plugins-good` (no `-bad`/`-ugly`).

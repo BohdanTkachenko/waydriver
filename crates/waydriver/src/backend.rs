@@ -325,6 +325,35 @@ pub trait CaptureBackend: Send + Sync {
     /// Stop a previously started stream and release backend-side resources.
     async fn stop_stream(&self, stream: PipeWireStream) -> Result<()>;
 
+    /// Start a *dedicated* capture stream for a video recording, distinct
+    /// from the interactive/keepalive stream returned by [`Self::start_stream`].
+    ///
+    /// The recorder must not share a node with the screenshot path. A
+    /// recording pipeline is a continuous consumer; on compositors whose
+    /// screencast node only emits frames on screen damage (mutter negotiates
+    /// `framerate=0/1`), a screenshot consumer that attaches *after* the
+    /// recorder is already draining the shared node never receives the
+    /// initial frame and times out — a static app produces no further damage.
+    /// Giving the recorder its own node keeps the screenshot consumer the
+    /// node's first/triggering consumer, which is what makes the
+    /// recording-off path reliable.
+    ///
+    /// Backends that don't have this hazard may use the default, which simply
+    /// opens another stream via [`Self::start_stream`]. The mutter backend
+    /// overrides this to open a *standalone* (non-RemoteDesktop-linked)
+    /// stream so it doesn't perturb pointer routing or the active-stream path.
+    async fn start_recording_stream(&self) -> Result<PipeWireStream> {
+        self.start_stream().await
+    }
+
+    /// Stop a stream previously opened by [`Self::start_recording_stream`].
+    /// The default delegates to [`Self::stop_stream`]; the mutter backend
+    /// overrides it to avoid clearing the interactive stream's active-stream
+    /// path.
+    async fn stop_recording_stream(&self, stream: PipeWireStream) -> Result<()> {
+        self.stop_stream(stream).await
+    }
+
     /// Path to the PipeWire socket the shared GStreamer helper should talk
     /// to (usually `<runtime_dir>/pipewire-0`).
     fn pipewire_socket(&self) -> PathBuf;

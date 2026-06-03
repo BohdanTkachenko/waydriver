@@ -26,22 +26,38 @@ impl MutterCapture {
     pub fn new(state: Arc<MutterState>) -> Self {
         Self { state }
     }
-}
 
-#[async_trait]
-impl CaptureBackend for MutterCapture {
-    async fn start_stream(&self) -> Result<PipeWireStream> {
+    /// Open a ScreenCast monitor-record stream and resolve its PipeWire node id.
+    ///
+    /// `link_rd` selects between the two stream flavors waydriver needs:
+    ///
+    /// - `true` — the interactive/keepalive stream. The ScreenCast session is
+    ///   linked to the RemoteDesktop session so mutter accepts
+    ///   `NotifyPointerMotionAbsolute`, the session is driven via
+    ///   `RemoteDesktop.Session.Start` (mutter rejects
+    ///   `ScreenCast.Session.Start` on a linked session), and the resulting
+    ///   stream path is published as the active stream for pointer routing.
+    /// - `false` — a standalone stream for the video recorder. It is *not*
+    ///   linked to RemoteDesktop (the recorder needs only pixels), is started
+    ///   via `ScreenCast.Session.Start` directly, and does not touch the
+    ///   active-stream path. Keeping the recorder on its own node is what
+    ///   prevents it from starving the screenshot consumer on the shared
+    ///   keepalive node — see [`CaptureBackend::start_recording_stream`].
+    async fn create_stream(&self, link_rd: bool) -> Result<PipeWireStream> {
         let conn = self.state.conn();
 
-        // Step 1: Create ScreenCast session, linking it to the existing
-        // RemoteDesktop session so absolute pointer motion works (mutter
-        // routes NotifyPointerMotionAbsolute through the linked stream).
+        // Step 1: Create the ScreenCast session. For the interactive stream we
+        // link it to the existing RemoteDesktop session so absolute pointer
+        // motion works (mutter routes NotifyPointerMotionAbsolute through the
+        // linked stream). The recorder's standalone stream skips the link.
         let empty_opts: HashMap<&str, Value> = HashMap::new();
         let mut create_opts: HashMap<&str, Value> = HashMap::new();
-        create_opts.insert(
-            "remote-desktop-session-id",
-            Value::from(self.state.rd_session_id()),
-        );
+        if link_rd {
+            create_opts.insert(
+                "remote-desktop-session-id",
+                Value::from(self.state.rd_session_id()),
+            );
+        }
         let reply = conn
             .call_method(
                 Some("org.gnome.Mutter.ScreenCast"),
@@ -92,16 +108,16 @@ impl CaptureBackend for MutterCapture {
             .await
             .map_err(|e| Error::screenshot_with("receive_signal", e))?;
 
-        // Step 4: Start the ScreenCast session — via either the SC
-        // interface (standalone) or the linked RD session. When the SC
-        // session is linked to an RD session, mutter requires
-        // `RemoteDesktop.Session.Start` to drive it; calling
-        // `ScreenCast.Session.Start` directly yields
-        // "Must be started from remote desktop session". Starting RD
-        // also unlocks `NotifyPointerMotionAbsolute` on the input
-        // backend. Only the first stream triggers RD.Start; subsequent
-        // streams share the same RD session and skip.
-        let should_start_rd = {
+        // Step 4: Start the ScreenCast session. A linked (RD) session must be
+        // driven via `RemoteDesktop.Session.Start` — calling
+        // `ScreenCast.Session.Start` on it yields "Must be started from remote
+        // desktop session". Starting RD also unlocks
+        // `NotifyPointerMotionAbsolute` on the input backend. Only the first
+        // linked stream triggers RD.Start; subsequent linked streams share the
+        // same RD session and skip. A standalone (non-linked) stream — the
+        // recorder's — is started directly via `ScreenCast.Session.Start` and
+        // never touches the RD-started flag.
+        let should_start_rd = link_rd && {
             let mut guard = self.state.rd_started_lock()?;
             if *guard {
                 false
@@ -146,11 +162,15 @@ impl CaptureBackend for MutterCapture {
         .await
         .map_err(|_| Error::screenshot("timeout waiting for PipeWireStreamAdded"))??;
 
-        tracing::debug!(node_id, "got PipeWire node id for screenshot");
+        tracing::debug!(node_id, link_rd, "got PipeWire node id");
 
         // Publish the stream object path so MutterInput can route
-        // NotifyPointerMotionAbsolute at the correct monitor.
-        *self.state.active_stream_path_lock()? = Some(stream_path.to_string());
+        // NotifyPointerMotionAbsolute at the correct monitor. Only the
+        // interactive (RD-linked) stream owns pointer routing; the recorder's
+        // standalone stream must not overwrite it.
+        if link_rd {
+            *self.state.active_stream_path_lock()? = Some(stream_path.to_string());
+        }
 
         Ok(PipeWireStream {
             node_id,
@@ -163,7 +183,10 @@ impl CaptureBackend for MutterCapture {
         })
     }
 
-    async fn stop_stream(&self, stream: PipeWireStream) -> Result<()> {
+    /// Stop a ScreenCast session by object path. Shared by `stop_stream` and
+    /// `stop_recording_stream`; best-effort (a failed `Session.Stop` on a
+    /// teardown path is logged by the caller, not surfaced).
+    async fn stop_session(&self, stream: PipeWireStream) -> Result<()> {
         let session_path = stream.token.downcast::<OwnedObjectPath>()?;
         let _ = self
             .state
@@ -176,8 +199,31 @@ impl CaptureBackend for MutterCapture {
                 &(),
             )
             .await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CaptureBackend for MutterCapture {
+    async fn start_stream(&self) -> Result<PipeWireStream> {
+        self.create_stream(true).await
+    }
+
+    async fn stop_stream(&self, stream: PipeWireStream) -> Result<()> {
+        self.stop_session(stream).await?;
+        // The interactive stream owns pointer routing; clear it on teardown.
         *self.state.active_stream_path_lock()? = None;
         Ok(())
+    }
+
+    async fn start_recording_stream(&self) -> Result<PipeWireStream> {
+        self.create_stream(false).await
+    }
+
+    async fn stop_recording_stream(&self, stream: PipeWireStream) -> Result<()> {
+        // Standalone stream: never published itself as the active stream, so
+        // it must not clear the interactive stream's pointer-routing path.
+        self.stop_session(stream).await
     }
 
     fn pipewire_socket(&self) -> PathBuf {
