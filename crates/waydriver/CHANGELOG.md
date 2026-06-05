@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.8](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.2.7...waydriver-v0.2.8) - 2026-06-05
+
+### Fixed
+
+- *(compositor-mutter)* snapshot host runtime root to keep session dirs flat
+
 ## [0.2.7](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.2.6...waydriver-v0.2.7) - 2026-06-03
 
 ### Fixed
