@@ -17,7 +17,7 @@ mod error;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
@@ -127,6 +127,33 @@ pub struct MutterCompositor {
     state: Option<Arc<MutterState>>,
 }
 
+/// The host runtime root under which every session's `wd-session-<id>`
+/// directory is created. Snapshotted once, lazily, on the first
+/// `MutterCompositor::new()` call.
+///
+/// This is deliberately read **once** and cached, rather than re-read from
+/// `XDG_RUNTIME_DIR` per session. `waydriver`'s screenshot and video pipelines
+/// (`waydriver::capture`) mutate the parent process's `XDG_RUNTIME_DIR` to
+/// point `pipewiresrc` at the *live* session's pipewire socket, and never
+/// restore it. If `new()` re-read the live env each time, session N+1's
+/// runtime dir would be created **inside** session N's dir
+/// (`…/wd-session-A/wd-session-B/…`), nesting one level deeper per session.
+/// After ~4 levels the `<dir>/pipewire-0` path exceeds the ~107-byte AF_UNIX
+/// `sun_path` limit, pipewire can no longer bind its socket, and every
+/// subsequent `start_session` fails with a "timeout: pipewire socket" error
+/// until the server is restarted (which resets the process env). Snapshotting
+/// the root keeps each session dir a flat sibling under the original
+/// `XDG_RUNTIME_DIR`, independent of how many sessions preceded it.
+///
+/// The first `new()` runs before any session exists, so the env is still the
+/// pristine value set by the launcher (e.g. the Docker entrypoint) — capturing
+/// it then is safe.
+static HOST_RUNTIME_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
+    let root = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+    PathBuf::from(root)
+});
+
 impl MutterCompositor {
     /// Construct but do not start. Generates the session id and computes
     /// where the Wayland socket and runtime dir will live. No I/O.
@@ -134,9 +161,7 @@ impl MutterCompositor {
         let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let wayland_display = format!("wayland-wd-{}", id);
 
-        let host_runtime = std::env::var("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
-        let runtime_dir = PathBuf::from(&host_runtime).join(format!("wd-session-{}", id));
+        let runtime_dir = HOST_RUNTIME_ROOT.join(format!("wd-session-{}", id));
 
         Self {
             id,
@@ -722,6 +747,38 @@ mod tests {
             "runtime_dir '{}' should contain id '{}'",
             dir_str,
             c.id()
+        );
+    }
+
+    /// Regression: session runtime dirs must be flat siblings under one root,
+    /// never nested inside each other. `waydriver::capture` repoints the
+    /// process-wide `XDG_RUNTIME_DIR` at the live session's dir after a
+    /// screenshot/recording; if `new()` re-read that mutated value, each
+    /// session would nest one level deeper and eventually overflow the
+    /// AF_UNIX `sun_path` limit, wedging pipewire socket creation. See
+    /// `HOST_RUNTIME_ROOT`.
+    #[test]
+    fn test_session_runtime_dirs_are_siblings_not_nested() {
+        let a = MutterCompositor::new();
+        let dir_a = a.runtime_dir().to_path_buf();
+
+        // Simulate what a screenshot/recording does: point XDG_RUNTIME_DIR at
+        // the live session's runtime dir and leave it there.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &dir_a);
+        }
+
+        let b = MutterCompositor::new();
+        let dir_b = b.runtime_dir().to_path_buf();
+
+        assert_eq!(
+            dir_a.parent(),
+            dir_b.parent(),
+            "session dirs must share a parent (siblings), got a={dir_a:?} b={dir_b:?}"
+        );
+        assert!(
+            !dir_b.starts_with(&dir_a),
+            "session B nested inside session A: {dir_b:?}"
         );
     }
 
