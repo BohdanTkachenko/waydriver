@@ -19,7 +19,9 @@ use waydriver_capture_mutter::MutterCapture;
 use waydriver_compositor_mutter::MutterCompositor;
 use waydriver_input_mutter::MutterInput;
 
-use crate::cli::{resolve_report_dir, resolve_resolution, resolve_scale};
+use crate::cli::{
+    resolve_gsettings_isolation, resolve_report_dir, resolve_resolution, resolve_scale,
+};
 use crate::mcp_error::waydriver_to_mcp;
 use crate::params::{SessionIdParams, StartSessionParams};
 use crate::report::{append_event, now_ms, render_index_html};
@@ -100,6 +102,12 @@ impl UiTestServer {
 
         let resolution = resolve_resolution(&self.default_resolution, params.resolution.as_deref());
         let scale = resolve_scale(self.default_scale, params.scale);
+        let isolate_settings =
+            resolve_gsettings_isolation(self.default_gsettings_isolation, params.isolate_settings);
+        let gsettings = waydriver::GSettingsConfig {
+            isolated: isolate_settings,
+            initial: params.gsettings.iter().map(|g| g.to_waydriver()).collect(),
+        };
 
         let report_dir = resolve_report_dir(&self.report_dir, params.report_dir.as_deref());
         let report_enabled = params.report;
@@ -114,7 +122,7 @@ impl UiTestServer {
         // shared Arc<MutterState> out before erasing to trait objects. Input
         // and capture are thin wrappers around that Arc, so they get cloned
         // references to the same D-Bus connection.
-        let mut compositor = MutterCompositor::new();
+        let mut compositor = MutterCompositor::new().with_gsettings(gsettings);
         compositor
             .start(Some(&resolution), Some(scale))
             .await
@@ -151,6 +159,9 @@ impl UiTestServer {
                 visual_region_tuning: Default::default(),
                 visual_text_tuning: Default::default(),
                 visual_click_tuning: Default::default(),
+                // Must match the mode the compositor was started with —
+                // both read the same per-session keyfile dir.
+                gsettings_isolated: isolate_settings,
             },
         )
         .await
@@ -191,6 +202,7 @@ impl UiTestServer {
             "app_name": app_name,
             "resolution": resolution,
             "scale": scale,
+            "isolate_settings": isolate_settings,
         });
         if let Err(e) = managed
             .log_event(&id, "start_session", log_params, Ok(&start_msg), None)

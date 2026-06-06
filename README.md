@@ -154,7 +154,7 @@ with `.nth(i)` or a more specific XPath.
 
 | Tool              | Purpose                                                               |
 | ----------------- | --------------------------------------------------------------------- |
-| `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir`, `resolution`, `scale`, `record_video`, `video_bitrate` overrides per session) |
+| `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir`, `resolution`, `scale`, `isolate_settings`, `gsettings`, `record_video`, `video_bitrate` overrides per session) |
 | `list_sessions`   | List active session ids, app names, and Wayland displays              |
 | `kill_session`    | Tear down a session and clean up all child processes                  |
 | `dump_tree`       | Dump the AT-SPI accessibility tree as XML — each node carries a `_ref` you can target with `query`/`click`/etc. |

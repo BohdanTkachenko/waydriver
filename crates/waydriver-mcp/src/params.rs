@@ -44,6 +44,24 @@ pub struct StartSessionParams {
     /// for the mode (e.g. 1.66 may become 1.75). When unset, falls back to the
     /// server's `--scale` flag (default 1.0).
     pub scale: Option<f64>,
+    /// Isolate this session's GSettings: run mutter and the app against a
+    /// private per-session keyfile store instead of the host's dconf database.
+    /// Enabled by default — this is what lets fractional `scale` work and keeps
+    /// the session from reading or writing the host's real desktop settings.
+    /// Set `false` to use the host's GSettings (e.g. to debug against a live
+    /// desktop's settings); fractional scaling then depends on the host having
+    /// `scale-monitor-framebuffer` enabled. When unset, falls back to the
+    /// server's `--gsettings-isolation` flag (default true).
+    pub isolate_settings: Option<bool>,
+    /// GSettings entries to seed into the isolated keyfile store before launch,
+    /// readable by both mutter and the app (e.g. set
+    /// `org.gnome.desktop.interface text-scaling-factor` to test font scaling,
+    /// or `color-scheme` to test dark mode). Ignored when `isolate_settings`
+    /// is false. An entry for `org.gnome.mutter experimental-features`
+    /// overrides the default that enables fractional scaling, so include
+    /// `scale-monitor-framebuffer` yourself if you set that key.
+    #[serde(default)]
+    pub gsettings: Vec<GSettingParam>,
     /// Record a continuous WebM video of the session under
     /// `{report_dir}/{session_id}/{session_id}.webm`. When unset, falls back
     /// to the server's `--record-video` / `--no-record-video` flag (default
@@ -59,6 +77,31 @@ pub struct StartSessionParams {
 
 fn default_report_enabled() -> bool {
     true
+}
+
+/// One GSettings entry to seed into the session's isolated keyfile store,
+/// mirroring [`waydriver::GSettingEntry`] at the MCP boundary.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GSettingParam {
+    /// Dotted schema id, e.g. "org.gnome.desktop.interface".
+    pub schema: String,
+    /// Key within the schema, e.g. "text-scaling-factor".
+    pub key: String,
+    /// Value in GVariant text form (same syntax `gsettings set` takes):
+    /// numbers bare ("1.5"), strings single-quoted ("'prefer-dark'"),
+    /// arrays bracketed ("['scale-monitor-framebuffer']").
+    pub value: String,
+}
+
+impl GSettingParam {
+    /// Translate the wire struct into the library type.
+    pub fn to_waydriver(&self) -> waydriver::GSettingEntry {
+        waydriver::GSettingEntry::new(
+            self.schema.clone(),
+            self.key.clone(),
+            self.value.clone(),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -474,6 +517,38 @@ mod tests {
         let params: StartSessionParams =
             serde_json::from_value(serde_json::json!({ "command": "x", "scale": 1.5 })).unwrap();
         assert_eq!(params.scale, Some(1.5));
+    }
+
+    #[test]
+    fn start_session_params_isolate_settings_defaults_to_none() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
+        assert_eq!(params.isolate_settings, None);
+    }
+
+    #[test]
+    fn start_session_params_gsettings_defaults_to_empty() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
+        assert!(params.gsettings.is_empty());
+    }
+
+    #[test]
+    fn start_session_params_gsettings_parses_entries() {
+        let params: StartSessionParams = serde_json::from_value(serde_json::json!({
+            "command": "x",
+            "isolate_settings": false,
+            "gsettings": [
+                { "schema": "org.gnome.desktop.interface", "key": "text-scaling-factor", "value": "1.5" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(params.isolate_settings, Some(false));
+        assert_eq!(params.gsettings.len(), 1);
+        let entry = params.gsettings[0].to_waydriver();
+        assert_eq!(entry.schema, "org.gnome.desktop.interface");
+        assert_eq!(entry.key, "text-scaling-factor");
+        assert_eq!(entry.value, "1.5");
     }
 
     #[test]

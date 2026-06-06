@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use tokio::process::{Child, Command};
 use zbus::zvariant::OwnedValue;
 
+use waydriver::gsettings::{self, GSettingEntry, GSettingsConfig};
 use waydriver::{CompositorRuntime, Result};
 
 use crate::error::MutterError;
@@ -36,6 +37,13 @@ const DEFAULT_RESOLUTION: &str = "1024x768";
 /// logical (application) size. Any other value drives the HiDPI path in
 /// [`apply_scale`].
 const DEFAULT_SCALE: f64 = 1.0;
+
+/// GVariant-text value seeded into `org.gnome.mutter experimental-features`
+/// when GSettings isolation is on. `scale-monitor-framebuffer` switches the
+/// native headless backend to logical layout mode, which is what makes
+/// fractional scales (1.5, 1.75, …) appear in a mode's `supported-scales` and
+/// be accepted by `ApplyMonitorsConfig`. Harmless at integer/1.0 scales.
+const MUTTER_FRACTIONAL_SCALING: &str = "['scale-monitor-framebuffer']";
 
 /// Accepted scale range. Below 0.5 the UI is unusably small; above 4.0 mutter
 /// won't offer the scale for any virtual-monitor mode we'd create. Validated
@@ -173,6 +181,7 @@ pub struct MutterCompositor {
     pipewire: Option<Child>,
     wireplumber: Option<Child>,
     state: Option<Arc<MutterState>>,
+    gsettings: GSettingsConfig,
 }
 
 /// The host runtime root under which every session's `wd-session-<id>`
@@ -221,7 +230,20 @@ impl MutterCompositor {
             pipewire: None,
             wireplumber: None,
             state: None,
+            gsettings: GSettingsConfig::default(),
         }
+    }
+
+    /// Set the per-session GSettings isolation config (see
+    /// [`waydriver::gsettings`]). Defaults to isolated with no seeded entries.
+    /// When isolated, [`start`](Self::start) writes a private keyfile (seeded
+    /// with `org.gnome.mutter experimental-features` plus `config.initial`)
+    /// and points mutter at it, so fractional scales work and the host's dconf
+    /// is neither read nor written. Pass `isolated: false` to run mutter
+    /// against the host's GSettings instead.
+    pub fn with_gsettings(mut self, config: GSettingsConfig) -> Self {
+        self.gsettings = config;
+        self
     }
 
     /// Returns the shared `Arc<MutterState>` for passing to sibling
@@ -277,7 +299,13 @@ impl MutterCompositor {
         // DisplayConfig apply that consumes it doesn't run until mutter is up.
         validate_scale(scale)?;
 
-        tracing::info!(id = self.id, resolution, scale, "starting mutter compositor");
+        tracing::info!(
+            id = self.id,
+            resolution,
+            scale,
+            isolated = self.gsettings.isolated,
+            "starting mutter compositor"
+        );
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
         // `runtime_dir` is built in `new()` from a UTF-8 String
@@ -290,6 +318,33 @@ impl MutterCompositor {
             .to_str()
             .expect("invariant: runtime_dir built from UTF-8 inputs in new()")
             .to_string();
+
+        // GSettings isolation: when on, write the session's private keyfile
+        // (read by both mutter and the app — see `waydriver::gsettings`) and
+        // compute the env that points mutter at it. The keyfile is seeded with
+        // the fractional-scaling experimental feature so a non-integer `scale`
+        // is actually advertised by mutter, then any caller-supplied entries
+        // are appended (last-wins, so callers can override). When off, mutter
+        // reads the host's GSettings and `config_env` stays empty.
+        let config_env: Vec<(&str, String)> = if self.gsettings.isolated {
+            let mut entries = vec![GSettingEntry::new(
+                "org.gnome.mutter",
+                "experimental-features",
+                MUTTER_FRACTIONAL_SCALING,
+            )];
+            entries.extend(self.gsettings.initial.iter().cloned());
+            gsettings::write_keyfile(&self.runtime_dir, &entries)?;
+            let config_dir = gsettings::config_dir(&self.runtime_dir)
+                .to_str()
+                .expect("invariant: config_dir is runtime_dir (UTF-8) + ASCII suffix")
+                .to_string();
+            vec![
+                ("XDG_CONFIG_HOME", config_dir),
+                ("GSETTINGS_BACKEND", gsettings::KEYFILE_BACKEND.to_string()),
+            ]
+        } else {
+            Vec::new()
+        };
 
         // Step 1: Private D-Bus for mutter (so its ScreenCast API doesn't conflict with host).
         let dbus_output = Command::new("dbus-launch")
@@ -379,6 +434,9 @@ impl MutterCompositor {
             .env_remove("PIPEWIRE_REMOTE")
             .env("DBUS_SESSION_BUS_ADDRESS", &self.mutter_dbus_address)
             .env("XDG_RUNTIME_DIR", &runtime_str)
+            // Empty when isolation is off; otherwise points mutter at the
+            // per-session keyfile GSettings store written above.
+            .envs(config_env.iter().map(|(k, v)| (*k, v.as_str())))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()

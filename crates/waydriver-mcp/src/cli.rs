@@ -25,6 +25,19 @@ pub struct Cli {
     /// size, so apps see a logical size of resolution ÷ scale.
     #[arg(long, default_value_t = 1.0, env = "WAYDRIVER_SCALE")]
     pub scale: f64,
+    /// Default GSettings isolation for sessions that don't override it via
+    /// start_session's `isolate_settings` parameter. When on (default), mutter
+    /// and the app run against a private per-session keyfile store instead of
+    /// the host's dconf — required for fractional `--scale` and keeps sessions
+    /// from touching the host's real desktop settings. Turn off to use the
+    /// host's GSettings.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        env = "WAYDRIVER_GSETTINGS_ISOLATION"
+    )]
+    pub gsettings_isolation: bool,
     /// Record a continuous WebM video of each session by default. When on,
     /// each session writes `{report_dir}/{session_id}/{session_id}.webm`
     /// alongside its screenshots and events. Per-session override via
@@ -60,6 +73,12 @@ pub fn resolve_resolution(default: &str, override_: Option<&str>) -> String {
 /// Resolve the effective logical-monitor scale for a new session:
 /// per-session override if provided, else the server's default.
 pub fn resolve_scale(default: f64, override_: Option<f64>) -> f64 {
+    override_.unwrap_or(default)
+}
+
+/// Resolve the effective GSettings-isolation flag for a new session:
+/// per-session override if provided, else the server's default.
+pub fn resolve_gsettings_isolation(default: bool, override_: Option<bool>) -> bool {
     override_.unwrap_or(default)
 }
 
@@ -129,6 +148,30 @@ mod tests {
     fn cli_accepts_scale_flag() {
         let cli = Cli::try_parse_from(["waydriver-mcp", "--scale", "1.5"]).unwrap();
         assert_eq!(cli.scale, 1.5);
+    }
+
+    #[test]
+    fn resolve_gsettings_isolation_defaults_to_server_default() {
+        assert!(resolve_gsettings_isolation(true, None));
+        assert!(!resolve_gsettings_isolation(false, None));
+    }
+
+    #[test]
+    fn resolve_gsettings_isolation_uses_override_when_provided() {
+        assert!(!resolve_gsettings_isolation(true, Some(false)));
+        assert!(resolve_gsettings_isolation(false, Some(true)));
+    }
+
+    #[test]
+    fn cli_gsettings_isolation_defaults_to_true() {
+        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
+        assert!(cli.gsettings_isolation);
+    }
+
+    #[test]
+    fn cli_gsettings_isolation_can_be_disabled() {
+        let cli = Cli::try_parse_from(["waydriver-mcp", "--gsettings-isolation", "false"]).unwrap();
+        assert!(!cli.gsettings_isolation);
     }
 
     #[test]

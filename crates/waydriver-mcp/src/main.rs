@@ -28,6 +28,7 @@ pub struct UiTestServer {
     pub(crate) report_dir: PathBuf,
     pub(crate) default_resolution: String,
     pub(crate) default_scale: f64,
+    pub(crate) default_gsettings_isolation: bool,
     pub(crate) default_record_video: bool,
     pub(crate) default_video_bitrate: u32,
     #[allow(dead_code)]
@@ -155,6 +156,7 @@ impl UiTestServer {
         report_dir: PathBuf,
         default_resolution: String,
         default_scale: f64,
+        default_gsettings_isolation: bool,
         default_record_video: bool,
         default_video_bitrate: u32,
     ) -> Self {
@@ -167,6 +169,7 @@ impl UiTestServer {
             report_dir,
             default_resolution,
             default_scale,
+            default_gsettings_isolation,
             default_record_video,
             default_video_bitrate,
             tool_router,
@@ -222,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         cli.report_dir,
         cli.resolution,
         cli.scale,
+        cli.gsettings_isolation,
         cli.record_video,
         cli.video_bitrate,
     )
@@ -261,6 +265,7 @@ mod tests {
             PathBuf::from("/tmp/waydriver-test"),
             "1024x768".into(),
             1.0,
+            true,
             false,
             2_000_000,
         )
@@ -829,6 +834,7 @@ mod tests {
             tmp.path().to_path_buf(),
             "1024x768".into(),
             1.0,
+            true,
             false,
             2_000_000,
         );
@@ -849,6 +855,7 @@ mod tests {
             PathBuf::from("/tmp/custom-out"),
             "1024x768".into(),
             1.0,
+            true,
             false,
             2_000_000,
         );
@@ -965,6 +972,7 @@ mod tests {
             PathBuf::from("/tmp/base-out"),
             "1024x768".into(),
             1.0,
+            true,
             false,
             2_000_000,
         );
@@ -1100,6 +1108,7 @@ mod tests {
             tmp.path().to_path_buf(),
             "1024x768".into(),
             1.0,
+            true,
             false,
             2_000_000,
         );
@@ -1138,6 +1147,7 @@ mod tests {
             tmp.path().to_path_buf(),
             "1024x768".into(),
             1.0,
+            true,
             false,
             2_000_000,
         );
@@ -1236,6 +1246,7 @@ mod tests {
             tmp.path().to_path_buf(),
             "1024x768".into(),
             1.0,
+            true,
             false,
             2_000_000,
         );

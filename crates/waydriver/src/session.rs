@@ -105,6 +105,15 @@ pub struct SessionConfig {
     /// or shorten the settle times on real hardware where the race
     /// doesn't apply.
     pub visual_click_tuning: VisualClickTuning,
+
+    /// When `true` (the default), the app is launched against the session's
+    /// private per-session GSettings keyfile store (see
+    /// [`crate::gsettings`]) so it starts from default state and never reads
+    /// or writes the host user's dconf, and so it picks up any settings the
+    /// compositor seeded (e.g. `text-scaling-factor`). When `false`, the app
+    /// inherits the host's normal GSettings. Must match the isolation mode the
+    /// compositor was started with — both read the same keyfile dir.
+    pub gsettings_isolated: bool,
 }
 
 /// Which colour-distance metric the visual locator uses when
@@ -1251,25 +1260,29 @@ fn spawn_app(
     runtime_dir: &Path,
     dbus_address: &str,
 ) -> Result<Child> {
-    // Use the keyfile GSettings backend with an isolated config dir so
-    // the app starts with default state and never reads or writes the
-    // user's dconf database. The keyfile backend bypasses the dconf
-    // daemon entirely, unlike GSETTINGS_BACKEND=memory which the host
-    // daemon ignores.
-    let config_dir = runtime_dir.join("config");
-    let _ = std::fs::create_dir_all(&config_dir);
-
     let mut cmd = Command::new(&cfg.command);
     cmd.args(&cfg.args)
         .env("WAYLAND_DISPLAY", wayland_display)
         .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
         .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env("XDG_CONFIG_HOME", &config_dir)
-        .env("GSETTINGS_BACKEND", "keyfile")
         .env("NO_AT_BRIDGE", "0")
         .env("GTK_A11Y", "atspi")
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+
+    // When isolation is on, point the app at the session's private keyfile
+    // GSettings store (see `crate::gsettings`) so it starts from default
+    // state, never touches the host's dconf, and picks up any settings the
+    // compositor seeded into the same keyfile (the compositor is the sole
+    // writer; we only read here). The keyfile backend bypasses the dconf
+    // daemon entirely, unlike GSETTINGS_BACKEND=memory which the host daemon
+    // ignores. When off, the app inherits the host's normal GSettings.
+    if cfg.gsettings_isolated {
+        let config_dir = crate::gsettings::config_dir(runtime_dir);
+        let _ = std::fs::create_dir_all(&config_dir);
+        cmd.env("XDG_CONFIG_HOME", &config_dir)
+            .env("GSETTINGS_BACKEND", crate::gsettings::KEYFILE_BACKEND);
+    }
     if let Some(dir) = &cfg.cwd {
         cmd.current_dir(dir);
     }

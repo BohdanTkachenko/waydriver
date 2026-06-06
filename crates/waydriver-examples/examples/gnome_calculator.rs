@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
             visual_region_tuning: Default::default(),
             visual_text_tuning: Default::default(),
             visual_click_tuning: Default::default(),
+            gsettings_isolated: true,
         },
     )
     .await?;

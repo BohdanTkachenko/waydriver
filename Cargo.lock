@@ -3616,6 +3616,7 @@ dependencies = [
  "sha2",
  "sxd-document",
  "sxd-xpath",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

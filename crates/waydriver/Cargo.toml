@@ -49,3 +49,6 @@ unicode-normalization = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 imageproc = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

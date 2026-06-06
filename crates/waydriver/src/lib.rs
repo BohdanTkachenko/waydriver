@@ -15,6 +15,8 @@ pub mod backend;
 pub mod capture;
 /// Error types used throughout the crate.
 pub mod error;
+/// Per-session GSettings isolation via the keyfile backend.
+pub mod gsettings;
 /// X11 keysym utilities for keyboard input.
 pub mod keysym;
 /// XPath-based lazy locators over the AT-SPI tree.
@@ -32,6 +34,7 @@ pub use backend::{
     StreamToken,
 };
 pub use error::{Error, Result};
+pub use gsettings::{GSettingEntry, GSettingsConfig};
 pub use locator::{FillMode, Locator, SelectBy};
 pub use session::{Session, SessionConfig, VisualRegionTuning, VisualTextTuning};
 #[cfg(feature = "visual")]
