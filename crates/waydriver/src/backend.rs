@@ -85,7 +85,16 @@ pub trait CompositorRuntime: Send + Sync {
     /// backend default when `None`) and wait for it to be ready. After this
     /// returns successfully, `wayland_display()` and `runtime_dir()` must
     /// point at a live Wayland socket.
-    async fn start(&mut self, resolution: Option<&str>) -> Result<()>;
+    ///
+    /// `scale` is the logical-monitor scale factor (e.g. `2.0` for a 2×
+    /// HiDPI display, `1.5` for 150%). `None` — or `Some(1.0)` — means the
+    /// backend's default 1:1 mapping, where `resolution` pixels are also the
+    /// logical (application) size. With a scale `s`, `resolution` is the
+    /// *physical* framebuffer and applications see a logical size of
+    /// `resolution / s`, exactly as a real HiDPI monitor behaves. Backends
+    /// that can't honour a non-1.0 scale should error rather than silently
+    /// ignore it.
+    async fn start(&mut self, resolution: Option<&str>, scale: Option<f64>) -> Result<()>;
 
     /// Stop the compositor, tearing down all child processes and cleaning up
     /// the runtime directory. Safe to call on an un-started or

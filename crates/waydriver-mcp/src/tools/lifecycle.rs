@@ -19,7 +19,7 @@ use waydriver_capture_mutter::MutterCapture;
 use waydriver_compositor_mutter::MutterCompositor;
 use waydriver_input_mutter::MutterInput;
 
-use crate::cli::{resolve_report_dir, resolve_resolution};
+use crate::cli::{resolve_report_dir, resolve_resolution, resolve_scale};
 use crate::mcp_error::waydriver_to_mcp;
 use crate::params::{SessionIdParams, StartSessionParams};
 use crate::report::{append_event, now_ms, render_index_html};
@@ -99,6 +99,7 @@ impl UiTestServer {
             .unwrap_or_else(|| params.command.clone());
 
         let resolution = resolve_resolution(&self.default_resolution, params.resolution.as_deref());
+        let scale = resolve_scale(self.default_scale, params.scale);
 
         let report_dir = resolve_report_dir(&self.report_dir, params.report_dir.as_deref());
         let report_enabled = params.report;
@@ -115,7 +116,7 @@ impl UiTestServer {
         // references to the same D-Bus connection.
         let mut compositor = MutterCompositor::new();
         compositor
-            .start(Some(&resolution))
+            .start(Some(&resolution), Some(scale))
             .await
             .map_err(waydriver_to_mcp)?;
         let compositor_id = compositor.id().to_string();
@@ -189,6 +190,7 @@ impl UiTestServer {
             "cwd": cwd,
             "app_name": app_name,
             "resolution": resolution,
+            "scale": scale,
         });
         if let Err(e) = managed
             .log_event(&id, "start_session", log_params, Ok(&start_msg), None)

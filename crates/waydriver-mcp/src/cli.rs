@@ -18,6 +18,13 @@ pub struct Cli {
     /// override it via start_session's `resolution` parameter.
     #[arg(long, default_value = "1024x768", env = "WAYDRIVER_RESOLUTION")]
     pub resolution: String,
+    /// Default logical-monitor scale (HiDPI factor) for sessions that don't
+    /// override it via start_session's `scale` parameter. `1.0` = 1:1; `2.0` =
+    /// 200%; fractional values like `1.5` (150%) are snapped to the nearest
+    /// scale mutter advertises. `--resolution` stays the *physical* framebuffer
+    /// size, so apps see a logical size of resolution ÷ scale.
+    #[arg(long, default_value_t = 1.0, env = "WAYDRIVER_SCALE")]
+    pub scale: f64,
     /// Record a continuous WebM video of each session by default. When on,
     /// each session writes `{report_dir}/{session_id}/{session_id}.webm`
     /// alongside its screenshots and events. Per-session override via
@@ -48,6 +55,12 @@ pub fn resolve_report_dir(base: &std::path::Path, override_: Option<&str>) -> Pa
 /// per-session override if provided, else the server's default.
 pub fn resolve_resolution(default: &str, override_: Option<&str>) -> String {
     override_.unwrap_or(default).to_string()
+}
+
+/// Resolve the effective logical-monitor scale for a new session:
+/// per-session override if provided, else the server's default.
+pub fn resolve_scale(default: f64, override_: Option<f64>) -> f64 {
+    override_.unwrap_or(default)
 }
 
 #[cfg(test)]
@@ -94,6 +107,28 @@ mod tests {
         // The override is taken as-is; the server default is ignored even if
         // the override is nonsensical (mutter validator catches that later).
         assert_eq!(resolve_resolution("1920x1080", Some("garbage")), "garbage");
+    }
+
+    #[test]
+    fn resolve_scale_defaults_to_server_default() {
+        assert_eq!(resolve_scale(1.0, None), 1.0);
+    }
+
+    #[test]
+    fn resolve_scale_uses_override_when_provided() {
+        assert_eq!(resolve_scale(1.0, Some(2.0)), 2.0);
+    }
+
+    #[test]
+    fn cli_scale_defaults_to_one() {
+        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
+        assert_eq!(cli.scale, 1.0);
+    }
+
+    #[test]
+    fn cli_accepts_scale_flag() {
+        let cli = Cli::try_parse_from(["waydriver-mcp", "--scale", "1.5"]).unwrap();
+        assert_eq!(cli.scale, 1.5);
     }
 
     #[test]

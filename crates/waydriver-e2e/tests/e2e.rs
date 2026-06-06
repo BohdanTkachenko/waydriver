@@ -105,7 +105,7 @@ fn fixture_binary() -> std::path::PathBuf {
 /// section's widgets.
 async fn start_fixture_session(section: &str) -> anyhow::Result<(Arc<Session>, Arc<MutterState>)> {
     let mut compositor = MutterCompositor::new();
-    compositor.start(None).await?;
+    compositor.start(None, None).await?;
     // `state()` returns `Option` post-API-tightening; immediately after
     // a successful `start()` it is always `Some`, but `expect` makes
     // the contract local to the call site rather than implicit in the

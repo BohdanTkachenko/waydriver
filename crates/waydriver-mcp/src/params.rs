@@ -33,7 +33,17 @@ pub struct StartSessionParams {
     pub report: bool,
     /// Virtual display size as "WIDTHxHEIGHT" (e.g. "1920x1080"). When unset,
     /// falls back to the server's --resolution flag (default "1024x768").
+    /// This is the *physical* framebuffer; with `scale` > 1 the logical size
+    /// applications see is `resolution / scale`.
     pub resolution: Option<String>,
+    /// HiDPI scale factor for the virtual monitor: `1.0` = 1:1 (default),
+    /// `2.0` = 200%, `1.5` = 150%. Use this to debug HiDPI rendering — apps
+    /// see a logical display of `resolution / scale` rendered onto the full
+    /// `resolution` framebuffer, exactly like a real scaled monitor.
+    /// Fractional values are snapped to the nearest scale mutter advertises
+    /// for the mode (e.g. 1.66 may become 1.75). When unset, falls back to the
+    /// server's `--scale` flag (default 1.0).
+    pub scale: Option<f64>,
     /// Record a continuous WebM video of the session under
     /// `{report_dir}/{session_id}/{session_id}.webm`. When unset, falls back
     /// to the server's `--record-video` / `--no-record-video` flag (default
@@ -450,6 +460,20 @@ mod tests {
         let params: StartSessionParams =
             serde_json::from_value(serde_json::json!({ "command": "x", "report": false })).unwrap();
         assert!(!params.report);
+    }
+
+    #[test]
+    fn start_session_params_scale_defaults_to_none() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
+        assert_eq!(params.scale, None);
+    }
+
+    #[test]
+    fn start_session_params_scale_can_be_set() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x", "scale": 1.5 })).unwrap();
+        assert_eq!(params.scale, Some(1.5));
     }
 
     #[test]

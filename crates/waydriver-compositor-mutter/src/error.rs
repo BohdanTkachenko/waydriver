@@ -89,6 +89,36 @@ pub(crate) enum MutterError {
     #[error("invalid resolution {value:?}: expected WIDTHxHEIGHT")]
     ResolutionInvalid { value: String },
 
+    /// The requested scale was not a finite, positive number within the
+    /// accepted range. Caught before any D-Bus traffic so a typo doesn't
+    /// reach mutter.
+    #[error("invalid scale {value}: expected a positive factor in {min}..={max}")]
+    ScaleInvalid { value: f64, min: f64, max: f64 },
+
+    /// `DisplayConfig.GetCurrentState` failed or returned a body we
+    /// couldn't deserialize into the expected monitor-state tuple.
+    #[error("DisplayConfig.GetCurrentState: {stage}")]
+    DisplayConfigState {
+        stage: &'static str,
+        #[source]
+        source: zbus::Error,
+    },
+
+    /// `GetCurrentState` succeeded but reported no virtual monitor to
+    /// scale — nothing to apply a logical-monitor config against.
+    #[error("DisplayConfig reported no monitors to scale")]
+    DisplayConfigNoMonitor,
+
+    /// `ApplyMonitorsConfig` was rejected by mutter (stale serial,
+    /// unsupported scale that survived our nearest-scale snap, or a
+    /// connector/mode mismatch).
+    #[error("DisplayConfig.ApplyMonitorsConfig (scale {scale})")]
+    DisplayConfigApply {
+        scale: f64,
+        #[source]
+        source: zbus::Error,
+    },
+
     #[error("spawning {process}")]
     Spawn {
         process: &'static str,

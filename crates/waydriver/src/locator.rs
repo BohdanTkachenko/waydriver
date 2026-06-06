@@ -1801,7 +1801,7 @@ mod tests {
     struct StubCompositor;
     #[async_trait]
     impl CompositorRuntime for StubCompositor {
-        async fn start(&mut self, _resolution: Option<&str>) -> WdResult<()> {
+        async fn start(&mut self, _resolution: Option<&str>, _scale: Option<f64>) -> WdResult<()> {
             Ok(())
         }
         async fn stop(&mut self) -> WdResult<()> {

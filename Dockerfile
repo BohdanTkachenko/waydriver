@@ -38,7 +38,7 @@ RUN dnf install -y \
     dbus dbus-x11 at-spi2-core \
     mutter pipewire wireplumber pipewire-gstreamer \
     gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good \
-    gsettings-desktop-schemas \
+    gsettings-desktop-schemas dconf \
     && dnf clean all
 
 COPY --from=model-downloader /models /usr/share/waydriver/ocrs-models

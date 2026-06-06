@@ -15,12 +15,14 @@
 
 mod error;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
+use zbus::zvariant::OwnedValue;
 
 use waydriver::{CompositorRuntime, Result};
 
@@ -29,6 +31,52 @@ use crate::error::MutterError;
 /// Default virtual-monitor geometry passed to mutter when the caller doesn't
 /// override it. Matches mutter's own implicit default.
 const DEFAULT_RESOLUTION: &str = "1024x768";
+
+/// Default logical-monitor scale: 1:1, i.e. `resolution` pixels are also the
+/// logical (application) size. Any other value drives the HiDPI path in
+/// [`apply_scale`].
+const DEFAULT_SCALE: f64 = 1.0;
+
+/// Accepted scale range. Below 0.5 the UI is unusably small; above 4.0 mutter
+/// won't offer the scale for any virtual-monitor mode we'd create. Validated
+/// up-front so a typo fails before we spawn any subprocess.
+const MIN_SCALE: f64 = 0.5;
+const MAX_SCALE: f64 = 4.0;
+
+/// How far a requested scale may sit from the nearest mutter-supported scale
+/// before we log a warning about snapping to it. Mutter only accepts scales it
+/// lists in a mode's `supported-scales`, so an exact arbitrary value (e.g.
+/// 1.66) may be nudged to the closest legal step.
+const SCALE_SNAP_TOLERANCE: f64 = 0.01;
+
+// ── DisplayConfig D-Bus shapes ───────────────────────────────────────────────
+//
+// Type aliases mirroring the `org.gnome.Mutter.DisplayConfig` wire types so
+// `body().deserialize::<CurrentState>()` validates the reply against the exact
+// signature mutter sends. The `a{sv}` property dicts are kept as
+// `HashMap<String, OwnedValue>` (signature `a{sv}`) and ignored — we only need
+// the connector, mode id, and supported-scales list.
+
+/// `a{sv}` — a D-Bus property dict.
+type DbusProps = HashMap<String, OwnedValue>;
+/// `(siiddada{sv})` — one monitor mode: id, width, height, refresh, preferred
+/// scale, supported scales, properties.
+type MonitorMode = (String, i32, i32, f64, f64, Vec<f64>, DbusProps);
+/// `(ssss)` — connector, vendor, product, serial.
+type MonitorSpec = (String, String, String, String);
+/// `((ssss)a(siiddada{sv})a{sv})` — one physical monitor: spec, modes, props.
+type PhysicalMonitor = (MonitorSpec, Vec<MonitorMode>, DbusProps);
+/// `(iiduba(ssss)a{sv})` — one logical monitor in the current layout.
+type LogicalMonitor = (i32, i32, f64, u32, bool, Vec<MonitorSpec>, DbusProps);
+/// Return tuple of `GetCurrentState`: `(serial, monitors, logical, props)`.
+type CurrentState = (u32, Vec<PhysicalMonitor>, Vec<LogicalMonitor>, DbusProps);
+
+/// `(ssa{sv})` — one monitor assignment in an `ApplyMonitorsConfig` request:
+/// connector, mode id, properties.
+type MonitorAssignment = (String, String, DbusProps);
+/// `(iiduba(ssa{sv}))` — one logical monitor to apply: x, y, scale, transform,
+/// primary, assigned monitors.
+type LogicalMonitorConfig = (i32, i32, f64, u32, bool, Vec<MonitorAssignment>);
 
 /// Shared mutter-backend state consumed by `waydriver-input-mutter` and
 /// `waydriver-capture-mutter`.
@@ -204,7 +252,7 @@ impl MutterCompositor {
     /// this and converts the result via `From<MutterError>`.
     ///
     /// Steps (each fails with a specific `MutterError` variant):
-    /// 1. validate resolution,
+    /// 1. validate resolution + scale,
     /// 2. ensure the session runtime dir exists,
     /// 3. spawn a private `dbus-daemon` and parse its address + PID,
     /// 4. spawn `pipewire` + `wireplumber` on that bus,
@@ -212,18 +260,24 @@ impl MutterCompositor {
     /// 6. wait for the Wayland socket,
     /// 7. open a zbus connection, retry-create the RemoteDesktop session,
     /// 8. read its `SessionId` property,
-    /// 9. publish the `Arc<MutterState>` for sibling backends.
+    /// 9. apply a non-default logical-monitor scale via DisplayConfig,
+    /// 10. publish the `Arc<MutterState>` for sibling backends.
     async fn start_inner(
         &mut self,
         resolution: Option<&str>,
+        scale: Option<f64>,
     ) -> std::result::Result<(), MutterError> {
         let resolution = resolution.unwrap_or(DEFAULT_RESOLUTION);
         // Validate before we start spawning subprocesses — mutter silently
         // ignores bad --virtual-monitor values and falls back to its own
         // default, which would surprise the caller.
         parse_resolution(resolution)?;
+        let scale = scale.unwrap_or(DEFAULT_SCALE);
+        // Fail fast on a nonsense scale too, for the same reason — the
+        // DisplayConfig apply that consumes it doesn't run until mutter is up.
+        validate_scale(scale)?;
 
-        tracing::info!(id = self.id, resolution, "starting mutter compositor");
+        tracing::info!(id = self.id, resolution, scale, "starting mutter compositor");
 
         tokio::fs::create_dir_all(&self.runtime_dir).await?;
         // `runtime_dir` is built in `new()` from a UTF-8 String
@@ -436,6 +490,20 @@ impl MutterCompositor {
             "RemoteDesktop session started"
         );
 
+        // Step: apply a non-default logical-monitor scale. `--virtual-monitor`
+        // has no scale component, so HiDPI is configured here over mutter's
+        // private bus once DisplayConfig is up. Skipped at 1.0 to leave the
+        // default 1:1 path completely untouched.
+        if (scale - DEFAULT_SCALE).abs() > f64::EPSILON {
+            let applied = apply_scale(&mutter_conn, scale, &self.id).await?;
+            tracing::info!(
+                id = self.id,
+                requested = scale,
+                applied,
+                "applied logical-monitor scale"
+            );
+        }
+
         self.state = Some(Arc::new(MutterState {
             conn: mutter_conn,
             rd_session_path,
@@ -451,13 +519,13 @@ impl MutterCompositor {
 
 #[async_trait]
 impl CompositorRuntime for MutterCompositor {
-    async fn start(&mut self, resolution: Option<&str>) -> Result<()> {
+    async fn start(&mut self, resolution: Option<&str>, scale: Option<f64>) -> Result<()> {
         // Body uses the crate-local typed `MutterError`. The `?` at the
         // end of `self.start_inner(...).await?` runs the
         // `From<MutterError> for waydriver::Error` impl in `error.rs`,
         // which is the single boundary at which the typed enum becomes
         // the workspace's shared `waydriver::Error`.
-        Ok(self.start_inner(resolution).await?)
+        Ok(self.start_inner(resolution, scale).await?)
     }
 
     async fn stop(&mut self) -> Result<()> {
@@ -590,6 +658,120 @@ fn parse_resolution(s: &str) -> std::result::Result<(u32, u32), MutterError> {
     Ok((parse(w)?, parse(h)?))
 }
 
+/// Reject a scale that isn't a finite, positive factor inside
+/// [`MIN_SCALE`]..=[`MAX_SCALE`]. Run before any subprocess spawns so a bad
+/// value fails fast.
+fn validate_scale(scale: f64) -> std::result::Result<(), MutterError> {
+    if scale.is_finite() && (MIN_SCALE..=MAX_SCALE).contains(&scale) {
+        Ok(())
+    } else {
+        Err(MutterError::ScaleInvalid {
+            value: scale,
+            min: MIN_SCALE,
+            max: MAX_SCALE,
+        })
+    }
+}
+
+/// Pick the entry of `supported` closest to `requested`. Mutter only accepts
+/// scales it advertises for a mode, so an arbitrary request (e.g. 1.66) is
+/// snapped to the nearest legal step. Falls back to `requested` when the list
+/// is empty (mutter then validates — and likely rejects — it).
+fn nearest_supported_scale(requested: f64, supported: &[f64]) -> f64 {
+    supported
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            let da = (a - requested).abs();
+            let db = (b - requested).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(requested)
+}
+
+/// Apply `requested` as the logical-monitor scale of the (single) virtual
+/// monitor via `org.gnome.Mutter.DisplayConfig`, returning the scale mutter
+/// actually accepted (snapped to a supported step).
+///
+/// Reads `GetCurrentState` fresh each call so the `serial` is current —
+/// mutter rejects `ApplyMonitorsConfig` on a stale serial, and the serial
+/// bumps when the virtual monitor first appears. Fractional scales (1.5,
+/// 1.75, …) require the `scale-monitor-framebuffer` experimental feature; the
+/// container entrypoint enables it. Without it only integer scales are
+/// advertised, so [`nearest_supported_scale`] would snap a fractional request
+/// to 1.0 or 2.0.
+async fn apply_scale(
+    conn: &zbus::Connection,
+    requested: f64,
+    id: &str,
+) -> std::result::Result<f64, MutterError> {
+    let state_reply = conn
+        .call_method(
+            Some("org.gnome.Mutter.DisplayConfig"),
+            "/org/gnome/Mutter/DisplayConfig",
+            Some("org.gnome.Mutter.DisplayConfig"),
+            "GetCurrentState",
+            &(),
+        )
+        .await
+        .map_err(|source| MutterError::DisplayConfigState {
+            stage: "call",
+            source,
+        })?;
+    let state_body = state_reply.body();
+    let (serial, monitors, _logical, _props): CurrentState =
+        state_body
+            .deserialize()
+            .map_err(|source| MutterError::DisplayConfigState {
+                stage: "deserialize",
+                source,
+            })?;
+
+    // Headless mutter started with a single `--virtual-monitor` exposes
+    // exactly one monitor advertising exactly the mode we asked for, so the
+    // first monitor / first mode is the one to scale.
+    let (spec, modes, _mprops) = monitors
+        .into_iter()
+        .next()
+        .ok_or(MutterError::DisplayConfigNoMonitor)?;
+    let connector = spec.0;
+    let (mode_id, _w, _h, _refresh, _preferred, supported, _modeprops) = modes
+        .into_iter()
+        .next()
+        .ok_or(MutterError::DisplayConfigNoMonitor)?;
+
+    let applied = nearest_supported_scale(requested, &supported);
+    if (applied - requested).abs() > SCALE_SNAP_TOLERANCE {
+        tracing::warn!(
+            id,
+            requested,
+            applied,
+            supported = ?supported,
+            "requested scale not advertised by mutter; snapped to nearest supported"
+        );
+    }
+
+    // (x, y, scale, transform, primary, [(connector, mode_id, {})]).
+    let logical: LogicalMonitorConfig =
+        (0, 0, applied, 0, true, vec![(connector, mode_id, DbusProps::new())]);
+    // method 1 = temporary: applies for this session without writing
+    // ~/.config/monitors.xml, which is all a throwaway headless run needs.
+    conn.call_method(
+        Some("org.gnome.Mutter.DisplayConfig"),
+        "/org/gnome/Mutter/DisplayConfig",
+        Some("org.gnome.Mutter.DisplayConfig"),
+        "ApplyMonitorsConfig",
+        &(serial, 1u32, vec![logical], DbusProps::new()),
+    )
+    .await
+    .map_err(|source| MutterError::DisplayConfigApply {
+        scale: applied,
+        source,
+    })?;
+
+    Ok(applied)
+}
+
 async fn wait_for_wayland_socket(
     runtime_dir: &str,
     display: &str,
@@ -627,6 +809,50 @@ async fn wait_for_pipewire_socket(runtime_dir: &str) -> std::result::Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live end-to-end check that a fractional scale is actually applied by a
+    /// real mutter. Requires the runtime stack (mutter, pipewire, wireplumber,
+    /// dbus-launch) on `PATH` plus the GSettings schemas in `XDG_DATA_DIRS`, so
+    /// it's `#[ignore]`d by default; run with the dev shell's env via
+    /// `cargo test -p waydriver-compositor-mutter -- --ignored`.
+    ///
+    /// This exercises the whole chain at once: the per-session keyfile must
+    /// enable `scale-monitor-framebuffer` (otherwise 1.5 is not advertised and
+    /// would snap to 1.0/2.0), and `apply_scale` must drive DisplayConfig
+    /// correctly. We read the scale straight back from `GetCurrentState`.
+    #[tokio::test]
+    #[ignore = "requires a live mutter/pipewire/dbus runtime stack"]
+    async fn applies_fractional_scale_against_real_mutter() {
+        let mut compositor = MutterCompositor::new();
+        compositor
+            .start(Some("1920x1080"), Some(1.5))
+            .await
+            .expect("compositor should start");
+        let state = compositor.state().expect("state present after start");
+
+        let reply = state
+            .conn()
+            .call_method(
+                Some("org.gnome.Mutter.DisplayConfig"),
+                "/org/gnome/Mutter/DisplayConfig",
+                Some("org.gnome.Mutter.DisplayConfig"),
+                "GetCurrentState",
+                &(),
+            )
+            .await
+            .expect("GetCurrentState should succeed");
+        let body = reply.body();
+        let (_serial, _monitors, logical, _props): CurrentState =
+            body.deserialize().expect("GetCurrentState body should deserialize");
+        let applied = logical.first().expect("at least one logical monitor").2;
+
+        compositor.stop().await.expect("compositor should stop");
+
+        assert!(
+            (applied - 1.5).abs() < 0.01,
+            "expected logical scale ~1.5 (fractional scaling enabled via keyfile), got {applied}"
+        );
+    }
 
     #[test]
     fn test_parse_dbus_address_valid() {
@@ -827,6 +1053,40 @@ mod tests {
         ] {
             assert!(parse_resolution(bad).is_err(), "expected error for {bad:?}");
         }
+    }
+
+    #[test]
+    fn test_validate_scale_accepts_common_factors() {
+        for ok in [0.5, 1.0, 1.25, 1.5, 1.6666, 1.75, 2.0, 3.0, 4.0] {
+            assert!(validate_scale(ok).is_ok(), "expected {ok} to validate");
+        }
+    }
+
+    #[test]
+    fn test_validate_scale_rejects_out_of_range_and_nonfinite() {
+        for bad in [0.0, 0.49, 4.01, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                validate_scale(bad).is_err(),
+                "expected {bad} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nearest_supported_scale_snaps_to_closest() {
+        let supported = [1.0, 1.25, 1.5, 1.75, 2.0];
+        // Exact hits pass straight through.
+        assert_eq!(nearest_supported_scale(1.5, &supported), 1.5);
+        assert_eq!(nearest_supported_scale(2.0, &supported), 2.0);
+        // 1.66 (166%) isn't advertised → nearest is 1.75.
+        assert_eq!(nearest_supported_scale(1.66, &supported), 1.75);
+        // 1.6 is closer to 1.5.
+        assert_eq!(nearest_supported_scale(1.6, &supported), 1.5);
+    }
+
+    #[test]
+    fn test_nearest_supported_scale_empty_list_returns_request() {
+        assert_eq!(nearest_supported_scale(1.5, &[]), 1.5);
     }
 
     #[test]

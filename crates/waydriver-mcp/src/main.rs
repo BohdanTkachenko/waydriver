@@ -27,6 +27,7 @@ pub struct UiTestServer {
     pub(crate) sessions: Arc<RwLock<HashMap<String, Arc<ManagedSession>>>>,
     pub(crate) report_dir: PathBuf,
     pub(crate) default_resolution: String,
+    pub(crate) default_scale: f64,
     pub(crate) default_record_video: bool,
     pub(crate) default_video_bitrate: u32,
     #[allow(dead_code)]
@@ -153,6 +154,7 @@ impl UiTestServer {
     pub fn new(
         report_dir: PathBuf,
         default_resolution: String,
+        default_scale: f64,
         default_record_video: bool,
         default_video_bitrate: u32,
     ) -> Self {
@@ -164,6 +166,7 @@ impl UiTestServer {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             report_dir,
             default_resolution,
+            default_scale,
             default_record_video,
             default_video_bitrate,
             tool_router,
@@ -218,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
     let service = UiTestServer::new(
         cli.report_dir,
         cli.resolution,
+        cli.scale,
         cli.record_video,
         cli.video_bitrate,
     )
@@ -256,6 +260,7 @@ mod tests {
         UiTestServer::new(
             PathBuf::from("/tmp/waydriver-test"),
             "1024x768".into(),
+            1.0,
             false,
             2_000_000,
         )
@@ -275,7 +280,11 @@ mod tests {
 
     #[async_trait]
     impl CompositorRuntime for MockCompositor {
-        async fn start(&mut self, _resolution: Option<&str>) -> waydriver::error::Result<()> {
+        async fn start(
+            &mut self,
+            _resolution: Option<&str>,
+            _scale: Option<f64>,
+        ) -> waydriver::error::Result<()> {
             Ok(())
         }
         async fn stop(&mut self) -> waydriver::error::Result<()> {
@@ -819,6 +828,7 @@ mod tests {
         let s = UiTestServer::new(
             tmp.path().to_path_buf(),
             "1024x768".into(),
+            1.0,
             false,
             2_000_000,
         );
@@ -838,6 +848,7 @@ mod tests {
         let s = UiTestServer::new(
             PathBuf::from("/tmp/custom-out"),
             "1024x768".into(),
+            1.0,
             false,
             2_000_000,
         );
@@ -953,6 +964,7 @@ mod tests {
         let s = UiTestServer::new(
             PathBuf::from("/tmp/base-out"),
             "1024x768".into(),
+            1.0,
             false,
             2_000_000,
         );
@@ -1087,6 +1099,7 @@ mod tests {
         let s = UiTestServer::new(
             tmp.path().to_path_buf(),
             "1024x768".into(),
+            1.0,
             false,
             2_000_000,
         );
@@ -1124,6 +1137,7 @@ mod tests {
         let s = UiTestServer::new(
             tmp.path().to_path_buf(),
             "1024x768".into(),
+            1.0,
             false,
             2_000_000,
         );
@@ -1221,6 +1235,7 @@ mod tests {
         let s = UiTestServer::new(
             tmp.path().to_path_buf(),
             "1024x768".into(),
+            1.0,
             false,
             2_000_000,
         );

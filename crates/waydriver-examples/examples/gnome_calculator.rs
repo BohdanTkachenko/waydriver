@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut compositor = MutterCompositor::new();
-    compositor.start(None).await?;
+    compositor.start(None, None).await?;
     let state = compositor
         .state()
         .expect("MutterCompositor::state must be Some immediately after start() succeeded");

@@ -1534,7 +1534,7 @@ mod tests {
         struct StubCompositor;
         #[async_trait]
         impl CompositorRuntime for StubCompositor {
-            async fn start(&mut self, _r: Option<&str>) -> Result<()> {
+            async fn start(&mut self, _r: Option<&str>, _scale: Option<f64>) -> Result<()> {
                 Ok(())
             }
             async fn stop(&mut self) -> Result<()> {
@@ -1702,7 +1702,7 @@ mod tests {
         struct StubCompositor;
         #[async_trait]
         impl CompositorRuntime for StubCompositor {
-            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+            async fn start(&mut self, _: Option<&str>, _: Option<f64>) -> Result<()> {
                 Ok(())
             }
             async fn stop(&mut self) -> Result<()> {
@@ -1771,7 +1771,7 @@ mod tests {
         struct StubCompositor;
         #[async_trait]
         impl CompositorRuntime for StubCompositor {
-            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+            async fn start(&mut self, _: Option<&str>, _: Option<f64>) -> Result<()> {
                 Ok(())
             }
             async fn stop(&mut self) -> Result<()> {
@@ -1940,7 +1940,7 @@ mod tests {
         struct StubCompositor;
         #[async_trait]
         impl CompositorRuntime for StubCompositor {
-            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+            async fn start(&mut self, _: Option<&str>, _: Option<f64>) -> Result<()> {
                 Ok(())
             }
             async fn stop(&mut self) -> Result<()> {
@@ -2067,7 +2067,7 @@ mod tests {
         struct StubCompositor;
         #[async_trait]
         impl CompositorRuntime for StubCompositor {
-            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+            async fn start(&mut self, _: Option<&str>, _: Option<f64>) -> Result<()> {
                 Ok(())
             }
             async fn stop(&mut self) -> Result<()> {
@@ -2124,7 +2124,7 @@ mod tests {
         struct StubCompositor;
         #[async_trait]
         impl CompositorRuntime for StubCompositor {
-            async fn start(&mut self, _: Option<&str>) -> Result<()> {
+            async fn start(&mut self, _: Option<&str>, _: Option<f64>) -> Result<()> {
                 Ok(())
             }
             async fn stop(&mut self) -> Result<()> {

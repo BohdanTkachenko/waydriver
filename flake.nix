@@ -257,6 +257,21 @@
               # nixpkgs' rustc doesn't ship the stdlib source tree, so rust-analyzer
               # can't resolve `std`/`core` without this pointer.
               export RUST_SRC_PATH="${pkgs.rustPlatform.rustLibSrc}"
+              # Mesa software (llvmpipe) rendering so headless mutter can bring
+              # up its Clutter backend without a real GPU. Without this the
+              # live-mutter `--ignored` tests fail at startup ("no available
+              # drivers found" / "/dev/dri/renderD128" missing) because this
+              # environment has no DRI/EGL driver — the reason such tests
+              # otherwise only run in the Docker image (Fedora ships Mesa at
+              # standard paths). The driver dirs are dlopen'd via these vars;
+              # LD_LIBRARY_PATH lets the EGL vendor lib (libEGL_mesa.so.0,
+              # referenced relatively by 50_mesa.json) resolve.
+              export LIBGL_ALWAYS_SOFTWARE=1
+              export GALLIUM_DRIVER=llvmpipe
+              export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
+              export GBM_BACKENDS_PATH="${pkgs.mesa}/lib/gbm"
+              export __EGL_VENDOR_LIBRARY_DIRS="${pkgs.mesa}/share/glvnd/egl_vendor.d"
+              export LD_LIBRARY_PATH="${pkgs.mesa}/lib:''${LD_LIBRARY_PATH:-}"
             '';
           };
         }
