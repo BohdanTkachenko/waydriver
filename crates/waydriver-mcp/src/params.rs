@@ -96,11 +96,7 @@ pub struct GSettingParam {
 impl GSettingParam {
     /// Translate the wire struct into the library type.
     pub fn to_waydriver(&self) -> waydriver::GSettingEntry {
-        waydriver::GSettingEntry::new(
-            self.schema.clone(),
-            self.key.clone(),
-            self.value.clone(),
-        )
+        waydriver::GSettingEntry::new(self.schema.clone(), self.key.clone(), self.value.clone())
     }
 }
 

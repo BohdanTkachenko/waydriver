@@ -793,10 +793,11 @@ async fn apply_scale(
         .next()
         .ok_or(MutterError::DisplayConfigNoMonitor)?;
     let connector = spec.0;
-    let (mode_id, _w, _h, _refresh, _preferred, supported, _modeprops) = modes
-        .into_iter()
-        .next()
-        .ok_or(MutterError::DisplayConfigNoMonitor)?;
+    let (mode_id, _w, _h, _refresh, _preferred, supported, _modeprops) =
+        modes
+            .into_iter()
+            .next()
+            .ok_or(MutterError::DisplayConfigNoMonitor)?;
 
     let applied = nearest_supported_scale(requested, &supported);
     if (applied - requested).abs() > SCALE_SNAP_TOLERANCE {
@@ -810,8 +811,14 @@ async fn apply_scale(
     }
 
     // (x, y, scale, transform, primary, [(connector, mode_id, {})]).
-    let logical: LogicalMonitorConfig =
-        (0, 0, applied, 0, true, vec![(connector, mode_id, DbusProps::new())]);
+    let logical: LogicalMonitorConfig = (
+        0,
+        0,
+        applied,
+        0,
+        true,
+        vec![(connector, mode_id, DbusProps::new())],
+    );
     // method 1 = temporary: applies for this session without writing
     // ~/.config/monitors.xml, which is all a throwaway headless run needs.
     conn.call_method(
@@ -900,8 +907,9 @@ mod tests {
             .await
             .expect("GetCurrentState should succeed");
         let body = reply.body();
-        let (_serial, _monitors, logical, _props): CurrentState =
-            body.deserialize().expect("GetCurrentState body should deserialize");
+        let (_serial, _monitors, logical, _props): CurrentState = body
+            .deserialize()
+            .expect("GetCurrentState body should deserialize");
         let applied = logical.first().expect("at least one logical monitor").2;
 
         compositor.stop().await.expect("compositor should stop");

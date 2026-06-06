@@ -205,7 +205,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_keyfile(
             dir.path(),
-            &[GSettingEntry::new("org.gnome.mutter", "experimental-features", "['x']")],
+            &[GSettingEntry::new(
+                "org.gnome.mutter",
+                "experimental-features",
+                "['x']",
+            )],
         )
         .unwrap();
         let written = std::fs::read_to_string(keyfile_path(dir.path())).unwrap();
