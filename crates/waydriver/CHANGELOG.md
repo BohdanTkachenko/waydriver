@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.10](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.2.9...waydriver-v0.2.10) - 2026-06-08
+
+### Fixed
+
+- *(mcp)* keep start_session from hanging on stalled setup
+
 ## [0.2.9](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.2.8...waydriver-v0.2.9) - 2026-06-06
 
 ### Added
