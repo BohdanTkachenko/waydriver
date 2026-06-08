@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 use clap::Parser;
@@ -31,6 +32,10 @@ pub struct UiTestServer {
     pub(crate) default_gsettings_isolation: bool,
     pub(crate) default_record_video: bool,
     pub(crate) default_video_bitrate: u32,
+    /// Hard ceiling on session setup applied when a start_session call doesn't
+    /// pass its own `setup_timeout_secs`. Guarantees the call returns (with an
+    /// error + teardown) instead of hanging when setup or recording stalls.
+    pub(crate) default_setup_timeout: Duration,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -159,6 +164,7 @@ impl UiTestServer {
         default_gsettings_isolation: bool,
         default_record_video: bool,
         default_video_bitrate: u32,
+        default_setup_timeout: Duration,
     ) -> Self {
         let tool_router = Self::lifecycle_router()
             + Self::inspection_router()
@@ -172,6 +178,7 @@ impl UiTestServer {
             default_gsettings_isolation,
             default_record_video,
             default_video_bitrate,
+            default_setup_timeout,
             tool_router,
         }
     }
@@ -207,27 +214,57 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
+    // Per-instance isolation: multiple servers may share one host dir (e.g.
+    // `-v /tmp/waydriver:/tmp` mounted into several containers). Namespace this
+    // process's report tree AND compositor runtime tree under a per-instance
+    // segment so concurrent instances can't collide on session ids, contend on
+    // the same files, or pollute one shared tree. The PID is unique per running
+    // process and needs no extra dependency.
+    let instance_id = std::process::id();
+    let report_dir = cli.report_dir.join(format!("inst-{instance_id}"));
+
+    // Point the compositor's runtime root (read once from XDG_RUNTIME_DIR via a
+    // LazyLock in waydriver-compositor-mutter) at an instance-private subdir.
+    // Must happen before the first compositor is constructed, i.e. before any
+    // start_session — here at startup is safe.
+    let runtime_root = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let instance_runtime_root = runtime_root.join(format!("wd-inst-{instance_id}"));
+    if let Err(e) = std::fs::create_dir_all(&instance_runtime_root) {
+        tracing::warn!(error = %e, "create instance runtime dir failed");
+    }
+    // SAFETY: single-threaded at this point — the tokio runtime worker threads
+    // and any compositor spawn happen after `main` returns into `.serve()`.
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", &instance_runtime_root);
+    }
+
     // Create the base report dir up front so per-session dirs land under an
     // existing parent.
-    if let Err(e) = tokio::fs::create_dir_all(&cli.report_dir).await {
+    if let Err(e) = tokio::fs::create_dir_all(&report_dir).await {
         tracing::warn!(error = %e, "create report_dir failed");
     }
 
     tracing::info!(
-        report_dir = %cli.report_dir.display(),
+        instance_id,
+        report_dir = %report_dir.display(),
+        runtime_root = %instance_runtime_root.display(),
         resolution = %cli.resolution,
         record_video = cli.record_video,
         video_bitrate = cli.video_bitrate,
+        setup_timeout_secs = cli.setup_timeout_secs,
         "waydriver-mcp starting"
     );
 
     let service = UiTestServer::new(
-        cli.report_dir,
+        report_dir,
         cli.resolution,
         cli.scale,
         cli.gsettings_isolation,
         cli.record_video,
         cli.video_bitrate,
+        Duration::from_secs(cli.setup_timeout_secs),
     )
     .serve(stdio())
     .await
@@ -268,6 +305,7 @@ mod tests {
             true,
             false,
             2_000_000,
+            Duration::from_secs(90),
         )
     }
 
@@ -837,6 +875,7 @@ mod tests {
             true,
             false,
             2_000_000,
+            Duration::from_secs(90),
         );
         insert_test_session_with(&s, "test-1", "calculator", "wayland-test-1", false).await;
 
@@ -858,6 +897,7 @@ mod tests {
             true,
             false,
             2_000_000,
+            Duration::from_secs(90),
         );
         assert_eq!(s.report_dir, PathBuf::from("/tmp/custom-out"));
     }
@@ -975,6 +1015,7 @@ mod tests {
             true,
             false,
             2_000_000,
+            Duration::from_secs(90),
         );
         insert_test_session(&s, "abc", "calc", "wayland-abc").await;
         let sessions = s.sessions.read().await;
@@ -1111,6 +1152,7 @@ mod tests {
             true,
             false,
             2_000_000,
+            Duration::from_secs(90),
         );
         tokio::fs::create_dir_all(tmp.path().join("sid"))
             .await
@@ -1150,6 +1192,7 @@ mod tests {
             true,
             false,
             2_000_000,
+            Duration::from_secs(90),
         );
         tokio::fs::create_dir_all(tmp.path().join("sid"))
             .await
@@ -1249,6 +1292,7 @@ mod tests {
             true,
             false,
             2_000_000,
+            Duration::from_secs(90),
         );
         insert_test_session(&s, "sid", "app", "wayland-x").await;
 

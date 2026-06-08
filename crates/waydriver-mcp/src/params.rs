@@ -73,6 +73,12 @@ pub struct StartSessionParams {
     /// `--video-bitrate` flag (default 2_000_000 ≈ 2 Mbps). Higher = sharper
     /// text, bigger file.
     pub video_bitrate: Option<u32>,
+    /// Hard ceiling, in seconds, on session setup (compositor + app launch +
+    /// AT-SPI settle + recording start). If setup doesn't finish within this
+    /// budget, the partially-built session is torn down and start_session
+    /// returns an error instead of hanging. When unset, falls back to the
+    /// server's `--setup-timeout-secs` flag (default 90).
+    pub setup_timeout_secs: Option<u64>,
 }
 
 fn default_report_enabled() -> bool {
@@ -576,5 +582,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params.video_bitrate, Some(5_000_000));
+    }
+
+    #[test]
+    fn start_session_params_setup_timeout_defaults_to_none() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
+        assert_eq!(params.setup_timeout_secs, None);
+    }
+
+    #[test]
+    fn start_session_params_setup_timeout_can_be_set() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x", "setup_timeout_secs": 30 }))
+                .unwrap();
+        assert_eq!(params.setup_timeout_secs, Some(30));
     }
 }

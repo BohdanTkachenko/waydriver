@@ -12,10 +12,17 @@
 //! since [`render_matches`] is what the user-facing JSON looks like.
 
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+
+/// Upper bound on any single report filesystem operation. Report writing is a
+/// best-effort artifact that sits on the critical path of `start_session` and
+/// every other tool, so a stalled filesystem (shared bind-mount, tmpfs under
+/// pressure, blocking-pool saturation) must never hang the tool: on elapse the
+/// write is abandoned with a `TimedOut` error the caller logs and ignores.
+const REPORT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 use waydriver::atspi::ElementInfo;
 
@@ -105,6 +112,22 @@ impl Default for EventLog {
 /// jsonl is the durable source of truth (every event ever, kept
 /// forever); the in-memory ring and the js mirror only carry the
 /// last [`MAX_IN_MEMORY_EVENTS`] entries.
+/// Run a report filesystem future under [`REPORT_IO_TIMEOUT`], converting an
+/// elapsed timeout into a `TimedOut` IO error so callers (which all treat
+/// report writes as best-effort) log-and-continue instead of blocking.
+async fn with_io_timeout<F>(what: &str, fut: F) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    match tokio::time::timeout(REPORT_IO_TIMEOUT, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("report {what} exceeded {}s", REPORT_IO_TIMEOUT.as_secs()),
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn append_event(
     report_dir: &std::path::Path,
@@ -138,18 +161,22 @@ pub async fn append_event(
         event["screenshot"] = serde_json::Value::String(name.to_string());
     }
 
-    // 1. Append to events.jsonl (durable source of truth).
+    // 1. Append to events.jsonl (durable source of truth). Bounded so a
+    // stalled filesystem can't hang the calling tool indefinitely.
     let mut line = serde_json::to_vec(&event)?;
     line.push(b'\n');
     let session_dir = report_dir.join(session_id);
     let jsonl_path = session_dir.join("events.jsonl");
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&jsonl_path)
-        .await?;
-    file.write_all(&line).await?;
-    file.flush().await?;
+    let jsonl_write = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&jsonl_path)
+            .await?;
+        file.write_all(&line).await?;
+        file.flush().await
+    };
+    with_io_timeout("events.jsonl append", jsonl_write).await?;
 
     // 2. Push into in-memory ring (evicts the oldest entry once
     // the cap is hit; total counter increments unconditionally).
@@ -163,8 +190,12 @@ pub async fn append_event(
     let json_array = serde_json::to_string(&recent)?;
     let js_body = format!("window.__events_update({json_array});\n");
     let tmp_path = session_dir.join(".events.js.tmp");
-    tokio::fs::write(&tmp_path, js_body.as_bytes()).await?;
-    tokio::fs::rename(&tmp_path, session_dir.join("events.js")).await?;
+    let events_js = session_dir.join("events.js");
+    let js_write = async {
+        tokio::fs::write(&tmp_path, js_body.as_bytes()).await?;
+        tokio::fs::rename(&tmp_path, &events_js).await
+    };
+    with_io_timeout("events.js rewrite", js_write).await?;
 
     Ok(seq)
 }

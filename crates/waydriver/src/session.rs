@@ -1268,7 +1268,13 @@ fn spawn_app(
         .env("NO_AT_BRIDGE", "0")
         .env("GTK_A11Y", "atspi")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        // Kill the app if its `Child` is dropped without an explicit
+        // kill — e.g. when `Session::start` is aborted mid-construction
+        // (a setup timeout / client cancellation in the MCP layer) before
+        // the child is owned by a `Session` whose `Drop` would SIGKILL it.
+        // Harmless on the normal path, where `kill()` runs first.
+        .kill_on_drop(true);
 
     // When isolation is on, point the app at the session's private keyfile
     // GSettings store (see `crate::gsettings`) so it starts from default

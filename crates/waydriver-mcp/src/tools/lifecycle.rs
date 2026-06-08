@@ -8,11 +8,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content};
 use rmcp::{tool, tool_router, ErrorData as McpError};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+/// Upper bound on the best-effort viewer-seed filesystem writes. Mirrors
+/// `report::REPORT_IO_TIMEOUT`: seeding runs inside the start_session setup
+/// budget, so a stalled write must not consume it (which would needlessly tear
+/// down an otherwise-healthy session).
+const SEED_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 use waydriver::{CompositorRuntime, Session, SessionConfig};
 use waydriver_capture_mutter::MutterCapture;
@@ -67,15 +75,24 @@ pub(crate) async fn seed_viewer(
     video_path: Option<&Path>,
 ) {
     let session_dir = report_dir.join(session_id);
-    if let Err(e) = tokio::fs::create_dir_all(&session_dir).await {
-        tracing::warn!(error = %e, "create session report dir failed");
+    match tokio::time::timeout(SEED_IO_TIMEOUT, tokio::fs::create_dir_all(&session_dir)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "create session report dir failed"),
+        Err(_) => tracing::warn!("create session report dir timed out"),
     }
     let video_file = video_path
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str());
     let html = render_index_html(session_id, app_name, started_at_ms, video_file);
-    if let Err(e) = tokio::fs::write(session_dir.join("index.html"), html).await {
-        tracing::warn!(error = %e, "write index.html failed");
+    match tokio::time::timeout(
+        SEED_IO_TIMEOUT,
+        tokio::fs::write(session_dir.join("index.html"), html),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "write index.html failed"),
+        Err(_) => tracing::warn!("write index.html timed out"),
     }
 }
 
@@ -91,6 +108,11 @@ impl UiTestServer {
     pub(crate) async fn start_session(
         &self,
         Parameters(params): Parameters<StartSessionParams>,
+        // Per-request cancellation token, injected by rmcp. Fires when the
+        // client sends a `notifications/cancelled` for this call or the
+        // transport disconnects — letting us tear the half-built session down
+        // instead of orphaning its compositor/app/pipewire.
+        ct: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let command = params.command.clone();
         let args = params.args.clone();
@@ -118,107 +140,156 @@ impl UiTestServer {
             report_enabled && params.record_video.unwrap_or(self.default_record_video);
         let resolved_bitrate = params.video_bitrate.unwrap_or(self.default_video_bitrate);
 
-        // Construct and pre-start the mutter compositor so we can pull its
-        // shared Arc<MutterState> out before erasing to trait objects. Input
-        // and capture are thin wrappers around that Arc, so they get cloned
-        // references to the same D-Bus connection.
-        let mut compositor = MutterCompositor::new().with_gsettings(gsettings);
-        compositor
-            .start(Some(&resolution), Some(scale))
+        // Hard ceiling on the whole setup. Per-call override, else server
+        // default. Guarantees the call returns even if any setup step (mutter
+        // start, app launch, AT-SPI settle, recording, report I/O) stalls.
+        let setup_timeout = params
+            .setup_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(self.default_setup_timeout);
+
+        // Everything that spawns processes, talks D-Bus, or touches the
+        // filesystem lives in `build`. We do NOT register the session in the
+        // map until `build` fully succeeds, so on timeout / cancellation /
+        // setup error the future is dropped and the partially-built
+        // `Session` + `MutterCompositor` run their `Drop` impls — SIGKILL'ing
+        // mutter / app / pipewire — leaving nothing orphaned and nothing in
+        // the map. `build` returns the ready session plus the response text.
+        let build = async move {
+            // Construct and pre-start the mutter compositor so we can pull its
+            // shared Arc<MutterState> out before erasing to trait objects.
+            // Input and capture are thin wrappers around that Arc, so they get
+            // cloned references to the same D-Bus connection.
+            let mut compositor = MutterCompositor::new().with_gsettings(gsettings);
+            compositor
+                .start(Some(&resolution), Some(scale))
+                .await
+                .map_err(waydriver_to_mcp)?;
+            let compositor_id = compositor.id().to_string();
+            // `state()` returns `Option` post-API-tightening — but we have
+            // just awaited a successful `start()`, so the state is
+            // guaranteed present here. `expect` documents the invariant.
+            let state = compositor
+                .state()
+                .expect("MutterCompositor::state must be Some immediately after start() succeeded");
+            let input = MutterInput::new(state.clone());
+            let capture = MutterCapture::new(state);
+
+            let video_path = resolve_video_output(record_video, &report_dir, &compositor_id).await;
+
+            let session = Session::start(
+                Box::new(compositor),
+                Box::new(input),
+                Box::new(capture),
+                SessionConfig {
+                    command: params.command,
+                    args: params.args,
+                    cwd: params.cwd,
+                    app_name: app_name.clone(),
+                    video_output: video_path.clone(),
+                    video_bitrate: Some(resolved_bitrate),
+                    video_fps: None,
+                    // Visual tools (`click_by_text`) are exposed by this
+                    // server, so kick off the ocrs model load in the
+                    // background — keeps the first OCR call from paying
+                    // the ~1-2s cold-start cost.
+                    prewarm_visual: true,
+                    visual_region_tuning: Default::default(),
+                    visual_text_tuning: Default::default(),
+                    visual_click_tuning: Default::default(),
+                    // Must match the mode the compositor was started with —
+                    // both read the same per-session keyfile dir.
+                    gsettings_isolated: isolate_settings,
+                },
+            )
             .await
             .map_err(waydriver_to_mcp)?;
-        let compositor_id = compositor.id().to_string();
-        // `state()` returns `Option` post-API-tightening — but we have
-        // just awaited a successful `start()`, so the state is
-        // guaranteed present here. `expect` documents the invariant.
-        let state = compositor
-            .state()
-            .expect("MutterCompositor::state must be Some immediately after start() succeeded");
-        let input = MutterInput::new(state.clone());
-        let capture = MutterCapture::new(state);
 
-        let video_path = resolve_video_output(record_video, &report_dir, &compositor_id).await;
+            let id = session.id.clone();
+            let display = session.wayland_display().to_string();
 
-        let session = Session::start(
-            Box::new(compositor),
-            Box::new(input),
-            Box::new(capture),
-            SessionConfig {
-                command: params.command,
-                args: params.args,
-                cwd: params.cwd,
-                app_name: app_name.clone(),
-                video_output: video_path.clone(),
-                video_bitrate: Some(resolved_bitrate),
-                video_fps: None,
-                // Visual tools (`click_by_text`) are exposed by this
-                // server, so kick off the ocrs model load in the
-                // background — keeps the first OCR call from paying
-                // the ~1-2s cold-start cost.
-                prewarm_visual: true,
-                visual_region_tuning: Default::default(),
-                visual_text_tuning: Default::default(),
-                visual_click_tuning: Default::default(),
-                // Must match the mode the compositor was started with —
-                // both read the same per-session keyfile dir.
-                gsettings_isolated: isolate_settings,
-            },
-        )
-        .await
-        .map_err(waydriver_to_mcp)?;
+            let started_at_ms = now_ms();
 
-        let id = session.id.clone();
-        let display = session.wayland_display().to_string();
+            // Seed the per-session dir + viewer shell before we insert so the
+            // first event always lands on an existing index.html.
+            if report_enabled {
+                seed_viewer(
+                    &report_dir,
+                    &id,
+                    &app_name,
+                    started_at_ms,
+                    video_path.as_deref(),
+                )
+                .await;
+            }
 
-        let started_at_ms = now_ms();
+            let managed = Arc::new(ManagedSession {
+                session: Arc::new(session),
+                report_dir: report_dir.clone(),
+                screenshot_counter: AtomicU32::new(0),
+                events: Mutex::new(crate::report::EventLog::new()),
+                report_enabled,
+                kill_lock: Arc::new(tokio::sync::RwLock::new(())),
+            });
 
-        // Seed the per-session dir + viewer shell before we insert so the
-        // first event always lands on an existing index.html.
-        if report_enabled {
-            seed_viewer(
-                &report_dir,
-                &id,
-                &app_name,
-                started_at_ms,
-                video_path.as_deref(),
-            )
-            .await;
-        }
+            let start_msg = format!("Session started: id={id}, display={display}, app={app_name}");
+            let log_params = serde_json::json!({
+                "command": command,
+                "args": args,
+                "cwd": cwd,
+                "app_name": app_name,
+                "resolution": resolution,
+                "scale": scale,
+                "isolate_settings": isolate_settings,
+            });
+            // Best-effort: append_event is internally bounded so a stalled
+            // filesystem can't hang us here.
+            if let Err(e) = managed
+                .log_event(&id, "start_session", log_params, Ok(&start_msg), None)
+                .await
+            {
+                tracing::warn!(error = %e, "log_event(start_session) failed");
+            }
 
-        let managed = Arc::new(ManagedSession {
-            session: Arc::new(session),
-            report_dir: report_dir.clone(),
-            screenshot_counter: AtomicU32::new(0),
-            events: Mutex::new(crate::report::EventLog::new()),
-            report_enabled,
-            kill_lock: Arc::new(tokio::sync::RwLock::new(())),
-        });
-
-        let start_msg = format!("Session started: id={id}, display={display}, app={app_name}");
-        let log_params = serde_json::json!({
-            "command": command,
-            "args": args,
-            "cwd": cwd,
-            "app_name": app_name,
-            "resolution": resolution,
-            "scale": scale,
-            "isolate_settings": isolate_settings,
-        });
-        if let Err(e) = managed
-            .log_event(&id, "start_session", log_params, Ok(&start_msg), None)
-            .await
-        {
-            tracing::warn!(error = %e, "log_event(start_session) failed");
-        }
-
-        self.sessions.write().await.insert(id.clone(), managed);
-
-        let text = if report_enabled {
-            let url = format!("file://{}/{id}/index.html", report_dir.display());
-            format!("{start_msg}\nreport={url}")
-        } else {
-            start_msg
+            let text = if report_enabled {
+                let url = format!("file://{}/{id}/index.html", report_dir.display());
+                format!("{start_msg}\nreport={url}")
+            } else {
+                start_msg
+            };
+            Ok::<(Arc<ManagedSession>, String, String), McpError>((managed, id, text))
         };
+
+        let (managed, id, text) = tokio::select! {
+            biased;
+            _ = ct.cancelled() => {
+                return Err(McpError::internal_error(
+                    "start_session cancelled by client before completion; session torn down",
+                    None,
+                ));
+            }
+            r = tokio::time::timeout(setup_timeout, build) => match r {
+                Ok(Ok(v)) => v,
+                // Setup failed; `build` already dropped, so its partial
+                // compositor/session ran Drop and cleaned up.
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(McpError::internal_error(
+                        format!(
+                            "start_session timed out after {}s during setup; session torn down",
+                            setup_timeout.as_secs()
+                        ),
+                        None,
+                    ));
+                }
+            }
+        };
+
+        // Register only after a fully successful, non-cancelled setup. This is
+        // the only await left before returning and cannot block indefinitely
+        // (the map lock is never held across an await elsewhere).
+        self.sessions.write().await.insert(id, managed);
+
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 

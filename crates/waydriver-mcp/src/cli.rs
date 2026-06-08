@@ -54,6 +54,13 @@ pub struct Cli {
     /// override via start_session's `video_bitrate` argument.
     #[arg(long, default_value_t = 2_000_000, env = "WAYDRIVER_VIDEO_BITRATE")]
     pub video_bitrate: u32,
+    /// Hard ceiling, in seconds, on session setup (compositor + app launch +
+    /// AT-SPI settle + recording start). If setup stalls past this budget,
+    /// start_session tears the partial session down and returns an error
+    /// instead of hanging. Per-session override via start_session's
+    /// `setup_timeout_secs` argument.
+    #[arg(long, default_value_t = 90, env = "WAYDRIVER_SETUP_TIMEOUT_SECS")]
+    pub setup_timeout_secs: u64,
 }
 
 /// Resolve the effective report dir for a new session: per-session override
@@ -208,5 +215,17 @@ mod tests {
     fn cli_accepts_video_bitrate_flag() {
         let cli = Cli::try_parse_from(["waydriver-mcp", "--video-bitrate", "5000000"]).unwrap();
         assert_eq!(cli.video_bitrate, 5_000_000);
+    }
+
+    #[test]
+    fn cli_setup_timeout_defaults_to_ninety() {
+        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
+        assert_eq!(cli.setup_timeout_secs, 90);
+    }
+
+    #[test]
+    fn cli_accepts_setup_timeout_flag() {
+        let cli = Cli::try_parse_from(["waydriver-mcp", "--setup-timeout-secs", "30"]).unwrap();
+        assert_eq!(cli.setup_timeout_secs, 30);
     }
 }
