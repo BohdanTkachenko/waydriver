@@ -255,6 +255,16 @@ pub struct VisualTextTuning {
     /// context.
     pub ocr_context_padding_px: i32,
 
+    /// **Experimental.** Integer factor the cropped image is upscaled by
+    /// (Lanczos3) *before* it's fed to ocrs, with detected coordinates scaled
+    /// back to screen space. Intended to make very small UI text (≈11px row
+    /// titles that the detector can miss at native size) legible. Default `1`
+    /// (no upscaling — no behavior change). Set to `2`/`3` when small text
+    /// reads as 0; verify with [`Session::recognized_text`] since the benefit
+    /// is rendering-dependent (clean text already reads fine). Upscaling the
+    /// *full* frame is wasteful — pair this with a scoped `within(...)` crop.
+    pub ocr_upscale_factor: u32,
+
     /// Sample density per axis for the boundary-detection divider
     /// scan. Each row in the gap between two candidate-merge OCR
     /// lines is sampled at this many evenly-spaced x positions
@@ -315,6 +325,7 @@ impl Default for VisualTextTuning {
             background_color_tolerance: 24,
             divider_detection_enabled: true,
             ocr_context_padding_px: 32,
+            ocr_upscale_factor: 1,
             boundary_samples_per_axis: 16,
             boundary_majority_threshold: 0.8,
             background_sample_radius: 2,
@@ -463,6 +474,13 @@ pub struct Session {
     /// re-trying the load on every call.
     #[cfg(feature = "visual")]
     visual_engine: Arc<tokio::sync::OnceCell<crate::visual::EngineResult>>,
+    /// Per-frame OCR memo: the last captured frame's hash plus the OCR result
+    /// for each region scoped on it. Repeated `find_by_text` / asserts on an
+    /// unchanged screen (and the auto-wait retry loop) reuse one OCR pass
+    /// instead of re-running the ~tens-of-seconds pipeline. Invalidated
+    /// wholesale when a new frame hash arrives.
+    #[cfg(feature = "visual")]
+    visual_ocr_cache: std::sync::Mutex<crate::visual::OcrCache>,
     /// Region-detection tuning copied from [`SessionConfig`] at
     /// session start. Read on every `Locator::find_regions` etc. call
     /// so a runtime setter (future) can re-tune without invalidating
@@ -651,6 +669,8 @@ impl Session {
             stdout_reader,
             #[cfg(feature = "visual")]
             visual_engine,
+            #[cfg(feature = "visual")]
+            visual_ocr_cache: std::sync::Mutex::new(crate::visual::OcrCache::default()),
             visual_region_tuning: cfg.visual_region_tuning,
             visual_text_tuning: cfg.visual_text_tuning,
             visual_click_tuning: cfg.visual_click_tuning,
@@ -1054,6 +1074,25 @@ impl Session {
         crate::visual::VisualLocator::new(self.clone(), text)
     }
 
+    /// OCR the entire current frame and return every recognised text block —
+    /// its text plus screen-coordinate bounds — in reading order.
+    ///
+    /// Where [`find_by_text`](Self::find_by_text) searches for one string,
+    /// this dumps *everything* OCR saw. It's the diagnostic for a
+    /// `find_by_text` that returned 0: you can see whether the target was
+    /// mis-recognised (e.g. "Cursor" read as "Cursar"), folded into a
+    /// different block, or never detected — instead of a bare 0 that's
+    /// indistinguishable from "not on screen."
+    ///
+    /// Runs a full-frame OCR pass, so it costs as much as one *unscoped*
+    /// `find_by_text`. Requires the `visual` Cargo feature. (No confidence
+    /// score — the underlying `ocrs` engine doesn't expose one.)
+    #[cfg(feature = "visual")]
+    pub async fn recognized_text(self: &Arc<Self>) -> Result<Vec<crate::visual::TextHit>> {
+        let png = self.take_screenshot().await?;
+        crate::visual::__recognized_text(self, png).await
+    }
+
     /// Find a reference image inside the current screen via classical
     /// normalized cross-correlation (template matching). Returns an
     /// [`ImageLocator`](crate::visual::ImageLocator); call `.click()`,
@@ -1112,6 +1151,13 @@ impl Session {
     #[cfg(feature = "visual")]
     pub(crate) fn visual_engine(&self) -> &Arc<tokio::sync::OnceCell<crate::visual::EngineResult>> {
         &self.visual_engine
+    }
+
+    /// The per-frame OCR memo (see the field docs). Used by
+    /// `crate::visual::ocr_lines` to skip re-OCRing an unchanged frame.
+    #[cfg(feature = "visual")]
+    pub(crate) fn visual_ocr_cache(&self) -> &std::sync::Mutex<crate::visual::OcrCache> {
+        &self.visual_ocr_cache
     }
 
     /// Locator matching an element by PascalCase role and accessible name.
@@ -1187,6 +1233,8 @@ impl Session {
             stdout_reader: None,
             #[cfg(feature = "visual")]
             visual_engine: Arc::new(tokio::sync::OnceCell::new()),
+            #[cfg(feature = "visual")]
+            visual_ocr_cache: std::sync::Mutex::new(crate::visual::OcrCache::default()),
             visual_region_tuning: VisualRegionTuning::default(),
             visual_text_tuning: VisualTextTuning::default(),
             visual_click_tuning: VisualClickTuning::default(),

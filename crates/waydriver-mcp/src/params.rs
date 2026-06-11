@@ -352,6 +352,10 @@ pub enum MatchModeParam {
     /// Use when overlapping labels would substring-match (e.g. "Save"
     /// matching both "Save" and "Save As").
     Exact,
+    /// Like `substring` but tolerant of a few OCR character errors (edit
+    /// distance). Use when small/low-contrast labels mis-read by a glyph
+    /// or two (e.g. "Cursor" read as "Cursar") so `substring` finds nothing.
+    Fuzzy,
 }
 
 impl MatchModeParam {
@@ -359,6 +363,7 @@ impl MatchModeParam {
         match self {
             MatchModeParam::Substring => waydriver::MatchMode::Substring,
             MatchModeParam::Exact => waydriver::MatchMode::Exact,
+            MatchModeParam::Fuzzy => waydriver::MatchMode::Fuzzy,
         }
     }
 }

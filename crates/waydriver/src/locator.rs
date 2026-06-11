@@ -458,6 +458,14 @@ impl Locator {
     /// toolkits (notably GTK4 `TextView` and widgets with custom entry
     /// buffers) don't. For those, use [`fill`](Self::fill) instead.
     ///
+    /// **Does not drive input-change behavior.** `SetTextContents` sets the
+    /// value directly, so input-driven signals never fire — e.g. a
+    /// `GtkSearchEntry`'s `search-changed` won't run, so search-as-you-type,
+    /// key handlers, and live validation see nothing. When the widget *reacts*
+    /// to typing, use [`fill`](Self::fill) / [`Session::type_text`] instead,
+    /// which synthesize real keystrokes. Reach for `set_text` as a fast
+    /// value-set when those side effects don't matter.
+    ///
     /// Auto-waits for the element to be resolvable, showing, and enabled.
     pub async fn set_text(&self, text: &str) -> Result<()> {
         let info = self.wait_for_actionable().await?;
@@ -472,8 +480,12 @@ impl Locator {
     /// Slower than [`set_text`](Self::set_text) but works on any widget
     /// that accepts keyboard input — including `GtkTextView` and other
     /// targets that don't implement the AT-SPI `EditableText` interface.
-    /// Use `set_text` when the target exposes `EditableText`; use `fill`
-    /// as the compatibility fallback.
+    /// Use `set_text` when the target exposes `EditableText` and you only
+    /// need the value set; use `fill` as the compatibility fallback **and**
+    /// whenever the widget must react to typing — because the synthesized
+    /// keystrokes fire input-driven signals (`GtkSearchEntry`'s
+    /// `search-changed`, key handlers, validation) that `set_text`'s direct
+    /// `SetTextContents` does not.
     ///
     /// ## Focus handling
     ///
@@ -1317,6 +1329,25 @@ impl Locator {
 
     // ── Specialized waits (thin layers over wait_until / wait_for) ─────────
 
+    /// Poll until the selector resolves — i.e. at least one matching element
+    /// has entered the AT-SPI tree.
+    ///
+    /// Unlike the other `wait_for_*` helpers (which wait for a *condition* on
+    /// a node that already resolves), this waits for the node to merely
+    /// *exist*. That's the common need with GTK/Adwaita's lazily- and
+    /// asynchronously-realized accessibles — a status `Label` that only joins
+    /// the tree once it has a value, a popover's children after it opens, a
+    /// freshly-spawned widget whose accessible lands a few frames later.
+    ///
+    /// Times out with [`Error::Timeout`] (naming the selector) if nothing ever
+    /// matches within the locator timeout. The action methods (`click`,
+    /// `fill`, `set_text`, …) already auto-wait for presence, so reach for
+    /// this mainly before a *read* (`inspect`/`read_text`) or to assert
+    /// appearance explicitly.
+    pub async fn wait_for_present(&self) -> Result<()> {
+        self.wait_until(|hits| !hits.is_empty()).await.map(|_| ())
+    }
+
     /// Poll until the element exists and has the `Showing` state.
     pub async fn wait_for_visible(&self) -> Result<()> {
         self.wait_until(|hits| single_has_state(hits, "showing"))
@@ -1419,7 +1450,7 @@ impl Locator {
     async fn resolve_once_info(&self) -> Result<ElementInfo> {
         let xml = self.snapshot().await?;
         let mut hits = atspi_client::evaluate_xpath_detailed(&xml, &self.xpath)?;
-        select_exactly_one(&self.xpath, hits.len())?;
+        select_exactly_one(&self.xpath, &hits)?;
         Ok(hits.pop().unwrap())
     }
 
@@ -1576,9 +1607,15 @@ fn child_index_for_label(children: &[ElementInfo], label: &str, xpath: &str) -> 
     };
     let extra = hits.count();
     if extra > 0 {
+        let matched: Vec<String> = children
+            .iter()
+            .filter(|c| c.name.as_deref() == Some(label))
+            .map(describe_match)
+            .collect();
         return Err(Error::AmbiguousSelector {
             xpath: format!("{xpath} options named {label:?}"),
             count: extra + 1,
+            matched,
         });
     }
     Ok(first_idx)
@@ -1597,8 +1634,8 @@ fn single_has_state(hits: &[ElementInfo], state: &str) -> bool {
 /// zero → `ElementNotFound`, one → `Ok(())`, more than one →
 /// `AmbiguousSelector`. Leaves the Vec intact so callers can pop the sole
 /// element themselves.
-fn select_exactly_one(xpath: &str, count: usize) -> Result<()> {
-    match count {
+fn select_exactly_one(xpath: &str, hits: &[ElementInfo]) -> Result<()> {
+    match hits.len() {
         0 => Err(Error::ElementNotFound {
             xpath: xpath.to_string(),
         }),
@@ -1606,7 +1643,18 @@ fn select_exactly_one(xpath: &str, count: usize) -> Result<()> {
         n => Err(Error::AmbiguousSelector {
             xpath: xpath.to_string(),
             count: n,
+            matched: hits.iter().map(describe_match).collect(),
         }),
+    }
+}
+
+/// Short human descriptor for one ambiguous-match entry — `Role[name='…']`,
+/// or just the role when the element has no accessible name. Used to spell out
+/// *which* elements a single-target selector collided on.
+fn describe_match(info: &ElementInfo) -> String {
+    match &info.name {
+        Some(name) => format!("{}[name={name:?}]", info.role),
+        None => info.role.clone(),
     }
 }
 
@@ -1670,13 +1718,23 @@ where
         }
 
         if Instant::now() >= deadline {
-            return Err(last_err.unwrap_or_else(|| {
-                Error::Timeout(format!(
-                    "wait for '{xpath}' timed out after {attempts} attempt(s) \
-                     ({}ms budget)",
-                    timeout.as_millis()
-                ))
-            }));
+            // Always surface a `Timeout` on deadline. `last_err` only ever
+            // holds a *retriable* error (ElementNotFound / ElementStale) —
+            // non-retriable errors return immediately above — so when an
+            // element never enters the tree we report a timeout that *names*
+            // that cause, instead of leaking a raw `ElementNotFound` that
+            // reads like an instant "not found" failure even though we polled
+            // for the full budget.
+            let cause = match &last_err {
+                Some(Error::ElementNotFound { .. }) => " — element never entered the AT-SPI tree",
+                Some(Error::ElementStale { .. }) => " — element kept going stale",
+                _ => "",
+            };
+            return Err(Error::Timeout(format!(
+                "wait for '{xpath}' timed out after {attempts} attempt(s) \
+                 ({}ms budget){cause}",
+                timeout.as_millis()
+            )));
         }
 
         // Race the backoff sleep against cancellation so a kill arriving
@@ -1758,9 +1816,23 @@ mod tests {
 
     // ── select_exactly_one dispatch ─────────────────────────────────────────
 
+    /// Build a minimal `ElementInfo` carrying just a role and optional name —
+    /// enough to drive `select_exactly_one`'s count/descriptor logic.
+    fn match_info(role: &str, name: Option<&str>) -> ElementInfo {
+        ElementInfo {
+            ref_: ("bus".into(), "/path".into()),
+            role: role.into(),
+            role_raw: None,
+            name: name.map(str::to_string),
+            attributes: HashMap::new(),
+            states: Vec::new(),
+            bounds: None,
+        }
+    }
+
     #[test]
     fn select_exactly_one_zero_is_not_found() {
-        let err = select_exactly_one("//Missing", 0).unwrap_err();
+        let err = select_exactly_one("//Missing", &[]).unwrap_err();
         assert!(matches!(err, Error::ElementNotFound { .. }));
         // Error carries the xpath so callers can see what didn't match.
         assert!(err.to_string().contains("//Missing"));
@@ -1768,19 +1840,41 @@ mod tests {
 
     #[test]
     fn select_exactly_one_one_is_ok() {
-        assert!(select_exactly_one("//PushButton[@name='OK']", 1).is_ok());
+        let hits = [match_info("PushButton", Some("OK"))];
+        assert!(select_exactly_one("//PushButton[@name='OK']", &hits).is_ok());
     }
 
     #[test]
-    fn select_exactly_one_many_is_ambiguous_with_count() {
-        let err = select_exactly_one("//PushButton", 7).unwrap_err();
+    fn select_exactly_one_many_is_ambiguous_and_lists_matches() {
+        let hits = [
+            match_info("PushButton", Some("Close")),
+            match_info("Button", Some("Close")),
+        ];
+        let err = select_exactly_one("//Button[@name='Close']", &hits).unwrap_err();
         match err {
-            Error::AmbiguousSelector { count, xpath } => {
-                assert_eq!(count, 7);
-                assert_eq!(xpath, "//PushButton");
+            Error::AmbiguousSelector {
+                count,
+                xpath,
+                matched,
+            } => {
+                assert_eq!(count, 2);
+                assert_eq!(xpath, "//Button[@name='Close']");
+                assert_eq!(
+                    matched,
+                    vec![
+                        "PushButton[name=\"Close\"]".to_string(),
+                        "Button[name=\"Close\"]".to_string(),
+                    ]
+                );
             }
             other => panic!("expected AmbiguousSelector, got {other:?}"),
         }
+        // The rendered message names both colliding elements.
+        let msg = select_exactly_one("//Button[@name='Close']", &hits)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("PushButton[name=\"Close\"]"), "msg: {msg}");
+        assert!(msg.contains("Button[name=\"Close\"]"), "msg: {msg}");
     }
 
     // ── Real Locator methods against a test Session ─────────────────────────
@@ -2233,7 +2327,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_surfaces_last_retriable_error_on_timeout() {
+    async fn poll_surfaces_timeout_naming_not_found_when_element_never_appears() {
+        // A selector that never resolves should time out (not leak a raw
+        // ElementNotFound that reads like an instant failure). The message
+        // names the cause so the caller knows we polled the full budget.
         let tok = noncancel();
         let result: Result<&'static str, Error> =
             poll_with_retry(Duration::from_millis(50), "//Missing", &tok, || async {
@@ -2242,11 +2339,16 @@ mod tests {
                 })
             })
             .await;
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, Error::ElementNotFound { .. }),
-            "expected ElementNotFound, got {err}"
-        );
+        match result.unwrap_err() {
+            Error::Timeout(msg) => {
+                assert!(msg.contains("//Missing"), "should name the selector: {msg}");
+                assert!(
+                    msg.contains("never entered the AT-SPI tree"),
+                    "should name the not-found cause: {msg}"
+                );
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2306,6 +2408,7 @@ mod tests {
                     Err(Error::AmbiguousSelector {
                         xpath: "//PushButton".into(),
                         count: 3,
+                        matched: Vec::new(),
                     })
                 }
             })
@@ -2486,11 +2589,21 @@ mod tests {
         let children = children_from(xml, "//ComboBox");
         let err = super::child_index_for_label(&children, "Red", "//ComboBox").unwrap_err();
         match err {
-            Error::AmbiguousSelector { count, xpath } => {
+            Error::AmbiguousSelector {
+                count,
+                xpath,
+                matched,
+            } => {
                 assert_eq!(count, 2);
                 assert!(
                     xpath.contains("Red"),
                     "synthetic xpath should include the label: {xpath}"
+                );
+                // Both colliding options are named in the descriptor list.
+                assert_eq!(matched.len(), 2, "matched: {matched:?}");
+                assert!(
+                    matched.iter().all(|m| m.contains("Red")),
+                    "matched: {matched:?}"
                 );
             }
             other => panic!("expected AmbiguousSelector, got {other:?}"),
@@ -2518,6 +2631,7 @@ mod tests {
         assert!(!is_retriable(&Error::AmbiguousSelector {
             xpath: "x".into(),
             count: 2,
+            matched: Vec::new(),
         }));
         assert!(!is_retriable(&Error::InvalidSelector {
             xpath: "x".into(),

@@ -3658,8 +3658,12 @@ dependencies = [
 name = "waydriver-e2e"
 version = "0.2.10"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "image",
+ "imageproc",
+ "ocrs",
+ "rten",
  "tokio",
  "tokio-util",
  "tracing",

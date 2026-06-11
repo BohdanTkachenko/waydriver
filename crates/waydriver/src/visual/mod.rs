@@ -88,6 +88,8 @@ pub(crate) use region::sweep_regions as __region_sweep;
 // the visual module through these re-exports.
 pub(crate) use list_labelled_regions as __list_labelled_regions;
 pub(crate) use list_text as __list_text;
+// Session::recognized_text reaches in through this one.
+pub(crate) use recognized_text as __recognized_text;
 
 /// A recognised text line on screen — what
 /// [`Locator::list_text`](crate::Locator::list_text) returns for each
@@ -113,6 +115,14 @@ pub enum MatchMode {
     Substring,
     /// Case-sensitive equality on the full recognized word.
     Exact,
+    /// Like [`Substring`](Self::Substring) but tolerant of a few OCR
+    /// character errors: a window of recognised words matches when its text
+    /// is within a small normalized edit distance of the needle. Use this
+    /// when small/low-contrast labels mis-read by a glyph or two (e.g. OCR
+    /// reads "Cursor" as "Cursar", "hover-target" as "hover-targel") so an
+    /// exact substring search returns nothing. Slightly looser, so prefer
+    /// `Substring` when the text reads cleanly.
+    Fuzzy,
 }
 
 /// Visual (OCR-backed) locator. See [module docs](self) for cost and
@@ -144,6 +154,13 @@ impl std::fmt::Debug for VisualLocator {
             .finish()
     }
 }
+
+/// Auto-wait default for visual (OCR) locators when no per-locator timeout is
+/// set. Deliberately *higher* than the AT-SPI locator default: one OCR pass is
+/// tens of seconds on CPU (no GPU), so a 5s-style default would time out before
+/// a single pass could finish. Still a hard, overridable bound — set a longer
+/// `with_timeout(...)` on genuinely slow hardware, or a short one to fail fast.
+const VISUAL_DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl VisualLocator {
     pub(crate) fn new(session: Arc<Session>, text: impl Into<String>) -> Self {
@@ -253,16 +270,19 @@ impl VisualLocator {
                     }
                 }
             }
-            // Substring: group lines into multi-line blocks via
-            // geometric clustering (y-gap + x-overlap) plus pixel-
-            // level boundary checks, then search within each block.
-            MatchMode::Substring => {
+            // Substring / Fuzzy: group lines into multi-line blocks via
+            // geometric clustering (y-gap + x-overlap) plus pixel-level
+            // boundary checks, then search within each block. Both modes
+            // share this flow; they differ only inside `find_matches`
+            // (exact vs edit-distance-tolerant), so `mode` is threaded
+            // through below.
+            MatchMode::Substring | MatchMode::Fuzzy => {
                 let boundary = BoundaryContext {
                     image: &ocr.image,
                     crop_origin: ocr.crop_origin,
                 };
                 let blocks = group_lines_into_blocks(
-                    ocr.lines,
+                    ocr.lines.clone(),
                     self.session.visual_text_tuning,
                     Some(boundary),
                 );
@@ -278,9 +298,7 @@ impl VisualLocator {
                     // sit inside the query).
                     let variants = block_haystack_variants(block);
                     for variant in &variants {
-                        for (m_start, m_end) in
-                            find_matches(&variant.joined, &needle, MatchMode::Substring)
-                        {
+                        for (m_start, m_end) in find_matches(&variant.joined, &needle, mode) {
                             if let Some(rect) =
                                 union_bbox_for_match(&block.words, &variant.spans, m_start, m_end)
                             {
@@ -306,23 +324,63 @@ impl VisualLocator {
         Ok(self.matches().await?.len())
     }
 
+    /// Effective auto-wait budget: the per-locator override, else the
+    /// visual-specific default — never the (short) AT-SPI session default,
+    /// which would time out before one OCR pass.
+    fn effective_timeout(&self) -> Duration {
+        self.timeout.unwrap_or(VISUAL_DEFAULT_TIMEOUT)
+    }
+
+    fn timeout_err(&self) -> Error {
+        Error::Timeout(format!(
+            "visual: no match for {:?} within {}ms",
+            self.text,
+            self.effective_timeout().as_millis()
+        ))
+    }
+
+    /// One OCR pass, bounded by the time left until `deadline` *and* the
+    /// session cancellation token. This is the load-bearing guarantee for the
+    /// "no 20-minute wait" rule: a single OCR pass is tens of seconds, so
+    /// without this the deadline (checked only between passes) wouldn't bound
+    /// it. The background OCR thread still runs to completion, but the caller
+    /// is released at the deadline (or immediately on `kill`).
+    async fn matches_bounded(&self, deadline: std::time::Instant) -> Result<Vec<Rect>> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(self.timeout_err());
+        }
+        tokio::select! {
+            biased;
+            _ = self.session.cancellation_token().cancelled() => Err(Error::Cancelled),
+            r = tokio::time::timeout(remaining, self.matches()) => match r {
+                Ok(res) => res,
+                Err(_) => Err(self.timeout_err()),
+            }
+        }
+    }
+
+    /// Sleep `d`, but wake immediately (as `Cancelled`) if the session is
+    /// killed, so a long auto-wait doesn't ignore a kill between OCR passes.
+    async fn sleep_or_cancel(&self, d: Duration) -> Result<()> {
+        tokio::select! {
+            _ = self.session.cancellation_token().cancelled() => Err(Error::Cancelled),
+            _ = tokio::time::sleep(d) => Ok(()),
+        }
+    }
+
     /// Bounding rectangle of the unique match. Errors when zero matches
-    /// after auto-wait, or when multiple matches found.
+    /// after auto-wait (`Timeout`), or when multiple matches found.
     pub async fn bounds(&self) -> Result<Rect> {
-        let deadline = std::time::Instant::now()
-            + self
-                .timeout
-                .unwrap_or_else(|| self.session.default_timeout());
+        let deadline = std::time::Instant::now() + self.effective_timeout();
         loop {
-            let hits = self.matches().await?;
+            let hits = self.matches_bounded(deadline).await?;
             match hits.len() {
                 0 => {
                     if std::time::Instant::now() >= deadline {
-                        return Err(Error::ElementNotFound {
-                            xpath: format!("visual: {}", self.text),
-                        });
+                        return Err(self.timeout_err());
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    self.sleep_or_cancel(Duration::from_millis(200)).await?;
                 }
                 1 => return Ok(hits[0]),
                 n => {
@@ -336,22 +394,19 @@ impl VisualLocator {
         }
     }
 
-    /// Wait until at least one match exists, or the timeout elapses.
+    /// Wait until at least one match exists, or the timeout elapses
+    /// (`Timeout`). Bounded by the cancellation token, so a `kill` interrupts
+    /// even a long OCR pass.
     pub async fn wait_for_exists(&self) -> Result<()> {
-        let deadline = std::time::Instant::now()
-            + self
-                .timeout
-                .unwrap_or_else(|| self.session.default_timeout());
+        let deadline = std::time::Instant::now() + self.effective_timeout();
         loop {
-            if !self.matches().await?.is_empty() {
+            if !self.matches_bounded(deadline).await?.is_empty() {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return Err(Error::ElementNotFound {
-                    xpath: format!("visual: {}", self.text),
-                });
+                return Err(self.timeout_err());
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.sleep_or_cancel(Duration::from_millis(200)).await?;
         }
     }
 
@@ -412,7 +467,7 @@ impl VisualLocator {
 /// One OCR'd line: the joined text, the union bbox of all words on
 /// it, and the per-word breakdown the matcher needs to compute
 /// substring hits at word granularity.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OcrLine {
     /// Words joined by spaces — what the matcher searches against
     /// and what [`Locator::list_text`](crate::Locator::list_text)
@@ -817,7 +872,7 @@ fn group_lines_into_blocks(
 /// screen-coordinate origin are kept alongside the OCR results so
 /// the grouper can run pixel-level boundary checks against the
 /// same image without re-decoding the PNG.
-struct OcrResult {
+pub(crate) struct OcrResult {
     lines: Vec<OcrLine>,
     image: image::RgbImage,
     /// Top-left of `image` in screen coordinates. Subtract from a
@@ -825,12 +880,78 @@ struct OcrResult {
     crop_origin: (i32, i32),
 }
 
+/// Per-frame OCR memo held on the `Session` (see `Session::visual_ocr_cache`).
+///
+/// OCR is the dominant cost in the visual path — tens of seconds per
+/// full-frame pass on CPU — so repeated lookups on an *unchanged* frame must
+/// not re-run it. Keyed by the captured frame's content hash plus the scoped
+/// region; when a new frame hash arrives the whole map is dropped (the old
+/// frame's results are stale). `Arc` so a hit is a cheap clone, not a deep
+/// copy of the decoded image.
+/// Region key for the OCR memo: `(x, y, w, h)` in screen coords, or `None`
+/// for a full-frame (unscoped) pass.
+type RegionKey = Option<(i32, i32, i32, i32)>;
+
+#[derive(Default)]
+pub(crate) struct OcrCache {
+    frame_hash: u64,
+    /// Region (None = full frame) → OCR result for it on the current frame.
+    by_region: std::collections::HashMap<RegionKey, Arc<OcrResult>>,
+}
+
+impl OcrCache {
+    /// Look up `region` for the frame identified by `hash`. If `hash` differs
+    /// from the cached frame, the whole memo is dropped first (the old frame's
+    /// results are stale) and this returns `None`.
+    fn get(&mut self, hash: u64, region: RegionKey) -> Option<Arc<OcrResult>> {
+        if self.frame_hash != hash {
+            self.frame_hash = hash;
+            self.by_region.clear();
+        }
+        self.by_region.get(&region).cloned()
+    }
+
+    /// Memoize `region`'s result for frame `hash` — but only if `hash` is
+    /// still the current frame (a concurrent OCR of a newer frame may have
+    /// advanced it, in which case this result is already stale).
+    fn put(&mut self, hash: u64, region: RegionKey, result: Arc<OcrResult>) {
+        if self.frame_hash == hash {
+            self.by_region.insert(region, result);
+        }
+    }
+}
+
+/// Content hash of a captured frame. Identical frames produce byte-identical
+/// PNGs (deterministic encoder + identical pixels), so this keys the memo; any
+/// change busts it. Non-cryptographic is fine — collisions only cost a
+/// re-OCR, never correctness.
+fn frame_hash(png_bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    png_bytes.hash(&mut h);
+    h.finish()
+}
+
 async fn ocr_lines(
     session: &Arc<Session>,
     region: Option<Rect>,
     png_bytes: Vec<u8>,
-) -> Result<OcrResult> {
+) -> Result<Arc<OcrResult>> {
     use ocrs::{ImageSource, TextItem};
+
+    // Per-frame memo: if this exact frame was already OCR'd for this region,
+    // reuse it instead of paying the ~tens-of-seconds pipeline again. A new
+    // frame hash invalidates the whole memo.
+    let region_key = region.map(|r| (r.x, r.y, r.width, r.height));
+    let hash = frame_hash(&png_bytes);
+    if let Some(hit) = session
+        .visual_ocr_cache()
+        .lock()
+        .unwrap()
+        .get(hash, region_key)
+    {
+        return Ok(hit);
+    }
 
     let engine = session
         .visual_engine()
@@ -839,8 +960,11 @@ async fn ocr_lines(
         .clone()
         .map_err(Error::visual)?;
     let context_pad_px = session.visual_text_tuning.ocr_context_padding_px;
+    // Experimental: upscale the crop before OCR to make tiny glyphs legible.
+    // `1` = off. Detected coordinates are divided back down below.
+    let upscale = session.visual_text_tuning.ocr_upscale_factor.max(1) as i32;
 
-    tokio::task::spawn_blocking(move || -> Result<OcrResult> {
+    let result = tokio::task::spawn_blocking(move || -> Result<OcrResult> {
         let full = crate::locator::decode_screenshot_png(&png_bytes)
             .map_err(|e| Error::visual(format!("decode screenshot: {e}")))?;
         // If the caller scoped to a region, crop to it first.
@@ -876,7 +1000,19 @@ async fn ocr_lines(
 
         let rgb = cropped.into_rgb8();
         let (w, h) = rgb.dimensions();
-        let src = ImageSource::from_bytes(rgb.as_raw(), (w, h))
+        // Feed ocrs an upscaled copy when requested; keep `rgb` (the native
+        // crop) for the boundary sampler, and divide detected coordinates by
+        // `upscale` below so hits land in screen space.
+        let upscaled_img;
+        let (ocr_bytes, ocr_w, ocr_h): (&[u8], u32, u32) = if upscale > 1 {
+            let f = upscale as u32;
+            upscaled_img =
+                image::imageops::resize(&rgb, w * f, h * f, image::imageops::FilterType::Lanczos3);
+            (upscaled_img.as_raw(), w * f, h * f)
+        } else {
+            (rgb.as_raw(), w, h)
+        };
+        let src = ImageSource::from_bytes(ocr_bytes, (ocr_w, ocr_h))
             .map_err(|e| Error::visual(format!("ocrs ImageSource: {e}")))?;
         let input = engine
             .prepare_input(src)
@@ -897,11 +1033,14 @@ async fn ocr_lines(
                 .map(|w| {
                     let text: String = w.chars().iter().map(|c| c.char).collect();
                     let r = w.bounding_rect();
+                    // Map ocrs pixel coords back to screen space: undo the
+                    // upscale (no-op when `upscale == 1`), then add the crop
+                    // origin.
                     let rect = Rect {
-                        x: r.left() + origin_x,
-                        y: r.top() + origin_y,
-                        width: r.width(),
-                        height: r.height(),
+                        x: r.left() / upscale + origin_x,
+                        y: r.top() / upscale + origin_y,
+                        width: (r.width() / upscale).max(1),
+                        height: (r.height() / upscale).max(1),
                     };
                     (text, rect)
                 })
@@ -957,7 +1096,18 @@ async fn ocr_lines(
         })
     })
     .await
-    .map_err(|e| Error::visual(format!("OCR task panicked: {e}")))?
+    .map_err(|e| Error::visual(format!("OCR task panicked: {e}")))??;
+
+    // Memoize for this frame so sibling lookups (and the auto-wait retry
+    // loop) on the same screen reuse it. Skip if a concurrent call already
+    // advanced the frame hash — its result is for a newer frame.
+    let arc = Arc::new(result);
+    session
+        .visual_ocr_cache()
+        .lock()
+        .unwrap()
+        .put(hash, region_key, arc.clone());
+    Ok(arc)
 }
 
 /// Public-via-`Locator::list_text` enumeration. Drops the
@@ -975,10 +1125,39 @@ pub(crate) async fn list_text(
         image: &ocr.image,
         crop_origin: ocr.crop_origin,
     };
-    let blocks = group_lines_into_blocks(ocr.lines, session.visual_text_tuning, Some(boundary));
+    let blocks = group_lines_into_blocks(
+        ocr.lines.clone(),
+        session.visual_text_tuning,
+        Some(boundary),
+    );
     Ok(blocks
         .into_iter()
         .filter(|block| block.bbox.is_inside(&scope))
+        .map(|block| TextHit {
+            text: block.joined,
+            bounds: block.bbox,
+        })
+        .collect())
+}
+
+/// Public-via-[`Session::recognized_text`] full-frame dump. OCRs the *entire*
+/// captured frame (no region crop, no substring filter) and returns one
+/// `TextHit` per recognised block, in reading order. The diagnostic for a
+/// `find_by_text` that returned 0: it shows whether OCR read the target as a
+/// near-miss, mis-recognised it, or never detected it at all.
+pub(crate) async fn recognized_text(session: &Arc<Session>, png: Vec<u8>) -> Result<Vec<TextHit>> {
+    let ocr = ocr_lines(session, None, png).await?;
+    let boundary = BoundaryContext {
+        image: &ocr.image,
+        crop_origin: ocr.crop_origin,
+    };
+    let blocks = group_lines_into_blocks(
+        ocr.lines.clone(),
+        session.visual_text_tuning,
+        Some(boundary),
+    );
+    Ok(blocks
+        .into_iter()
         .map(|block| TextHit {
             text: block.joined,
             bounds: block.bbox,
@@ -1004,7 +1183,11 @@ pub(crate) async fn list_labelled_regions(
         image: &ocr.image,
         crop_origin: ocr.crop_origin,
     };
-    let blocks = group_lines_into_blocks(ocr.lines, session.visual_text_tuning, Some(boundary));
+    let blocks = group_lines_into_blocks(
+        ocr.lines.clone(),
+        session.visual_text_tuning,
+        Some(boundary),
+    );
     let mut pairs = Vec::new();
     for block in blocks {
         if !block.bbox.is_inside(&scope) {
@@ -1168,7 +1351,67 @@ fn find_matches(haystack: &str, needle: &str, mode: MatchMode) -> Vec<(usize, us
             }
             out
         }
+        MatchMode::Fuzzy => fuzzy_find(&h, &n),
     }
+}
+
+/// Levenshtein edit distance between two strings (char-wise).
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Edit-distance-tolerant substring search. Slides a window of
+/// `needle.word_count` consecutive haystack words and reports every window
+/// whose text is within a small normalized edit budget of the needle (≈1
+/// error per 5 chars, min 1). Offsets are byte ranges into the (normalized)
+/// haystack, matching the `Substring` path so `union_bbox_for_match` maps them
+/// the same way.
+fn fuzzy_find(h: &str, n: &str) -> Vec<(usize, usize)> {
+    let needle_words = n.split_whitespace().count().max(1);
+    let budget = (n.chars().count() / 5).max(1);
+
+    // Byte spans of each haystack word.
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (idx, ch) in h.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(s) = start.take() {
+                words.push((s, idx));
+            }
+        } else if start.is_none() {
+            start = Some(idx);
+        }
+    }
+    if let Some(s) = start.take() {
+        words.push((s, h.len()));
+    }
+    if words.len() < needle_words {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for w in 0..=(words.len() - needle_words) {
+        let span = (words[w].0, words[w + needle_words - 1].1);
+        if levenshtein(&h[span.0..span.1], n) <= budget {
+            out.push(span);
+        }
+    }
+    out
 }
 
 /// Map a `(match_start, match_end)` char-offset range back to the
@@ -1215,12 +1458,62 @@ fn text_matches(haystack: &str, needle: &str, mode: MatchMode) -> bool {
     match mode {
         MatchMode::Exact => haystack == needle,
         MatchMode::Substring => haystack.to_lowercase().contains(&needle.to_lowercase()),
+        MatchMode::Fuzzy => !find_matches(haystack, needle, MatchMode::Fuzzy).is_empty(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dummy_result() -> Arc<OcrResult> {
+        Arc::new(OcrResult {
+            lines: Vec::new(),
+            image: image::RgbImage::new(1, 1),
+            crop_origin: (0, 0),
+        })
+    }
+
+    #[test]
+    fn frame_hash_is_deterministic_and_content_sensitive() {
+        assert_eq!(frame_hash(b"same bytes"), frame_hash(b"same bytes"));
+        assert_ne!(frame_hash(b"frame a"), frame_hash(b"frame b"));
+    }
+
+    #[test]
+    fn ocr_cache_hits_same_frame_and_region() {
+        let mut cache = OcrCache::default();
+        let h = 42;
+        assert!(cache.get(h, None).is_none(), "cold cache misses");
+        cache.put(h, None, dummy_result());
+        assert!(cache.get(h, None).is_some(), "same frame+region hits");
+        // Different region on the same frame is a separate entry.
+        assert!(cache.get(h, Some((0, 0, 10, 10))).is_none());
+    }
+
+    #[test]
+    fn ocr_cache_invalidates_on_new_frame() {
+        let mut cache = OcrCache::default();
+        cache.get(1, None); // establish frame 1 (as ocr_lines' miss path does)
+        cache.put(1, None, dummy_result());
+        assert!(cache.get(1, None).is_some());
+        // A new frame hash drops every prior entry.
+        assert!(cache.get(2, None).is_none(), "new frame busts the memo");
+        assert!(
+            cache.get(1, None).is_none(),
+            "old frame's entry is gone after invalidation"
+        );
+    }
+
+    #[test]
+    fn ocr_cache_put_ignored_for_stale_frame() {
+        let mut cache = OcrCache::default();
+        // Current frame is 2 (set via get); a late put for frame 1 must not
+        // land — its result is for a frame we've already moved past.
+        assert!(cache.get(2, None).is_none());
+        cache.put(1, None, dummy_result());
+        assert!(cache.get(2, None).is_none(), "stale-frame put rejected");
+    }
 
     #[test]
     fn find_matches_substring_in_single_word() {
@@ -1246,6 +1539,49 @@ mod tests {
     fn find_matches_substring_multiple_hits() {
         let hits = find_matches("foo bar foo", "foo", MatchMode::Substring);
         assert_eq!(hits, vec![(0, 3), (8, 11)]);
+    }
+
+    #[test]
+    fn levenshtein_basic() {
+        assert_eq!(levenshtein("cursor", "cursor"), 0);
+        assert_eq!(levenshtein("cursor", "cursar"), 1); // substitution
+        assert_eq!(levenshtein("hover-target", "hover-targel"), 1);
+        assert_eq!(levenshtein("abc", ""), 3);
+    }
+
+    #[test]
+    fn fuzzy_matches_single_glyph_ocr_error() {
+        // "Cursor" mis-read as "Cursar" should still match within a row.
+        let hits = find_matches("cursar font scrollback", "Cursor", MatchMode::Fuzzy);
+        assert_eq!(hits, vec![(0, 6)], "fuzzy should locate the mis-read word");
+    }
+
+    #[test]
+    fn fuzzy_matches_hyphenated_misread() {
+        let hits = find_matches(
+            "primary-button mode-toggle",
+            "hover-targel",
+            MatchMode::Fuzzy,
+        );
+        assert!(hits.is_empty(), "an unrelated word must not fuzzy-match");
+        let hits = find_matches("hover-targel dc-target", "hover-target", MatchMode::Fuzzy);
+        assert_eq!(hits, vec![(0, 12)]);
+    }
+
+    #[test]
+    fn fuzzy_multiword_window() {
+        // Two-word needle slides a two-word window; a single-glyph error is
+        // tolerated. "prefs dialog" sits at bytes 9..21; one substitution
+        // (o→e) is within budget.
+        let hits = find_matches("open the prefs dialog", "prefs dialeg", MatchMode::Fuzzy);
+        assert_eq!(hits, vec![(9, 21)]);
+    }
+
+    #[test]
+    fn fuzzy_rejects_too_many_errors() {
+        // "Cursor" vs "Buffer" — 5 substitutions, well over the budget.
+        let hits = find_matches("buffer", "Cursor", MatchMode::Fuzzy);
+        assert!(hits.is_empty());
     }
 
     #[test]

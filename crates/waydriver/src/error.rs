@@ -12,8 +12,16 @@ pub enum Error {
     #[error("element not found for selector: {xpath}")]
     ElementNotFound { xpath: String },
 
-    #[error("selector matched {count} elements (expected exactly one): {xpath}")]
-    AmbiguousSelector { xpath: String, count: usize },
+    #[error("selector matched {count} elements (expected exactly one): {xpath} — matched: {}", .matched.join(", "))]
+    AmbiguousSelector {
+        xpath: String,
+        count: usize,
+        /// Short descriptors of the matched elements (e.g.
+        /// `PushButton[name='Close']`), so the caller can tell *which* two
+        /// things collided without re-querying. Always populated when the
+        /// error is raised; may be empty for hand-constructed values.
+        matched: Vec<String>,
+    },
 
     #[error("invalid selector '{xpath}': {reason}")]
     InvalidSelector { xpath: String, reason: String },
@@ -171,10 +179,15 @@ mod tests {
         assert_eq!(
             Error::AmbiguousSelector {
                 xpath: "//PushButton".into(),
-                count: 12,
+                count: 2,
+                matched: vec![
+                    "PushButton[name=\"OK\"]".into(),
+                    "PushButton[name=\"Cancel\"]".into(),
+                ],
             }
             .to_string(),
-            "selector matched 12 elements (expected exactly one): //PushButton"
+            "selector matched 2 elements (expected exactly one): //PushButton — \
+             matched: PushButton[name=\"OK\"], PushButton[name=\"Cancel\"]"
         );
         assert_eq!(
             Error::InvalidSelector {

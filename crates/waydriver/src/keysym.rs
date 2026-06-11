@@ -100,6 +100,45 @@ pub fn key_name_to_keysym(key: &str) -> Option<u32> {
         "f10" => Some(0xffc7),
         "f11" => Some(0xffc8),
         "f12" => Some(0xffc9),
+        // Standard X11/GDK keysym *names* for ASCII punctuation. GTK writes
+        // accelerators this way (`<Ctrl>comma`, `<Ctrl>minus`), so mirroring an
+        // app's `gtk::accelerator_name()` strings through `press_chord` needs
+        // these to resolve the same as the literal character would. For ASCII
+        // punctuation the X11 keysym value equals the codepoint, so we map each
+        // name to its char and reuse `char_to_keysym` rather than duplicate the
+        // hex — one source of truth, and the values can't drift.
+        "exclam" => Some(char_to_keysym('!')),
+        "quotedbl" => Some(char_to_keysym('"')),
+        "numbersign" => Some(char_to_keysym('#')),
+        "dollar" => Some(char_to_keysym('$')),
+        "percent" => Some(char_to_keysym('%')),
+        "ampersand" => Some(char_to_keysym('&')),
+        "apostrophe" | "quoteright" => Some(char_to_keysym('\'')),
+        "parenleft" => Some(char_to_keysym('(')),
+        "parenright" => Some(char_to_keysym(')')),
+        "asterisk" => Some(char_to_keysym('*')),
+        "plus" => Some(char_to_keysym('+')),
+        "comma" => Some(char_to_keysym(',')),
+        "minus" => Some(char_to_keysym('-')),
+        "period" => Some(char_to_keysym('.')),
+        "slash" => Some(char_to_keysym('/')),
+        "colon" => Some(char_to_keysym(':')),
+        "semicolon" => Some(char_to_keysym(';')),
+        "less" => Some(char_to_keysym('<')),
+        "equal" => Some(char_to_keysym('=')),
+        "greater" => Some(char_to_keysym('>')),
+        "question" => Some(char_to_keysym('?')),
+        "at" => Some(char_to_keysym('@')),
+        "bracketleft" => Some(char_to_keysym('[')),
+        "backslash" => Some(char_to_keysym('\\')),
+        "bracketright" => Some(char_to_keysym(']')),
+        "asciicircum" => Some(char_to_keysym('^')),
+        "underscore" => Some(char_to_keysym('_')),
+        "grave" | "quoteleft" => Some(char_to_keysym('`')),
+        "braceleft" => Some(char_to_keysym('{')),
+        "bar" => Some(char_to_keysym('|')),
+        "braceright" => Some(char_to_keysym('}')),
+        "asciitilde" => Some(char_to_keysym('~')),
         // Fall through to the single-character path when `key` is a literal
         // character ("a", "+", "é"). `len()` is the byte length, so a guard
         // of `len() == 1` would silently reject any non-ASCII single char
@@ -398,5 +437,63 @@ mod tests {
         let c = parse_chord("  Ctrl +  A  ").unwrap();
         assert_eq!(c.modifiers, vec![0xffe3]);
         assert_eq!(c.key, char_to_keysym('A'));
+    }
+
+    #[test]
+    fn punctuation_keysym_names_resolve_to_their_chars() {
+        // GTK accelerator strings use these names; each must resolve the same
+        // as the literal character.
+        for (name, ch) in [
+            ("comma", ','),
+            ("period", '.'),
+            ("minus", '-'),
+            ("plus", '+'),
+            ("equal", '='),
+            ("slash", '/'),
+            ("backslash", '\\'),
+            ("bracketleft", '['),
+            ("bracketright", ']'),
+            ("semicolon", ';'),
+            ("apostrophe", '\''),
+            ("grave", '`'),
+            ("underscore", '_'),
+            ("asciitilde", '~'),
+        ] {
+            assert_eq!(
+                key_name_to_keysym(name),
+                Some(char_to_keysym(ch)),
+                "keysym name {name:?} should map to char {ch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn punctuation_keysym_names_are_case_insensitive_with_aliases() {
+        assert_eq!(key_name_to_keysym("COMMA"), Some(char_to_keysym(',')));
+        // X11 aliases.
+        assert_eq!(
+            key_name_to_keysym("quoteright"),
+            key_name_to_keysym("apostrophe")
+        );
+        assert_eq!(key_name_to_keysym("quoteleft"), key_name_to_keysym("grave"));
+    }
+
+    #[test]
+    fn parse_chord_punctuation_name_matches_literal_char() {
+        // `<Ctrl>comma` (a GTK accel) must parse identically to `Ctrl+,`.
+        let by_name = parse_chord("Ctrl+comma").expect("Ctrl+comma should parse");
+        let by_char = parse_chord("Ctrl+,").expect("Ctrl+, should parse");
+        assert_eq!(by_name.modifiers, by_char.modifiers);
+        assert_eq!(by_name.key, by_char.key);
+        assert_eq!(by_name.key, char_to_keysym(','));
+    }
+
+    #[test]
+    fn parse_chord_minus_name_avoids_separator_ambiguity() {
+        // The literal `Ctrl+-` is ambiguous with the `-` separator, but the
+        // keysym *name* `minus` sidesteps that — another reason to support it.
+        let c = parse_chord("Ctrl+minus").expect("Ctrl+minus should parse");
+        assert_eq!(c.modifiers, vec![0xffe3]);
+        assert_eq!(c.key, char_to_keysym('-'));
     }
 }

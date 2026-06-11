@@ -28,10 +28,23 @@ genuinely upstream:
 - **libadwaita lazy realization** — an `AdwPreferencesGroup`
   constructed with `visible:false` inside an `AdwPreferencesPage` and
   then flipped visible after `present()` never has its accessible
-  subtree built. The contained `AdwButtonRow` paints on screen but is
-  absent from every AT-SPI surface — parent traversal,
-  `GetChildAtIndex(i)` in a loop, even `Cache.GetItems` on the app's
-  own bus name. Libadwaita simply doesn't register these accessibles.
+  subtree built. The same happens to a non-initial `AdwPreferencesDialog`
+  page. The contained `AdwButtonRow` / `AdwSwitchRow` paints on screen
+  but is absent from every AT-SPI surface. We exhaustively tried to
+  *force* realization from the client and **none work** (confirmed live
+  on mutter 49 / GTK4 4.20 / libadwaita 1.8):
+    - parent traversal (`GetChildren`), a `0..ChildCount`
+      `GetChildAtIndex(i)` loop, and `Cache.GetItems` on the app bus —
+      the widgets are simply never published;
+    - a grid of `Component.GetAccessibleAtPoint` hit-tests over the
+      dialog and every descendant (thousands of calls) — no change;
+    - synthetic compositor pointer-hover across the page — no change;
+    - keyboard focus traversal (Tab through the dialog — how Orca
+      surfaces them) — no change.
+
+  Libadwaita doesn't register these accessibles, and there's no AT-SPI
+  or input path that makes it. The bug is genuinely upstream; the OCR
+  visual locator below is the only working way to drive these widgets.
 - **AdwButtonRow has no accessible name** — even when the row *is* in
   the tree, its title doesn't surface as an AT-SPI name, so
   `Locator::find_by_name` returns zero.

@@ -23,3 +23,10 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 image.workspace = true
+# For the OCR perf/upscale probe (ocr_perf.rs): runs ocrs directly on a
+# captured frame to measure the pipeline cost and the small-text upscale
+# benefit, independent of the Session wrappers.
+ocrs.workspace = true
+rten.workspace = true
+imageproc.workspace = true
+ab_glyph = "0.2"

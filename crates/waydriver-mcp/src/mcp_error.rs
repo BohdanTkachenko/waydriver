@@ -77,6 +77,7 @@ mod tests {
         let err = waydriver::Error::AmbiguousSelector {
             xpath: "//Button".into(),
             count: 3,
+            matched: vec!["Button[name=\"X\"]".into()],
         };
         let mcp = waydriver_to_mcp(err);
         assert_eq!(mcp.code.0, -32602);

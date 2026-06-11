@@ -77,6 +77,20 @@
           refresh = pkgs.writeShellScriptBin "refresh" ''
             nix build .#packages.${system}.dev-profile --out-link .nix-profile
           '';
+
+          # Run the `#[ignore]`d e2e suite (spawns mutter + pipewire + AT-SPI).
+          # A *fresh* session bus is required: waydriver connects accessibility
+          # to the host session bus, and the host login bus can't activate the
+          # nix-store `org.a11y.Bus.service`. `dbus-run-session` gives each run
+          # its own bus, which (with the at-spi env the shellHook already sets)
+          # activates a11y correctly. `--test-threads=1` because the tests share
+          # that bus. Usage: `e2e-tests` (all) or `e2e-tests <name-filter>`.
+          e2e-tests = pkgs.writeShellScriptBin "e2e-tests" ''
+            set -euo pipefail
+            cargo build -p waydriver-fixture-gtk
+            exec ${pkgs.dbus}/bin/dbus-run-session -- \
+              cargo test -p waydriver-e2e -- --ignored --test-threads=1 "$@"
+          '';
         in
         {
           packages = {
@@ -108,7 +122,7 @@
 
             dev-profile = pkgs.buildEnv {
               name = "waydriver-dev-profile";
-              paths = devPackages ++ [ refresh ];
+              paths = devPackages ++ [ refresh e2e-tests ];
             };
           };
 
@@ -241,7 +255,7 @@
           };
 
           devShells.default = pkgs.mkShell {
-            packages = devPackages ++ [ refresh ];
+            packages = devPackages ++ [ refresh e2e-tests ];
 
             shellHook = ''
               refresh
