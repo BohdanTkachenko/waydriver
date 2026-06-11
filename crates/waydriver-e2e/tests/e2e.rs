@@ -1574,3 +1574,84 @@ async fn fixture_adw_switch_row_toggle_emits_event() -> anyhow::Result<()> {
     kill(session).await?;
     Ok(())
 }
+
+/// Regression guard for the pipewire runtime-dir nesting overflow.
+///
+/// Drives a **real** mutter + pipewire screenshot and recording with no GTK
+/// fixture or AT-SPI, and asserts that each capture leaves `XDG_RUNTIME_DIR`
+/// exactly as it found it. Leaving it pointed at the live session's runtime
+/// dir is what made subsequent sessions nest one level deeper until the
+/// AF_UNIX `sun_path` limit wedged pipewire — so this directly exercises the
+/// fix (capture's `EnvGuard` restore) against the live stack, while also
+/// confirming the restore doesn't break capture itself (valid PNG + non-empty
+/// WebM produced).
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn capture_restores_runtime_env_and_still_produces_media() -> anyhow::Result<()> {
+    use waydriver::CaptureBackend;
+
+    init_tracing();
+
+    // The value the parent process must be restored to after every capture.
+    let before = std::env::var_os("XDG_RUNTIME_DIR");
+
+    let mut compositor = MutterCompositor::new();
+    compositor.start(None, None).await?;
+    let state = compositor
+        .state()
+        .expect("MutterCompositor::state is Some immediately after start()");
+    let capture = MutterCapture::new(state);
+
+    // ── Screenshot path: grab_png → EnvGuard ──────────────────────────────
+    let stream = capture.start_stream().await?;
+    let raw = capture.grab_screenshot(&stream).await?;
+    let png = extract_png(&raw)?;
+    assert!(
+        png.len() > 1000,
+        "screenshot PNG implausibly small ({} bytes) — capture path broken",
+        png.len()
+    );
+    assert_eq!(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        before,
+        "XDG_RUNTIME_DIR not restored after screenshot — capture leaked the session dir \
+         into the parent env (this is what caused the nesting overflow)"
+    );
+    capture.stop_stream(stream).await?;
+
+    // ── Recording path: start_recording_sync → wait-for-PLAYING → EnvGuard ─
+    let webm = std::env::temp_dir().join(format!(
+        "waydriver-capture-regression-{}.webm",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&webm);
+    let rec_stream = capture.start_recording_stream().await?;
+    let recorder = capture
+        .start_recording(&rec_stream, &webm, 2_000_000, 15)
+        .await?;
+    // Let it encode a couple of seconds of (videorate-duplicated) frames.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    capture.stop_recording(recorder).await?;
+    capture.stop_recording_stream(rec_stream).await?;
+
+    let webm_len = std::fs::metadata(&webm)
+        .map(|m| m.len())
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&webm);
+    assert!(
+        webm_len > 0,
+        "recorded WebM is empty — recorder's wait-for-PLAYING/restore broke capture"
+    );
+    assert_eq!(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        before,
+        "XDG_RUNTIME_DIR not restored after recording — capture leaked the session dir \
+         into the parent env (this is what caused the nesting overflow)"
+    );
+
+    // Drop capture (releasing its MutterState Arc) before tearing the
+    // compositor down, honoring the shared-state invariant.
+    drop(capture);
+    CompositorRuntime::stop(&mut compositor).await?;
+    Ok(())
+}
