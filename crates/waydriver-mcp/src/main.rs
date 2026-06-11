@@ -240,6 +240,14 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_var("XDG_RUNTIME_DIR", &instance_runtime_root);
     }
 
+    // Pin the compositor's host runtime root now, from the pristine env we just
+    // set, instead of lazily on the first session. Combined with capture
+    // restoring XDG_RUNTIME_DIR after each screenshot/recording, this keeps
+    // per-session runtime dirs deterministically flat siblings regardless of
+    // init order — closing the pipewire socket-path nesting overflow at the
+    // root rather than relying on the lazy snapshot landing before any capture.
+    let pinned_root = waydriver_compositor_mutter::establish_runtime_root().to_path_buf();
+
     // Create the base report dir up front so per-session dirs land under an
     // existing parent.
     if let Err(e) = tokio::fs::create_dir_all(&report_dir).await {
@@ -249,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         instance_id,
         report_dir = %report_dir.display(),
-        runtime_root = %instance_runtime_root.display(),
+        runtime_root = %pinned_root.display(),
         resolution = %cli.resolution,
         record_video = cli.record_video,
         video_bitrate = cli.video_bitrate,

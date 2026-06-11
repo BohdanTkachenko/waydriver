@@ -211,6 +211,19 @@ static HOST_RUNTIME_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
     PathBuf::from(root)
 });
 
+/// Eagerly capture [`HOST_RUNTIME_ROOT`] from the current `XDG_RUNTIME_DIR`
+/// and return it.
+///
+/// The snapshot is otherwise taken lazily on the first [`MutterCompositor::new`].
+/// Call this once at process startup — before any session is created and
+/// before anything can mutate `XDG_RUNTIME_DIR` — to pin the root to the
+/// pristine launcher value deterministically, rather than relying on `new()`
+/// happening first. Idempotent: subsequent calls (and `new()`) return the same
+/// captured value.
+pub fn establish_runtime_root() -> &'static std::path::Path {
+    HOST_RUNTIME_ROOT.as_path()
+}
+
 impl MutterCompositor {
     /// Construct but do not start. Generates the session id and computes
     /// where the Wayland socket and runtime dir will live. No I/O.

@@ -12,6 +12,57 @@ use crate::error::{Error, Result};
 /// `pipewiresrc` reads during pipeline startup.
 static GRAB_PNG_LOCK: Mutex<()> = Mutex::new(());
 
+/// RAII guard that sets process-wide env vars and restores their prior values
+/// on drop.
+///
+/// `pipewiresrc` only reads `PIPEWIRE_REMOTE` / `XDG_RUNTIME_DIR` from the
+/// environment, so the capture paths have to set them process-wide before the
+/// pipeline connects. Leaving them set, though, is the root cause of the
+/// session-dir nesting overflow: `XDG_RUNTIME_DIR` would stay pointed at the
+/// live session's runtime dir for the rest of the server's life, so any later
+/// consumer that re-derived a path from it would nest one level deeper per
+/// session until the AF_UNIX `sun_path` limit wedged pipewire (a restart was
+/// the only cure). Restoring on drop keeps the parent env pristine, so the
+/// leak — and the nesting it caused — can't accumulate across a server
+/// lifetime regardless of init order.
+///
+/// All construction/restoration happens under [`GRAB_PNG_LOCK`], so there's no
+/// concurrent mutation of these process-wide keys.
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    fn set(vars: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(key, val)| {
+                let prev = std::env::var_os(key);
+                // Safe: callers hold GRAB_PNG_LOCK, which serializes every
+                // read/write of these keys across the process.
+                unsafe { std::env::set_var(key, val) };
+                (*key, prev)
+            })
+            .collect();
+        Self { saved }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, prev) in &self.saved {
+            // Safe: still under GRAB_PNG_LOCK (the guard drops before the lock
+            // guard, which is declared first and so drops last).
+            unsafe {
+                match prev {
+                    Some(val) => std::env::set_var(key, val),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
 /// Capture a PNG from a PipeWire node using an in-process GStreamer pipeline.
 ///
 /// Builds `pipewiresrc ! videoconvert ! pngenc snapshot=true ! appsink` and
@@ -62,12 +113,15 @@ fn grab_png_sync(node_id: u32, pipewire_socket: &Path, runtime_dir: &Path) -> Re
 
     gst::init().map_err(|e| Error::screenshot_with("gstreamer init failed", e))?;
 
-    // pipewiresrc reads these from the environment. Safe because GRAB_PNG_LOCK
-    // serializes all callers — no concurrent set_var/get_var on these keys.
-    unsafe {
-        std::env::set_var("PIPEWIRE_REMOTE", pipewire_socket);
-        std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
-    }
+    // pipewiresrc reads these from the environment. The guard restores their
+    // prior values when this function returns (on every path, including the
+    // `?` errors below), so the parent process is never left with
+    // `XDG_RUNTIME_DIR` pointed at a session dir. The synchronous frame pull
+    // below keeps them set for as long as pipewiresrc needs them.
+    let _env = EnvGuard::set(&[
+        ("PIPEWIRE_REMOTE", pipewire_socket.as_os_str()),
+        ("XDG_RUNTIME_DIR", runtime_dir.as_os_str()),
+    ]);
 
     let pipeline_str = build_pipeline_str(node_id);
 
@@ -257,12 +311,16 @@ fn start_recording_sync(
 
     gst::init().map_err(|e| Error::screenshot_with("gstreamer init failed", e))?;
 
-    // pipewiresrc reads these from the environment during state-transition to
-    // READY. The GRAB_PNG_LOCK guard serializes us with screenshot grabs.
-    unsafe {
-        std::env::set_var("PIPEWIRE_REMOTE", pipewire_socket);
-        std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
-    }
+    // pipewiresrc reads these from the environment during the state transition
+    // below. Unlike the screenshot path, the pipeline outlives this function,
+    // so we must keep the env set until pipewiresrc has actually connected —
+    // hence the explicit wait for PLAYING before the guard restores the prior
+    // values on return. Restoring is what stops `XDG_RUNTIME_DIR` from leaking
+    // a session dir into the parent for the rest of the server's life.
+    let _env = EnvGuard::set(&[
+        ("PIPEWIRE_REMOTE", pipewire_socket.as_os_str()),
+        ("XDG_RUNTIME_DIR", runtime_dir.as_os_str()),
+    ]);
 
     let pipeline_str = build_recording_pipeline_str(node_id, &output_path, bitrate, fps);
 
@@ -275,6 +333,14 @@ fn start_recording_sync(
     pipeline
         .set_state(gst::State::Playing)
         .map_err(|e| Error::screenshot_with("failed to start recording pipeline", e))?;
+
+    // Block until the pipeline reaches PLAYING so pipewiresrc has connected to
+    // the daemon and read PIPEWIRE_REMOTE/XDG_RUNTIME_DIR before `_env` drops
+    // and restores the parent's prior values. Without this the async state
+    // change could still be pending when we restore, and pipewiresrc would
+    // read a stale socket path.
+    let (res, _current, _pending) = pipeline.state(gst::ClockTime::from_seconds(10));
+    res.map_err(|e| Error::screenshot_with("recording pipeline failed to reach PLAYING", e))?;
 
     tracing::info!(path = %output_path.display(), node_id, "video recording started");
 
@@ -462,5 +528,49 @@ mod tests {
     #[test]
     fn test_validate_pipewire_socket_no_parent() {
         assert!(validate_pipewire_socket(Path::new("")).is_err());
+    }
+
+    /// The whole nesting fix hinges on capture leaving the process env exactly
+    /// as it found it. Both env tests take `GRAB_PNG_LOCK` so they serialize
+    /// with each other (and mirror how the real capture paths guard these keys).
+    #[test]
+    fn env_guard_restores_prior_value_on_drop() {
+        let _lock = GRAB_PNG_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/tmp/wd-test-root") };
+        {
+            let _g = EnvGuard::set(&[(
+                "XDG_RUNTIME_DIR",
+                std::ffi::OsStr::new("/tmp/wd-test-root/wd-session-aaaa"),
+            )]);
+            assert_eq!(
+                std::env::var("XDG_RUNTIME_DIR").unwrap(),
+                "/tmp/wd-test-root/wd-session-aaaa"
+            );
+        }
+        // Restored to the pre-guard value — never left pointing at the session
+        // dir, so a subsequent session can't nest under it.
+        assert_eq!(
+            std::env::var("XDG_RUNTIME_DIR").unwrap(),
+            "/tmp/wd-test-root"
+        );
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+    }
+
+    #[test]
+    fn env_guard_removes_key_that_was_unset_before() {
+        let _lock = GRAB_PNG_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("WD_TEST_ENVGUARD_KEY") };
+        {
+            let _g = EnvGuard::set(&[(
+                "WD_TEST_ENVGUARD_KEY",
+                std::ffi::OsStr::new("/some/session/dir"),
+            )]);
+            assert_eq!(
+                std::env::var("WD_TEST_ENVGUARD_KEY").unwrap(),
+                "/some/session/dir"
+            );
+        }
+        // Was absent before, so it must be removed (not left as empty/stale).
+        assert!(std::env::var_os("WD_TEST_ENVGUARD_KEY").is_none());
     }
 }
