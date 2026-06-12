@@ -490,6 +490,321 @@ async fn lazy_a11y_hidden_then_shown_widget_missing_from_atspi() -> anyhow::Resu
 /// so a title-based count can't distinguish "bug present" from "title
 /// not exposed"). Same upstream-only conclusion: `Cache.GetItems`
 /// confirms page2 widgets aren't registered with AT-SPI at all.
+/// Experiment: does driving keyboard *focus* onto a lazily-revealed widget
+/// force-realize its AT-SPI context (per the focus-realize proposal)? Captures
+/// `object:state-changed:focused` and `object:children-changed` events while
+/// Tabbing through the non-initial-page dialog, and re-checks the tree + the
+/// app cache. Distinguishes Model A (focus realizes the leaf → carried by the
+/// focus *event* only, tree/cache stay empty) from Model B (chain repairs →
+/// tree/cache now include it) — or refutes both (no focus event for the
+/// target). Diagnostic; read the RESULT block on stderr.
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn lazy_a11y_focus_realization_experiment() -> anyhow::Result<()> {
+    use atspi::events::object::{ChildrenChangedEvent, StateChangedEvent};
+    use atspi::proxy::accessible::AccessibleProxy;
+    use atspi::proxy::cache::CacheProxy;
+    use atspi::AccessibilityConnection;
+    use atspi::ObjectEvents;
+    use futures_lite::StreamExt;
+    use std::collections::HashSet;
+
+    init_tracing();
+    let (session, _state) = start_fixture_session("lazy-a11y").await?;
+
+    // Open the non-initial-page dialog; its page2 AdwSwitchRow renders but is
+    // absent from AT-SPI.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='open-non-initial-page-dialog']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dialog-opened non-initial-page-dialog"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let conn = session
+        .a11y_connection
+        .as_ref()
+        .expect("session has a11y connection")
+        .clone();
+    let app = session.app_bus_name.clone();
+
+    // --- Baseline: tree + cache (both expected to lack the switch) ---
+    let baseline = session.locate("//Dialog//*").inspect_all().await?;
+    let baseline_paths: HashSet<String> = baseline.iter().map(|e| e.ref_.1.clone()).collect();
+    let b1 = session
+        .locate("//Dialog//*[@role='switch']")
+        .count()
+        .await?;
+
+    let cache = CacheProxy::builder(&conn)
+        .destination(app.clone())?
+        .path("/org/a11y/atspi/cache")?
+        .build()
+        .await?;
+    let before_items = cache.get_items().await?;
+    let before_paths: HashSet<String> = before_items
+        .iter()
+        .map(|i| i.object.path_as_str().to_string())
+        .collect();
+    eprintln!(
+        "BASELINE: dialog descendants={} switch-in-tree={b1} cache-items={}",
+        baseline.len(),
+        before_items.len()
+    );
+
+    // --- Subscribe to events BEFORE any input ---
+    let a11y = AccessibilityConnection::new().await?;
+    a11y.register_event::<StateChangedEvent>().await?;
+    a11y.register_event::<ChildrenChangedEvent>().await?;
+    let mut stream = std::pin::pin!(a11y.event_stream());
+    // Drain anything already queued.
+    while tokio::time::timeout(Duration::from_millis(40), stream.next())
+        .await
+        .is_ok()
+    {}
+
+    // --- Experiment F: Tab through the dialog, collect focus/children events ---
+    let mut focus_objs: Vec<(String, String)> = Vec::new();
+    let mut children_changed = 0u32;
+    for _ in 0..35 {
+        session.press_chord("Tab").await?;
+        let deadline = std::time::Instant::now() + Duration::from_millis(120);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(40), stream.next()).await {
+                Ok(Some(Ok(atspi::Event::Object(ObjectEvents::StateChanged(sc))))) => {
+                    if sc.state == atspi::State::Focused && sc.enabled {
+                        let name = sc.item.name_as_str().unwrap_or("").to_string();
+                        focus_objs.push((name, sc.item.path_as_str().to_string()));
+                    }
+                }
+                Ok(Some(Ok(atspi::Event::Object(ObjectEvents::ChildrenChanged(_))))) => {
+                    children_changed += 1;
+                }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+    }
+
+    // Resolve each focused object: role + whether it was in the baseline tree.
+    let mut realized_outside_tree = 0u32;
+    let mut switch_ref: Option<(String, String)> = None;
+    for (name, path) in &focus_objs {
+        let role = match AccessibleProxy::builder(&conn)
+            .destination(name.clone())?
+            .path(path.clone())?
+            .build()
+            .await
+        {
+            Ok(p) => p
+                .get_role_name()
+                .await
+                .unwrap_or_else(|_| "<unqueryable>".into()),
+            Err(_) => "<no-proxy>".into(),
+        };
+        if role == "switch" {
+            switch_ref = Some((name.clone(), path.clone()));
+        }
+        let in_tree = baseline_paths.contains(path);
+        if !in_tree {
+            realized_outside_tree += 1;
+        }
+        eprintln!("  focused: role={role:<14} in_baseline_tree={in_tree} {name}{path}");
+    }
+
+    // --- After focus: tree + cache ---
+    let f3 = session
+        .locate("//Dialog//*[@role='switch']")
+        .count()
+        .await?;
+    // Role-agnostic: does the focused switch's PATH now appear in a fresh tree
+    // walk? This is the clean Model A (no) vs Model B (yes) discriminator.
+    let after_tree = session.locate("//Dialog//*").inspect_all().await?;
+    let after_tree_paths: HashSet<String> = after_tree.iter().map(|e| e.ref_.1.clone()).collect();
+    let focus_paths_now_in_tree = focus_objs
+        .iter()
+        .filter(|(_, p)| after_tree_paths.contains(p))
+        .count();
+    let after_items = cache.get_items().await?;
+    let new_cache: Vec<_> = after_items
+        .iter()
+        .filter(|i| !before_paths.contains(i.object.path_as_str()))
+        .map(|i| format!("{:?}:{}", i.role, i.object.path_as_str()))
+        .collect();
+
+    eprintln!("=== RESULT (Case 2: non-initial AdwPreferencesDialog page) ===");
+    eprintln!("F1/F2  focus events total={} ; carrying an object NOT in the baseline tree={realized_outside_tree}", focus_objs.len());
+    eprintln!(
+        "F3     tree switch count after focus = {f3} (baseline {b1}); dialog descendants {} -> {}",
+        baseline.len(),
+        after_tree.len()
+    );
+    eprintln!("F3b    focused-object paths now present in a fresh tree walk = {focus_paths_now_in_tree} (Model B if >0, Model A if 0)");
+    eprintln!(
+        "F4     cache items after = {} (before {}); newly-cached = {} {new_cache:?}",
+        after_items.len(),
+        before_items.len(),
+        new_cache.len()
+    );
+    eprintln!("F5     children-changed events during focus = {children_changed}");
+
+    // --- DRIVE: can the focus-realized switch be *driven* via AT-SPI (not just
+    // queried)? Read its state + bounds, then perform its Action and confirm
+    // the fixture toggles. This is the real "does AT-SPI work for it now" test.
+    if let Some((name, path)) = switch_ref {
+        use atspi::proxy::action::ActionProxy;
+        use atspi::proxy::component::ComponentProxy;
+        use atspi::CoordType;
+
+        let acc = AccessibleProxy::builder(&conn)
+            .destination(name.clone())?
+            .path(path.clone())?
+            .build()
+            .await?;
+        let states = acc.get_state().await.ok();
+        let comp = ComponentProxy::builder(&conn)
+            .destination(name.clone())?
+            .path(path.clone())?
+            .build()
+            .await?;
+        let extents = comp.get_extents(CoordType::Screen).await.ok();
+        eprintln!("DRIVE  switch states={states:?} extents={extents:?}");
+
+        let act = ActionProxy::builder(&conn)
+            .destination(name.clone())?
+            .path(path.clone())?
+            .build()
+            .await?;
+        let nactions = act.nactions().await.unwrap_or(-1);
+        eprintln!("DRIVE  switch nactions={nactions}");
+
+        let cursor = session.stdout_cursor();
+        let did = if nactions > 0 {
+            act.do_action(0).await.unwrap_or(false)
+        } else {
+            false
+        };
+        eprintln!("DRIVE  do_action(0) returned {did}");
+        let toggled = session
+            .wait_for_stdout_line(
+                cursor,
+                |l| l.contains("toggled lazy-switch"),
+                Duration::from_secs(3),
+            )
+            .await;
+        eprintln!(
+            "DRIVE  via AT-SPI Action = {} ({:?})",
+            toggled.is_ok(),
+            toggled.as_deref().unwrap_or("<no stdout event>")
+        );
+
+        // No Action interface — try the *keyboard* path, which is how a
+        // keyboard user / Orca toggles a focused switch: grab_focus via AT-SPI
+        // (deterministic, using the realized accessible we discovered), then
+        // synthesize Space. AT-SPI as the observability/targeting layer,
+        // keyboard as the actuation layer.
+        let grabbed = comp.grab_focus().await.unwrap_or(false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let kbd_cursor = session.stdout_cursor();
+        session.press_chord("space").await?;
+        let kbd_toggled = session
+            .wait_for_stdout_line(
+                kbd_cursor,
+                |l| l.contains("toggled lazy-switch"),
+                Duration::from_secs(3),
+            )
+            .await;
+        eprintln!(
+            "DRIVE  via keyboard (grab_focus={grabbed} + Space) = {} ({:?})",
+            kbd_toggled.is_ok(),
+            kbd_toggled.as_deref().unwrap_or("<no stdout event>")
+        );
+    } else {
+        eprintln!("DRIVE  no focus event ever resolved to role=switch — cannot attempt");
+    }
+
+    drop(stream);
+    drop(a11y);
+    kill(session).await?;
+    Ok(())
+}
+
+/// The supported read-path for lazily-realized widgets: `focus_walk` to
+/// force-realize them, then `hidden_accessibles` to discover/inspect them via
+/// the app's AT-SPI cache (the `GetChildren` tree never repairs — see
+/// `docs/visual-locator.md`). Pins that the page2 `AdwSwitchRow`, invisible to
+/// `dump_tree`, becomes readable (role/states/path) after a focus walk.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn lazy_a11y_hidden_accessibles_readable_after_focus_walk() -> anyhow::Result<()> {
+    use std::collections::HashSet;
+
+    init_tracing();
+    let (session, _state) = start_fixture_session("lazy-a11y").await?;
+
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='open-non-initial-page-dialog']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dialog-opened non-initial-page-dialog"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // The switch never enters the snapshot tree (the upstream bug)...
+    let in_tree = session
+        .locate("//Dialog//*[@role='switch']")
+        .count()
+        .await?;
+    assert_eq!(in_tree, 0, "premise: switch absent from the snapshot tree");
+
+    // ...and before any focus, it isn't realized into the cache either.
+    let before = session.hidden_accessibles().await?;
+    let before_paths: HashSet<String> = before.iter().map(|c| c.ref_.1.clone()).collect();
+
+    // Focus-walk the dialog: realizes the focused widgets + ancestor chains.
+    session.focus_walk(20).await?;
+
+    let after = session.hidden_accessibles().await?;
+    let newly_realized: Vec<_> = after
+        .iter()
+        .filter(|c| !before_paths.contains(&c.ref_.1))
+        .collect();
+    eprintln!("newly realized after focus_walk:");
+    for c in &newly_realized {
+        eprintln!(
+            "  {} name={:?} states={:?} path={}",
+            c.role, c.name, c.states, c.ref_.1
+        );
+    }
+
+    // The lazy switch is among them, identifiable by its checkable state.
+    // (GTK caches an AdwSwitchRow's switch with a checkbox-family role, so
+    // match on the state rather than pinning the exact role string.)
+    let switch = newly_realized
+        .iter()
+        .find(|c| c.states.iter().any(|s| s == "checkable"));
+    assert!(
+        switch.is_some(),
+        "focus_walk should realize the page2 switch into the cache; newly realized: {newly_realized:?}"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
 /// Documented-negative for the libadwaita lazy-realization gap (see
 /// `docs/visual-locator.md`). We tried every client-side way to *force* the
 /// missing accessibles to register and none work: `GetChildren` /

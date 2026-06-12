@@ -924,6 +924,86 @@ pub async fn hit_test_at_point_on(
     }
 }
 
+/// One entry from the application's AT-SPI cache (`Cache.GetItems`),
+/// in waydriver's vocabulary: PascalCase role, lowercase state names —
+/// the same conventions as the snapshot tree.
+///
+/// The cache is a *different surface* than the `GetChildren` tree the
+/// snapshot walks: GTK populates it whenever an accessible's context is
+/// realized. For lazily-realized libadwaita widgets (hidden→shown
+/// `AdwPreferencesGroup` content, non-initial `AdwPreferencesDialog`
+/// pages) the parent→child tree links are never repaired, but a focus
+/// nudge realizes the focused widget *and its ancestor chain* into the
+/// cache — making this the only AT-SPI surface where those widgets can
+/// be discovered and inspected. See `Session::hidden_accessibles`.
+#[derive(Debug, Clone)]
+pub struct CachedAccessible {
+    /// AT-SPI `(bus_name, object_path)` identity — the same reference
+    /// shape as [`ElementInfo::ref_`].
+    pub ref_: (String, String),
+    /// PascalCase role (e.g. `"CheckBox"`), normalized exactly like the
+    /// snapshot's element names. Falls back to the raw role name when it
+    /// doesn't form a valid identifier.
+    pub role: String,
+    /// Accessible name, if non-empty.
+    pub name: Option<String>,
+    /// Lowercase names of the AT-SPI states set on the entry, filtered
+    /// to the same set the snapshot emits.
+    pub states: Vec<String>,
+    /// Object path of the parent accessible, when the cache knows it.
+    pub parent_path: Option<String>,
+    /// Child count as reported by the cache.
+    pub child_count: i32,
+}
+
+/// Read the application's AT-SPI cache (`Cache.GetItems` on the app's
+/// bus name). Returns every cached accessible mapped into waydriver's
+/// conventions. The cache reflects realized contexts, not tree
+/// membership — see [`CachedAccessible`].
+pub async fn cache_items(conn: &zbus::Connection, app_bus: &str) -> Result<Vec<CachedAccessible>> {
+    let proxy = atspi::proxy::cache::CacheProxy::builder(conn)
+        .destination(app_bus.to_string())
+        .map_err(|e| Error::atspi_with("cache proxy destination", e))?
+        .path("/org/a11y/atspi/cache")
+        .map_err(|e| Error::atspi_with("cache proxy path", e))?
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .map_err(|e| Error::atspi_with("cache proxy build", e))?;
+    let items = proxy
+        .get_items()
+        .await
+        .map_err(|e| Error::atspi_with("Cache.GetItems", e))?;
+
+    Ok(items
+        .into_iter()
+        .map(|item| {
+            let raw_role = item.role.name();
+            let role = role_to_element_name(raw_role).unwrap_or_else(|| raw_role.to_string());
+            let states = EMITTED_STATES
+                .iter()
+                .filter(|(state, _)| item.states.contains(*state))
+                .map(|(_, attr)| (*attr).to_string())
+                .collect();
+            let parent_path = match item.parent.path_as_str() {
+                "/org/a11y/atspi/null" | "" => None,
+                p => Some(p.to_string()),
+            };
+            CachedAccessible {
+                ref_: (
+                    item.object.name_as_str().unwrap_or(app_bus).to_string(),
+                    item.object.path_as_str().to_string(),
+                ),
+                role,
+                name: (!item.name.is_empty()).then(|| item.name.clone()),
+                states,
+                parent_path,
+                child_count: item.children,
+            }
+        })
+        .collect())
+}
+
 /// Ask the toolkit to scroll the element identified by `(bus, path)` into
 /// view via the AT-SPI `Component::scroll_to` method.
 ///

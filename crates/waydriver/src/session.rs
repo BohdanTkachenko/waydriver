@@ -1029,6 +1029,77 @@ impl Session {
             .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
         atspi_client::snapshot_tree(a11y, &self.app_bus_name, &self.app_path).await
     }
+
+    /// Walk keyboard focus through the app by pressing **Tab** `steps`
+    /// times (with a short settle between presses).
+    ///
+    /// The point is the side effect: focusing a widget force-realizes its
+    /// AT-SPI context (GTK's focus path realizes unconditionally), which is
+    /// the only client-side trigger that surfaces GTK4/libadwaita's
+    /// lazily-realized widgets — content revealed after the toplevel was
+    /// presented (hidden→shown `AdwPreferencesGroup`, non-initial
+    /// `AdwPreferencesDialog` pages) that never enters the `GetChildren`
+    /// tree. After a walk, the realized widgets and their ancestor chains
+    /// are readable via [`hidden_accessibles`](Self::hidden_accessibles).
+    ///
+    /// **Destructive:** this moves real keyboard focus. Focus wraps within
+    /// the active window's Tab cycle, so a `steps` larger than the number
+    /// of focusable widgets simply loops — covering every reachable widget.
+    pub async fn focus_walk(&self, steps: u32) -> Result<()> {
+        for _ in 0..steps {
+            if self.cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            self.press_chord("Tab").await?;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        // One extra beat so the last focus event's realization lands in the
+        // app cache before the caller re-reads it.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        Ok(())
+    }
+
+    /// Read the application's AT-SPI cache (`Cache.GetItems`) — every
+    /// accessible whose context the toolkit has realized, including ones
+    /// the `GetChildren` tree (and therefore [`dump_tree`](Self::dump_tree)
+    /// / XPath locators) cannot reach.
+    pub async fn cached_accessibles(&self) -> Result<Vec<atspi_client::CachedAccessible>> {
+        let a11y = self
+            .a11y_connection
+            .as_ref()
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
+        atspi_client::cache_items(a11y, &self.app_bus_name).await
+    }
+
+    /// The accessibles that exist in the app's AT-SPI cache but are
+    /// **missing from the snapshot tree** — i.e. widgets XPath locators
+    /// cannot see. For GTK4/libadwaita lazily-realized content this is the
+    /// only AT-SPI read path: run [`focus_walk`](Self::focus_walk) first to
+    /// realize the hidden widgets, then call this to discover and inspect
+    /// them (role, name, states, `(bus, path)` reference).
+    ///
+    /// Returns an empty list when the cache holds nothing beyond the tree —
+    /// the healthy case. Note the limits established for these widgets:
+    /// their `Component` bounds are unreliable and they expose no `Action`,
+    /// so use this for discovery/assertions, and actuate via keyboard
+    /// (focus + Space/Enter) or the OCR visual locator.
+    pub async fn hidden_accessibles(&self) -> Result<Vec<atspi_client::CachedAccessible>> {
+        let a11y = self
+            .a11y_connection
+            .as_ref()
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
+        let xml = atspi_client::snapshot_tree(a11y, &self.app_bus_name, &self.app_path).await?;
+        let tree_paths: std::collections::HashSet<String> =
+            atspi_client::evaluate_xpath_detailed(&xml, "//*")?
+                .into_iter()
+                .map(|e| e.ref_.1)
+                .collect();
+        let cached = atspi_client::cache_items(a11y, &self.app_bus_name).await?;
+        Ok(cached
+            .into_iter()
+            .filter(|c| !tree_paths.contains(&c.ref_.1))
+            .collect())
+    }
 }
 
 /// XPath-based element targeting entry points. Implemented on `Arc<Session>`

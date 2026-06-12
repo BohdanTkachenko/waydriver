@@ -30,3 +30,8 @@ ocrs.workspace = true
 rten.workspace = true
 imageproc.workspace = true
 ab_glyph = "0.2"
+# For the focus-realization AT-SPI experiment: subscribe to accessibility
+# events and read the app cache directly.
+atspi = { version = "0.29", features = ["proxies", "connection", "wrappers"] }
+zbus = "5"
+futures-lite = "2"

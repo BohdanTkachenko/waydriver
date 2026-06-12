@@ -3660,6 +3660,8 @@ version = "0.3.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "atspi",
+ "futures-lite",
  "image",
  "imageproc",
  "ocrs",
@@ -3672,6 +3674,7 @@ dependencies = [
  "waydriver-capture-mutter",
  "waydriver-compositor-mutter",
  "waydriver-input-mutter",
+ "zbus",
 ]
 
 [[package]]
