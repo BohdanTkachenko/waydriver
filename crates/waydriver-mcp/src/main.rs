@@ -30,6 +30,7 @@ pub struct UiTestServer {
     pub(crate) default_resolution: String,
     pub(crate) default_scale: f64,
     pub(crate) default_gsettings_isolation: bool,
+    pub(crate) default_xdg_isolation: bool,
     pub(crate) default_record_video: bool,
     pub(crate) default_video_bitrate: u32,
     /// Hard ceiling on session setup applied when a start_session call doesn't
@@ -157,11 +158,15 @@ impl UiTestServer {
     /// them here into the single `tool_router` field the
     /// `#[tool_handler]` below dispatches against. Adding a new tool
     /// group is: new module + new `+ Self::<group>_router()` line.
+    // One positional default per CLI flag; a config struct would just
+    // duplicate the `Cli` struct shape for no call-site gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         report_dir: PathBuf,
         default_resolution: String,
         default_scale: f64,
         default_gsettings_isolation: bool,
+        default_xdg_isolation: bool,
         default_record_video: bool,
         default_video_bitrate: u32,
         default_setup_timeout: Duration,
@@ -176,6 +181,7 @@ impl UiTestServer {
             default_resolution,
             default_scale,
             default_gsettings_isolation,
+            default_xdg_isolation,
             default_record_video,
             default_video_bitrate,
             default_setup_timeout,
@@ -270,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
         cli.resolution,
         cli.scale,
         cli.gsettings_isolation,
+        cli.xdg_isolation,
         cli.record_video,
         cli.video_bitrate,
         Duration::from_secs(cli.setup_timeout_secs),
@@ -310,6 +317,7 @@ mod tests {
             PathBuf::from("/tmp/waydriver-test"),
             "1024x768".into(),
             1.0,
+            true,
             true,
             false,
             2_000_000,
@@ -881,6 +889,7 @@ mod tests {
             "1024x768".into(),
             1.0,
             true,
+            true,
             false,
             2_000_000,
             Duration::from_secs(90),
@@ -902,6 +911,7 @@ mod tests {
             PathBuf::from("/tmp/custom-out"),
             "1024x768".into(),
             1.0,
+            true,
             true,
             false,
             2_000_000,
@@ -1020,6 +1030,7 @@ mod tests {
             PathBuf::from("/tmp/base-out"),
             "1024x768".into(),
             1.0,
+            true,
             true,
             false,
             2_000_000,
@@ -1158,6 +1169,7 @@ mod tests {
             "1024x768".into(),
             1.0,
             true,
+            true,
             false,
             2_000_000,
             Duration::from_secs(90),
@@ -1197,6 +1209,7 @@ mod tests {
             tmp.path().to_path_buf(),
             "1024x768".into(),
             1.0,
+            true,
             true,
             false,
             2_000_000,
@@ -1297,6 +1310,7 @@ mod tests {
             tmp.path().to_path_buf(),
             "1024x768".into(),
             1.0,
+            true,
             true,
             false,
             2_000_000,

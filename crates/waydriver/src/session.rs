@@ -114,6 +114,30 @@ pub struct SessionConfig {
     /// inherits the host's normal GSettings. Must match the isolation mode the
     /// compositor was started with — both read the same keyfile dir.
     pub gsettings_isolated: bool,
+
+    /// When `true` (the recommended default), the app gets private
+    /// `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `XDG_CACHE_HOME` under the
+    /// session runtime dir, so they vanish with the session. Without this,
+    /// an app that persists state via `g_get_user_state_dir()` /
+    /// `user_data_dir()` writes to the host's real `~/.local/state` /
+    /// `~/.local/share` — polluting the developer's environment and letting
+    /// one session's saved state (e.g. a restored-window session file) leak
+    /// into every later session.
+    ///
+    /// Set `false` only for the rare flows that genuinely need the host's
+    /// persisted app state (e.g. testing against a real profile). `HOME`
+    /// itself is never touched (fontconfig and friends need it); use
+    /// [`extra_env`](Self::extra_env) to override it when an app reads
+    /// `$HOME` directly.
+    pub xdg_isolated: bool,
+
+    /// Extra environment variables for the spawned app, applied **last** —
+    /// after the session's own env (Wayland display, D-Bus address, XDG
+    /// dirs), so entries here override anything the session set. Lets a
+    /// harness customize the app environment without process-global
+    /// `std::env::set_var` (which is unsound with concurrent sessions and
+    /// leaks into everything else the harness spawns).
+    pub extra_env: Vec<(String, String)>,
 }
 
 /// Which colour-distance metric the visual locator uses when
@@ -1373,6 +1397,19 @@ fn get_host_session_bus_inner(env_addr: Option<&str>) -> String {
     format!("unix:path=/run/user/{}/bus", uid)
 }
 
+/// The per-session XDG base-dir overrides applied under
+/// [`SessionConfig::gsettings_isolated`]: state, data, and cache homes,
+/// each a subdirectory of the session runtime dir so they vanish with the
+/// session. Config home is handled separately (it carries the GSettings
+/// keyfile — see [`crate::gsettings::config_dir`]).
+fn isolated_xdg_env(runtime_dir: &Path) -> [(&'static str, PathBuf); 3] {
+    [
+        ("XDG_STATE_HOME", runtime_dir.join("xdg-state")),
+        ("XDG_DATA_HOME", runtime_dir.join("xdg-data")),
+        ("XDG_CACHE_HOME", runtime_dir.join("xdg-cache")),
+    ]
+}
+
 fn spawn_app(
     cfg: &SessionConfig,
     wayland_display: &str,
@@ -1407,6 +1444,21 @@ fn spawn_app(
         let _ = std::fs::create_dir_all(&config_dir);
         cmd.env("XDG_CONFIG_HOME", &config_dir)
             .env("GSETTINGS_BACKEND", crate::gsettings::KEYFILE_BACKEND);
+    }
+    if cfg.xdg_isolated {
+        // Private state/data/cache base dirs. Config-only isolation lets
+        // app state (g_get_user_state_dir() / user_data_dir()) escape to
+        // the host's ~/.local/{state,share} — both polluting the host and
+        // letting one session's persisted state (e.g. a saved-session
+        // file) poison every later session.
+        for (key, dir) in isolated_xdg_env(runtime_dir) {
+            let _ = std::fs::create_dir_all(&dir);
+            cmd.env(key, &dir);
+        }
+    }
+    // Caller-supplied env last, so it can override anything above.
+    for (key, value) in &cfg.extra_env {
+        cmd.env(key, value);
     }
     if let Some(dir) = &cfg.cwd {
         cmd.current_dir(dir);
@@ -2447,5 +2499,25 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "cancel should wake the wait promptly; elapsed = {elapsed:?}"
         );
+    }
+
+    /// The XDG sandbox dirs must all live under the session runtime dir
+    /// (so they vanish with the session) and be distinct from each other —
+    /// state escaping to a shared path is exactly the cross-session
+    /// poisoning this isolation exists to prevent.
+    #[test]
+    fn isolated_xdg_env_dirs_are_private_and_distinct() {
+        let runtime = Path::new("/tmp/wd-session-test");
+        let dirs = isolated_xdg_env(runtime);
+        let keys: Vec<&str> = dirs.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]);
+        let mut paths = std::collections::HashSet::new();
+        for (key, path) in &dirs {
+            assert!(
+                path.starts_with(runtime),
+                "{key} must live under the runtime dir, got {path:?}"
+            );
+            assert!(paths.insert(path.clone()), "{key} collides: {path:?}");
+        }
     }
 }

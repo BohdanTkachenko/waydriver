@@ -38,6 +38,18 @@ pub struct Cli {
         env = "WAYDRIVER_GSETTINGS_ISOLATION"
     )]
     pub gsettings_isolation: bool,
+    /// Default XDG base-dir isolation for sessions that don't override it via
+    /// start_session's `isolate_xdg` parameter. When on (default), the app
+    /// gets private XDG state/data/cache dirs under the session runtime dir,
+    /// so persisted app state can't leak to the host or poison later
+    /// sessions. Turn off to run apps against the host's real state dirs.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        env = "WAYDRIVER_XDG_ISOLATION"
+    )]
+    pub xdg_isolation: bool,
     /// Record a continuous WebM video of each session by default. When on,
     /// each session writes `{report_dir}/{session_id}/{session_id}.webm`
     /// alongside its screenshots and events. Per-session override via
@@ -86,6 +98,12 @@ pub fn resolve_scale(default: f64, override_: Option<f64>) -> f64 {
 /// Resolve the effective GSettings-isolation flag for a new session:
 /// per-session override if provided, else the server's default.
 pub fn resolve_gsettings_isolation(default: bool, override_: Option<bool>) -> bool {
+    override_.unwrap_or(default)
+}
+
+/// Resolve the effective XDG base-dir isolation flag for a new session:
+/// per-session override if provided, else the server's default.
+pub fn resolve_xdg_isolation(default: bool, override_: Option<bool>) -> bool {
     override_.unwrap_or(default)
 }
 
@@ -167,6 +185,30 @@ mod tests {
     fn resolve_gsettings_isolation_uses_override_when_provided() {
         assert!(!resolve_gsettings_isolation(true, Some(false)));
         assert!(resolve_gsettings_isolation(false, Some(true)));
+    }
+
+    #[test]
+    fn resolve_xdg_isolation_defaults_to_server_default() {
+        assert!(resolve_xdg_isolation(true, None));
+        assert!(!resolve_xdg_isolation(false, None));
+    }
+
+    #[test]
+    fn resolve_xdg_isolation_uses_override_when_provided() {
+        assert!(!resolve_xdg_isolation(true, Some(false)));
+        assert!(resolve_xdg_isolation(false, Some(true)));
+    }
+
+    #[test]
+    fn cli_xdg_isolation_defaults_to_true() {
+        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
+        assert!(cli.xdg_isolation);
+    }
+
+    #[test]
+    fn cli_xdg_isolation_can_be_disabled() {
+        let cli = Cli::try_parse_from(["waydriver-mcp", "--xdg-isolation", "false"]).unwrap();
+        assert!(!cli.xdg_isolation);
     }
 
     #[test]

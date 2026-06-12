@@ -29,6 +29,7 @@ use waydriver_input_mutter::MutterInput;
 
 use crate::cli::{
     resolve_gsettings_isolation, resolve_report_dir, resolve_resolution, resolve_scale,
+    resolve_xdg_isolation,
 };
 use crate::mcp_error::waydriver_to_mcp;
 use crate::params::{SessionIdParams, StartSessionParams};
@@ -126,6 +127,7 @@ impl UiTestServer {
         let scale = resolve_scale(self.default_scale, params.scale);
         let isolate_settings =
             resolve_gsettings_isolation(self.default_gsettings_isolation, params.isolate_settings);
+        let isolate_xdg = resolve_xdg_isolation(self.default_xdg_isolation, params.isolate_xdg);
         let gsettings = waydriver::GSettingsConfig {
             isolated: isolate_settings,
             initial: params.gsettings.iter().map(|g| g.to_waydriver()).collect(),
@@ -200,6 +202,8 @@ impl UiTestServer {
                     // Must match the mode the compositor was started with —
                     // both read the same per-session keyfile dir.
                     gsettings_isolated: isolate_settings,
+                    xdg_isolated: isolate_xdg,
+                    extra_env: Vec::new(),
                 },
             )
             .await

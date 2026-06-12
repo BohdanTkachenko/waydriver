@@ -71,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
             visual_text_tuning: Default::default(),
             visual_click_tuning: Default::default(),
             gsettings_isolated: true,
+            xdg_isolated: true,
+            extra_env: Vec::new(),
         },
     )
     .await?;

@@ -53,6 +53,13 @@ pub struct StartSessionParams {
     /// `scale-monitor-framebuffer` enabled. When unset, falls back to the
     /// server's `--gsettings-isolation` flag (default true).
     pub isolate_settings: Option<bool>,
+    /// Isolate this session's XDG base dirs: give the app private
+    /// `XDG_STATE_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` under the
+    /// session runtime dir, so persisted app state can't leak to the host
+    /// or poison later sessions. Enabled by default; set `false` only when
+    /// the app genuinely needs the host's persisted state. When unset,
+    /// falls back to the server's `--xdg-isolation` flag (default true).
+    pub isolate_xdg: Option<bool>,
     /// GSettings entries to seed into the isolated keyfile store before launch,
     /// readable by both mutter and the app (e.g. set
     /// `org.gnome.desktop.interface text-scaling-factor` to test font scaling,
@@ -587,6 +594,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params.video_bitrate, Some(5_000_000));
+    }
+
+    #[test]
+    fn start_session_params_isolate_xdg_defaults_to_none() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x" })).unwrap();
+        assert_eq!(params.isolate_xdg, None);
+    }
+
+    #[test]
+    fn start_session_params_isolate_xdg_can_be_disabled() {
+        let params: StartSessionParams =
+            serde_json::from_value(serde_json::json!({ "command": "x", "isolate_xdg": false }))
+                .unwrap();
+        assert_eq!(params.isolate_xdg, Some(false));
     }
 
     #[test]

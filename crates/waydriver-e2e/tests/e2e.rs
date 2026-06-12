@@ -145,6 +145,8 @@ async fn start_fixture_session(section: &str) -> anyhow::Result<(Arc<Session>, A
             visual_text_tuning: Default::default(),
             visual_click_tuning: Default::default(),
             gsettings_isolated: true,
+            xdg_isolated: true,
+            extra_env: Vec::new(),
         },
     )
     .await?;
@@ -223,6 +225,93 @@ async fn fixture_exposes_gtk4_widgets() -> anyhow::Result<()> {
         ],
     )
     .await?;
+    kill(session).await?;
+    Ok(())
+}
+
+/// Live verification of the externally-reported locator/input bugs, each
+/// against its *reported* symptom:
+///
+/// 1. waits raced an element into existence and errored `ElementNotFound`
+///    instead of waiting — now `wait_for_present` started *before* the widget
+///    exists must resolve once it appears, and a never-appearing selector must
+///    wait out its budget and surface `Timeout` (not `ElementNotFound`).
+/// 2. `press_chord("Ctrl+comma")` was rejected as an invalid chord — must now
+///    be accepted (GTK accelerator keysym names).
+/// 3. a single-target action on an ambiguous selector gave a bare count — the
+///    error must now name the colliding elements.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn reported_locator_bugs_are_fixed() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // ── BUG 1a: wait_for_present resolves for an element that appears later.
+    // The sample dialog's close button doesn't exist until the dialog opens;
+    // start the wait first, then open.
+    let target = "//Button[@name='dialog-close']";
+    assert_eq!(
+        session.locate(target).count().await?,
+        0,
+        "premise: dialog-close absent before the wait starts"
+    );
+    let waiter = {
+        let s = session.clone();
+        let sel = target.to_string();
+        tokio::spawn(async move { s.locate(&sel).wait_for_present().await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await; // waiter is polling
+    session
+        .locate("//Button[@name='open-dialog']")
+        .click()
+        .await?;
+    waiter.await?.map_err(|e| {
+        anyhow::anyhow!("wait_for_present should resolve once the dialog appears: {e}")
+    })?;
+    eprintln!("BUG1a OK: wait_for_present resolved for a later-appearing dialog");
+
+    // ── BUG 1b: a never-appearing selector waits its budget and times out
+    // with Timeout (not ElementNotFound), naming the selector.
+    let started = std::time::Instant::now();
+    let err = session
+        .locate("//Label[@name='zzqx-never-exists']")
+        .with_timeout(Duration::from_millis(800))
+        .wait_for_present()
+        .await
+        .expect_err("absent element must not resolve");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, waydriver::Error::Timeout(_)),
+        "never-appears must surface Timeout, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("zzqx-never-exists"),
+        "timeout should name the selector: {err}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(700),
+        "must wait the budget out (polled, not failed instantly); took {elapsed:?}"
+    );
+    eprintln!("BUG1b OK: never-appears waited {elapsed:?} then Timeout: {err}");
+
+    // ── BUG 2: GTK accelerator punctuation names round-trip press_chord.
+    session.press_chord("Ctrl+comma").await?;
+    session.press_chord("Ctrl+minus").await?;
+    eprintln!("BUG2 OK: Ctrl+comma / Ctrl+minus accepted and dispatched");
+
+    // ── Minor: ambiguous single-target action names the colliding elements.
+    let err = session
+        .locate("//Label")
+        .click()
+        .await
+        .expect_err("//Label matches many; single-target click must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("matched") && msg.contains("Label"),
+        "ambiguity error should list the colliding elements: {msg}"
+    );
+    eprintln!("MINOR OK: ambiguous error lists matches: {msg}");
+
     kill(session).await?;
     Ok(())
 }
@@ -800,6 +889,101 @@ async fn lazy_a11y_hidden_accessibles_readable_after_focus_walk() -> anyhow::Res
         switch.is_some(),
         "focus_walk should realize the page2 switch into the cache; newly realized: {newly_realized:?}"
     );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// An isolated session must give the app private XDG state/data/cache dirs
+/// under the session runtime dir — not the host's ~/.local/{state,share} —
+/// so persisted app state can't poison later sessions or the host. Reads the
+/// spawned app's real environment from /proc to verify what it actually got.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn isolated_session_gets_private_xdg_dirs() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let out = std::process::Command::new("pgrep")
+        .args(["-fn", "waydriver-fixture-gtk"])
+        .output()?;
+    let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    anyhow::ensure!(!pid.is_empty(), "fixture process not found via pgrep");
+    let environ = std::fs::read(format!("/proc/{pid}/environ"))?;
+    let environ = String::from_utf8_lossy(&environ);
+    let vars: Vec<&str> = environ.split('\0').collect();
+
+    for key in [
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        let val = vars
+            .iter()
+            .find_map(|v| v.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("{key} not set on the spawned app"));
+        assert!(
+            val.contains("wd-session-"),
+            "{key} must point inside the session runtime dir, got {val:?}"
+        );
+        eprintln!("XDG ISOLATION OK: {key}={val}");
+    }
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Probe for reported Bug 8 (keyboard grabs wedge input): open the fixture's
+/// main-menu popover (which takes a GTK grab), then check whether synthesized
+/// Escape dismisses it and whether keyboard input still reaches the app
+/// afterwards. Diagnostic — read the GRAB PROBE lines on stderr.
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn grab_probe_escape_dismisses_popover() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Open the popover (same recipe as fixture_main_menu_opens_auto_waits).
+    session
+        .locate("//ToggleButton[@name='main-menu']")
+        .click()
+        .await?;
+    session.press_keysym(0xffe1).await?; // Shift_L: wake the frame clock
+    session
+        .locate("//Button[@name='main-menu' and @expanded='true']")
+        .wait_for_visible()
+        .await?;
+    eprintln!("GRAB PROBE: popover open (grab active)");
+
+    // Try to dismiss with synthesized Escape — per the report this gets
+    // swallowed and the session wedges.
+    session.press_chord("Escape").await?;
+    session.press_keysym(0xffe1).await?; // wake frame clock again
+    let dismissed = session
+        .locate("//Button[@name='main-menu' and @expanded='false']")
+        .with_timeout(Duration::from_secs(3))
+        .wait_for_present()
+        .await;
+    eprintln!(
+        "GRAB PROBE: Escape dismissed popover = {}",
+        dismissed.is_ok()
+    );
+
+    // Whether or not it dismissed, can keyboard input still reach the app?
+    // Type into the text entry and read it back. (Scoped so the Locator
+    // drops before kill().)
+    {
+        let entry = session.locate("//Text[@name='text-entry']");
+        let typed = match entry.fill("grab-check").await {
+            Ok(()) => entry.text().await.unwrap_or_default(),
+            Err(e) => format!("<fill failed: {e}>"),
+        };
+        eprintln!(
+            "GRAB PROBE: post-popover keyboard works = {} (entry now {typed:?})",
+            typed == "grab-check"
+        );
+    }
 
     kill(session).await?;
     Ok(())
