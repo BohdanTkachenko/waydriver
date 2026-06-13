@@ -1600,14 +1600,19 @@ fn spawn_app(
 /// orphan the app. Mirrors the compositor's protection of its daemon quartet.
 /// The `getppid` check covers the fork/exec parent-death race.
 fn set_pdeathsig(cmd: &mut Command) {
+    // Capture our PID in the parent; the child bails only if its parent is no
+    // longer us (we died and it was reparented). A hard-coded `getppid() == 1`
+    // check is wrong in a container, where the controlling process is often
+    // PID 1 and every legitimately-parented child would be killed at exec.
+    let parent = std::process::id();
     // SAFETY: the closure runs in the forked child before exec and calls only
     // async-signal-safe libc functions (prctl, getppid, _exit).
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::getppid() == 1 {
+            if libc::getppid() != parent as i32 {
                 libc::_exit(0);
             }
             Ok(())

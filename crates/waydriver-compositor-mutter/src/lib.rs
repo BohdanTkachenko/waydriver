@@ -372,43 +372,29 @@ impl MutterCompositor {
         // controlling process would orphan it — and the `at-spi-bus-launcher`
         // it D-Bus-activates, whose stale socket then GUID-mismatches every
         // later run. As our own child, the kernel reaps it on hard-kill.
+        // Pick the bus socket ourselves (under the per-session runtime dir,
+        // alongside the wayland/pipewire sockets) and pass it via `--address`,
+        // rather than parsing the daemon's stdout for `--print-address`: reading
+        // stdout is fragile across distros/containers (an early stderr-only
+        // failure reads back as an empty address), and a chosen path lets us use
+        // the same socket-appears readiness poll as wayland/pipewire.
+        let bus_socket = self.runtime_dir.join("bus");
+        let address = format!("unix:path={}", bus_socket.display());
         let mut dbus_cmd = Command::new("dbus-daemon");
         dbus_cmd
-            .args(["--session", "--print-address", "--nofork", "--nopidfile"])
-            .stdout(Stdio::piped())
+            .args(["--session", "--nofork", "--nopidfile"])
+            .arg(format!("--address={address}"))
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
         set_pdeathsig(&mut dbus_cmd);
-        let mut dbus_daemon = dbus_cmd.spawn().map_err(|source| MutterError::Spawn {
+        let dbus_daemon = dbus_cmd.spawn().map_err(|source| MutterError::Spawn {
             process: "dbus-daemon",
             source,
         })?;
-        // `--print-address` writes the bus address as the first stdout line,
-        // then the daemon runs in the foreground. Read that one line, then drop
-        // the reader — the daemon writes nothing further to stdout.
-        let stdout = dbus_daemon.stdout.take().ok_or_else(|| {
-            MutterError::DbusLaunchFailed("dbus-daemon stdout was not captured".to_string())
-        })?;
-        let mut reader = tokio::io::BufReader::new(stdout);
-        let mut addr_line = String::new();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut addr_line),
-        )
-        .await
-        .map_err(|_| {
-            MutterError::DbusLaunchFailed("timed out reading dbus-daemon address".to_string())
-        })?
-        .map_err(|e| MutterError::DbusLaunchFailed(format!("reading dbus-daemon address: {e}")))?;
-        drop(reader);
-        let address = addr_line.trim().to_string();
-        if address.is_empty() {
-            return Err(MutterError::DbusLaunchFailed(
-                "dbus-daemon printed an empty address".to_string(),
-            ));
-        }
-        self.mutter_dbus_address = address;
         self.dbus_daemon = Some(dbus_daemon);
+        wait_for_dbus_socket(&bus_socket).await?;
+        self.mutter_dbus_address = address;
         tracing::debug!(id = self.id, mutter_dbus_address = %self.mutter_dbus_address, "private D-Bus for mutter");
 
         // Step 2: PipeWire + WirePlumber (for screenshots via ScreenCast).
@@ -743,14 +729,21 @@ impl Drop for MutterCompositor {
 /// kernel level. The `getppid` check covers the race where the parent dies
 /// between fork and exec (the child would otherwise miss the death signal).
 fn set_pdeathsig(cmd: &mut Command) {
+    // Capture our PID now (in the parent). The child compares it against its
+    // own parent after fork: a mismatch means we already died and it was
+    // reparented (to init, or a subreaper), so it should bail. We must NOT
+    // hard-code "getppid() == 1 → orphaned": in a container the controlling
+    // process often *is* PID 1, so every legitimately-parented child sees
+    // getppid() == 1 and would be killed at exec.
+    let parent = std::process::id();
     // SAFETY: the closure runs in the forked child before exec and calls only
     // async-signal-safe libc functions (prctl, getppid, _exit).
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::getppid() == 1 {
+            if libc::getppid() != parent as i32 {
                 libc::_exit(0);
             }
             Ok(())
@@ -927,6 +920,23 @@ async fn wait_for_pipewire_socket(runtime_dir: &str) -> std::result::Result<(), 
     })
 }
 
+/// Poll for the managed `dbus-daemon`'s listen socket to appear before any
+/// client connects to it — the same readiness signal used for the wayland and
+/// pipewire sockets. A timeout means the daemon failed to bind (bad config,
+/// path too long for `AF_UNIX`, missing binary).
+async fn wait_for_dbus_socket(socket: &Path) -> std::result::Result<(), MutterError> {
+    for _ in 0..50 {
+        if socket.exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(MutterError::DbusLaunchFailed(format!(
+        "dbus-daemon socket never appeared at {}",
+        socket.display()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,13 +962,14 @@ mod tests {
             // Helper role: spawn `sleep` protected by PR_SET_PDEATHSIG.
             let mut sleep = StdCommand::new("sleep");
             sleep.arg("300");
+            let parent = std::process::id();
             // SAFETY: only async-signal-safe libc calls before exec.
             unsafe {
-                sleep.pre_exec(|| {
+                sleep.pre_exec(move || {
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    if libc::getppid() == 1 {
+                    if libc::getppid() != parent as i32 {
                         libc::_exit(0);
                     }
                     Ok(())
