@@ -32,3 +32,11 @@ tracing-subscriber.workspace = true
 waydriver = { path = "../waydriver", features = ["test-support"] }
 async-trait.workspace = true
 tempfile.workspace = true
+
+[package.metadata.docs.rs]
+# Document only this crate, not the entire dependency tree. shipyard hosts
+# generated rustdoc per published version and counts it against the storage
+# quota; documenting all deps produced ~683 MB per version. --no-deps keeps it
+# small. (Harmless for public docs.rs, which links to deps rather than rebuilding
+# them.)
+cargo-args = ["--no-deps"]
