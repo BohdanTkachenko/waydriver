@@ -819,8 +819,9 @@ async fn lazy_a11y_focus_realization_experiment() -> anyhow::Result<()> {
         eprintln!("DRIVE  no focus event ever resolved to role=switch — cannot attempt");
     }
 
-    drop(stream);
-    drop(a11y);
+    // `stream` (a `Pin<&mut>` borrowing `a11y`) and `a11y` hold no session
+    // Arc, so they drop naturally at scope end — in reverse declaration order,
+    // i.e. the stream releases its borrow before the connection closes.
     kill(session).await?;
     Ok(())
 }
