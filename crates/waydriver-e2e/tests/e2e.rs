@@ -934,55 +934,152 @@ async fn isolated_session_gets_private_xdg_dirs() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Probe for reported Bug 8 (keyboard grabs wedge input): open the fixture's
-/// main-menu popover (which takes a GTK grab), then check whether synthesized
-/// Escape dismisses it and whether keyboard input still reaches the app
-/// afterwards. Diagnostic — read the GRAB PROBE lines on stderr.
+/// Documented-positive for the reported "unreleasable keyboard grab" bug:
+/// with the fixture's `GtkPopoverMenu` open (GTK grab active), every input
+/// channel works in this stack — synthesized **Escape dismisses** the
+/// popover, **Down+Return navigates into it** and activates an item (the
+/// section switches), and an **outside pointer click dismisses** it; the app
+/// stays responsive throughout. The reported wedge did not reproduce.
+///
+/// Two measurement traps this probe corrects (both produced false "wedged"
+/// readings in earlier versions — likely the same class of error behind the
+/// original report): (1) the snapshot only emits `expanded` when the state is
+/// SET, so "closed" must be detected as the *absence* of `expanded='true'` —
+/// an `@expanded='false'` XPath never matches anything; (2) selector element
+/// names must match snapshot roles (`TextBox`, not `Text`).
+///
+/// What remains true: the popover's menu items are absent from the AT-SPI
+/// tree (`//MenuItem` = 0) — the known lazy-realization gap, now confirmed
+/// for `GtkPopoverMenu` content too — so items can't be activated via AT-SPI
+/// actions; use keyboard navigation (proven here) or OCR.
+/// Diagnostic — read the GRAB lines on stderr.
 #[tokio::test]
 #[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
-async fn grab_probe_escape_dismisses_popover() -> anyhow::Result<()> {
+async fn grab_probe_popover_input_routing() -> anyhow::Result<()> {
     init_tracing();
     let (session, _state) = start_fixture_session("gtk4").await?;
 
-    // Open the popover (same recipe as fixture_main_menu_opens_auto_waits).
+    // Popover open = the menu button currently carries expanded='true'.
+    async fn popover_open(session: &Arc<Session>) -> anyhow::Result<bool> {
+        let _ = session.press_keysym(0xffe1).await; // wake frame clock
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        Ok(session
+            .locate("//Button[@name='main-menu' and @expanded='true']")
+            .count()
+            .await?
+            > 0)
+    }
+    // App liveness: a fresh AT-SPI snapshot succeeds and still contains the
+    // header-bar menu button (present in every section). Proves the app's
+    // main loop + a11y bridge are responsive, independent of seat input and
+    // of which section is currently shown.
+    async fn app_alive(session: &Arc<Session>) -> bool {
+        session
+            .locate("//Button[@name='main-menu']")
+            .count()
+            .await
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+    // Which section is showing (gtk4 has agree-check; a section switch via a
+    // menu item activation removes it).
+    async fn gtk4_section_present(session: &Arc<Session>) -> anyhow::Result<bool> {
+        Ok(session
+            .locate("//Checkbox[@name='agree-check']")
+            .count()
+            .await?
+            > 0)
+    }
+
+    eprintln!(
+        "GRAB step0: baseline alive={} gtk4_section={}",
+        app_alive(&session).await,
+        gtk4_section_present(&session).await?
+    );
+
     session
         .locate("//ToggleButton[@name='main-menu']")
         .click()
         .await?;
-    session.press_keysym(0xffe1).await?; // Shift_L: wake the frame clock
-    session
-        .locate("//Button[@name='main-menu' and @expanded='true']")
-        .wait_for_visible()
-        .await?;
-    eprintln!("GRAB PROBE: popover open (grab active)");
-
-    // Try to dismiss with synthesized Escape — per the report this gets
-    // swallowed and the session wedges.
-    session.press_chord("Escape").await?;
-    session.press_keysym(0xffe1).await?; // wake frame clock again
-    let dismissed = session
-        .locate("//Button[@name='main-menu' and @expanded='false']")
-        .with_timeout(Duration::from_secs(3))
-        .wait_for_present()
-        .await;
     eprintln!(
-        "GRAB PROBE: Escape dismissed popover = {}",
-        dismissed.is_ok()
+        "GRAB step1: after open — open={} alive={} menu_items={}",
+        popover_open(&session).await?,
+        app_alive(&session).await,
+        session.locate("//MenuItem").count().await?
     );
 
-    // Whether or not it dismissed, can keyboard input still reach the app?
-    // Type into the text entry and read it back. (Scoped so the Locator
-    // drops before kill().)
-    {
-        let entry = session.locate("//Text[@name='text-entry']");
+    // Step 2: Escape.
+    session.press_chord("Escape").await?;
+    eprintln!(
+        "GRAB step2: after Escape — open={} alive={} gtk4_section={}",
+        popover_open(&session).await?,
+        app_alive(&session).await,
+        gtk4_section_present(&session).await?
+    );
+
+    // Step 3: reopen if needed, then keyboard navigation Down+Return.
+    if !popover_open(&session).await? {
+        session
+            .locate("//ToggleButton[@name='main-menu']")
+            .click()
+            .await?;
+        eprintln!("GRAB step3a: reopened = {}", popover_open(&session).await?);
+    }
+    session.press_chord("Down").await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    session.press_chord("Return").await?;
+    eprintln!(
+        "GRAB step3: after Down+Return — open={} alive={} gtk4_section={}",
+        popover_open(&session).await?,
+        app_alive(&session).await,
+        gtk4_section_present(&session).await?
+    );
+
+    // Step 4: reopen if needed, then outside pointer click.
+    if !popover_open(&session).await? {
+        session
+            .locate("//ToggleButton[@name='main-menu']")
+            .click()
+            .await?;
+        eprintln!("GRAB step4a: reopened = {}", popover_open(&session).await?);
+    }
+    session.pointer_motion_absolute(500.0, 600.0).await?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    session
+        .pointer_button(waydriver::PointerButton::Left)
+        .await?;
+    eprintln!(
+        "GRAB step4: after outside click — open={} alive={}",
+        popover_open(&session).await?,
+        app_alive(&session).await
+    );
+
+    // Step 5: AT-SPI re-click of the toggle (D-Bus escape hatch).
+    if popover_open(&session).await? {
+        session
+            .locate("//ToggleButton[@name='main-menu']")
+            .click()
+            .await?;
+        eprintln!(
+            "GRAB step5: after AT-SPI toggle re-click — open={} alive={}",
+            popover_open(&session).await?,
+            app_alive(&session).await
+        );
+    }
+
+    // Step 6: final keyboard sanity — fill the entry (gtk4 section only).
+    if gtk4_section_present(&session).await? {
+        let entry = session.locate("//TextBox[@name='text-entry']");
         let typed = match entry.fill("grab-check").await {
             Ok(()) => entry.text().await.unwrap_or_default(),
             Err(e) => format!("<fill failed: {e}>"),
         };
         eprintln!(
-            "GRAB PROBE: post-popover keyboard works = {} (entry now {typed:?})",
+            "GRAB step6: keyboard works after experiments = {} (entry {typed:?})",
             typed == "grab-check"
         );
+    } else {
+        eprintln!("GRAB step6: skipped — section switched away from gtk4 during probe");
     }
 
     kill(session).await?;
