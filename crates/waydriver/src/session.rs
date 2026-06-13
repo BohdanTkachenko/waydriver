@@ -1589,8 +1589,30 @@ fn spawn_app(
     if let Some(dir) = &cfg.cwd {
         cmd.current_dir(dir);
     }
+    set_pdeathsig(&mut cmd);
     cmd.spawn()
         .map_err(|e| Error::process_with(format!("app '{}'", cfg.command), e))
+}
+
+/// Linux parent-death protection: SIGKILL the app the moment the spawning
+/// thread dies, so a hard-killed controlling process (`SIGKILL`, panic=abort,
+/// OOM, CI timeout) — which bypasses `Session::Drop`/`kill_on_drop` — can't
+/// orphan the app. Mirrors the compositor's protection of its daemon quartet.
+/// The `getppid` check covers the fork/exec parent-death race.
+fn set_pdeathsig(cmd: &mut Command) {
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // async-signal-safe libc functions (prctl, getppid, _exit).
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                libc::_exit(0);
+            }
+            Ok(())
+        });
+    }
 }
 
 fn normalize_app_name(name: &str) -> String {

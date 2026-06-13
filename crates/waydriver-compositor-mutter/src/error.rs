@@ -31,17 +31,9 @@ use thiserror::Error;
 /// stringly-typed value.
 #[derive(Debug, Error)]
 pub(crate) enum MutterError {
-    #[error("dbus-launch failed: {0}")]
+    /// The managed `dbus-daemon` failed to start or to report its bus address.
+    #[error("dbus-daemon startup failed: {0}")]
     DbusLaunchFailed(String),
-
-    /// `parse_dbus_address` / `parse_dbus_pid` couldn't find their key
-    /// in the `dbus-launch --sh-syntax` output. `field` names the key
-    /// (e.g. `"DBUS_SESSION_BUS_ADDRESS"`).
-    #[error("could not parse {field} from dbus-launch output")]
-    DbusOutputMissingField { field: &'static str },
-
-    #[error("invalid dbus PID in dbus-launch output")]
-    DbusPidParse(#[source] std::num::ParseIntError),
 
     #[error("invalid mutter D-Bus address {addr:?}")]
     DbusAddressInvalid {

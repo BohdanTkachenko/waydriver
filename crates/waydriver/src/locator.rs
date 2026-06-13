@@ -492,14 +492,55 @@ impl Locator {
                     cx = screen.center_x(), cy = screen.center_y(),
                     "click: AT-SPI Action not supported; falling back to pointer click"
                 );
+                // Use the cold-start warmup recipe (approach motion + settle,
+                // then a separate press/release) rather than a bare motion +
+                // atomic click: on a fresh session the first synthesized click
+                // is dropped without the warmup, so a single `click()` on an
+                // Action-less widget (e.g. an `AdwActionRow`, which has no
+                // AT-SPI Action) would silently miss.
                 self.session
-                    .pointer_motion_absolute(screen.center_x() as f64, screen.center_y() as f64)
-                    .await?;
-                self.session
-                    .pointer_button(crate::backend::PointerButton::Left)
+                    .cold_start_click(
+                        screen.center_x() as f64,
+                        screen.center_y() as f64,
+                        crate::backend::PointerButton::Left,
+                    )
                     .await?;
                 Ok(())
             }
+        }
+    }
+
+    /// Activate this element through the AT-SPI `Action` interface
+    /// (`do_action(0)`, the widget's default action) — and **only** that.
+    ///
+    /// Unlike [`click`](Self::click), this never falls back to a synthetic
+    /// pointer click, which makes it the right tool for **activatable rows**
+    /// (`AdwActionRow`, `GtkListBoxRow`): a pixel click on a row tends to land
+    /// on a child — the title `Label` overlapping the row, a prefix/suffix
+    /// widget — so `connect_activated` / `row-activated` never fires, whereas
+    /// `do_action` triggers the row's default action directly. Auto-waits for
+    /// actionability; errors (rather than silently missing) if the element
+    /// doesn't expose an Action.
+    ///
+    /// **Selector tip:** a row's title usually produces *two* accessibles with
+    /// the same name — the row (`ListItem`) and its title `Label`. A bare
+    /// `//*[@name='…']` is ambiguous and a visual `find_by_text(title)` resolves
+    /// to the label; scope to the row (`//ListItem[@name='…']`) so this targets
+    /// the activatable node.
+    pub async fn activate(&self) -> Result<()> {
+        let info = self.wait_for_actionable().await?;
+        let (bus, path) = info.ref_.clone();
+        let a11y = self.a11y()?;
+        match atspi_client::try_do_action_on(a11y, &self.xpath, &bus, &path).await? {
+            atspi_client::ActionOutcome::Performed => Ok(()),
+            atspi_client::ActionOutcome::Refused => Err(Error::atspi(format!(
+                "activate: do_action(0) returned false on {bus}{path} — element declined activation"
+            ))),
+            atspi_client::ActionOutcome::NotSupported => Err(Error::atspi(format!(
+                "activate: {} does not expose the AT-SPI Action interface — \
+                 use click() (which falls back to a pointer click) or pointer_click(...)",
+                self.xpath
+            ))),
         }
     }
 
@@ -604,11 +645,14 @@ impl Locator {
                     cx = screen.center_x(), cy = screen.center_y(),
                     "fill: Component::grab_focus not supported; falling back to pointer click"
                 );
+                // Cold-start warmup recipe (see `click`'s fallback) so the
+                // focus-establishing click isn't dropped on a fresh session.
                 self.session
-                    .pointer_motion_absolute(screen.center_x() as f64, screen.center_y() as f64)
-                    .await?;
-                self.session
-                    .pointer_button(crate::backend::PointerButton::Left)
+                    .cold_start_click(
+                        screen.center_x() as f64,
+                        screen.center_y() as f64,
+                        crate::backend::PointerButton::Left,
+                    )
                     .await?;
             }
         }

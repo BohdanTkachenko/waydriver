@@ -292,6 +292,24 @@ fn role_to_element_name(role: &str) -> Option<String> {
     Some(out)
 }
 
+/// Resolve a raw AT-SPI cache role *index* into a display role string,
+/// tolerating indices the bundled `atspi` crate's `Role` enum doesn't know.
+///
+/// atspi 0.29 only covers indices 0..=129; newer at-spi2 cores expose higher
+/// ones (e.g. 130 = `ATSPI_ROLE_SWITCH`). Rather than let the strict enum
+/// reject the whole `Cache.GetItems` reply, [`cache_items`] reads the role as a
+/// `u32` and calls this: known indices map through [`role_to_element_name`],
+/// unknown ones become a stable `unknown-role-<n>` label so the item survives.
+fn cache_role_name(role_idx: u32) -> String {
+    match atspi::Role::try_from(role_idx) {
+        Ok(r) => {
+            let n = r.name();
+            role_to_element_name(n).unwrap_or_else(|| n.to_string())
+        }
+        Err(_) => format!("unknown-role-{role_idx}"),
+    }
+}
+
 /// Sanitize an AT-SPI attribute key into a valid XML attribute name.
 /// Returns `None` if the key would produce an empty or reserved name.
 fn sanitize_attr_key(key: &str) -> Option<String> {
@@ -961,46 +979,72 @@ pub struct CachedAccessible {
 /// conventions. The cache reflects realized contexts, not tree
 /// membership — see [`CachedAccessible`].
 pub async fn cache_items(conn: &zbus::Connection, app_bus: &str) -> Result<Vec<CachedAccessible>> {
-    let proxy = atspi::proxy::cache::CacheProxy::builder(conn)
-        .destination(app_bus.to_string())
-        .map_err(|e| Error::atspi_with("cache proxy destination", e))?
-        .path("/org/a11y/atspi/cache")
-        .map_err(|e| Error::atspi_with("cache proxy path", e))?
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await
-        .map_err(|e| Error::atspi_with("cache proxy build", e))?;
-    let items = proxy
-        .get_items()
+    // Deserialize the `Cache.GetItems` reply into a *tolerant* shape: the role
+    // is read as a raw `u32` rather than the `atspi` crate's `Role` enum.
+    //
+    // atspi 0.29's `Role` enum (via `CacheItem`) only covers indices 0..=129
+    // and its derived serde impl rejects the **entire** reply on the first
+    // index it doesn't recognise — observed with role 130, which libadwaita's
+    // newer AdwPreferences rows (AdwSpinRow/AdwComboRow/AdwExpanderRow) expose.
+    // One unknown role must not blank the whole cache read, so we bypass the
+    // strict enum at the wire boundary and convert per-item below.
+    //
+    // The tuple matches `atspi_common::CacheItem` field-for-field —
+    // signature `a((so)(so)(so)iiassusau)` — except `role: u32`.
+    type RawCacheItem = (
+        atspi::ObjectRefOwned, // object   (so)
+        atspi::ObjectRefOwned, // app      (so)
+        atspi::ObjectRefOwned, // parent   (so)
+        i32,                   // index in parent  i
+        i32,                   // child count      i
+        atspi::InterfaceSet,   // interfaces       as
+        String,                // short name       s
+        u32,                   // role (tolerant)  u
+        String,                // name             s
+        atspi::StateSet,       // states           au
+    );
+
+    let proxy = zbus::Proxy::new(
+        conn,
+        app_bus.to_string(),
+        "/org/a11y/atspi/cache",
+        "org.a11y.atspi.Cache",
+    )
+    .await
+    .map_err(|e| Error::atspi_with("cache proxy build", e))?;
+
+    let items: Vec<RawCacheItem> = proxy
+        .call("GetItems", &())
         .await
         .map_err(|e| Error::atspi_with("Cache.GetItems", e))?;
 
     Ok(items
         .into_iter()
-        .map(|item| {
-            let raw_role = item.role.name();
-            let role = role_to_element_name(raw_role).unwrap_or_else(|| raw_role.to_string());
-            let states = EMITTED_STATES
-                .iter()
-                .filter(|(state, _)| item.states.contains(*state))
-                .map(|(_, attr)| (*attr).to_string())
-                .collect();
-            let parent_path = match item.parent.path_as_str() {
-                "/org/a11y/atspi/null" | "" => None,
-                p => Some(p.to_string()),
-            };
-            CachedAccessible {
-                ref_: (
-                    item.object.name_as_str().unwrap_or(app_bus).to_string(),
-                    item.object.path_as_str().to_string(),
-                ),
-                role,
-                name: (!item.name.is_empty()).then(|| item.name.clone()),
-                states,
-                parent_path,
-                child_count: item.children,
-            }
-        })
+        .map(
+            |(object, _app, parent, _index, children, _ifaces, _short, role_idx, name, states)| {
+                let role = cache_role_name(role_idx);
+                let emitted_states = EMITTED_STATES
+                    .iter()
+                    .filter(|(state, _)| states.contains(*state))
+                    .map(|(_, attr)| (*attr).to_string())
+                    .collect();
+                let parent_path = match parent.path_as_str() {
+                    "/org/a11y/atspi/null" | "" => None,
+                    p => Some(p.to_string()),
+                };
+                CachedAccessible {
+                    ref_: (
+                        object.name_as_str().unwrap_or(app_bus).to_string(),
+                        object.path_as_str().to_string(),
+                    ),
+                    role,
+                    name: (!name.is_empty()).then_some(name),
+                    states: emitted_states,
+                    parent_path,
+                    child_count: children,
+                }
+            },
+        )
         .collect())
 }
 
@@ -1229,6 +1273,22 @@ pub async fn read_text_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_role_name_unknown_index_is_labelled_not_rejected() {
+        // The reporter's exact case: atspi 0.29's Role enum stops at 129, so a
+        // newer at-spi2 core's role 130 (`ATSPI_ROLE_SWITCH`) must round-trip
+        // as a stable label instead of blanking the whole Cache.GetItems reply.
+        assert_eq!(cache_role_name(130), "unknown-role-130");
+        assert_eq!(cache_role_name(9999), "unknown-role-9999");
+    }
+
+    #[test]
+    fn cache_role_name_known_index_resolves_through_element_table() {
+        let frame = cache_role_name(atspi::Role::Frame as u32);
+        assert_eq!(frame, "Frame");
+        assert!(!frame.starts_with("unknown-role-"));
+    }
 
     #[test]
     fn role_to_element_name_basic() {

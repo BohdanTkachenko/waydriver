@@ -826,6 +826,199 @@ async fn lazy_a11y_focus_realization_experiment() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// OPEN 1 regression: `Cache.GetItems` must tolerate AT-SPI role indices the
+/// `atspi` crate's `Role` enum doesn't know (e.g. role 130 from libadwaita's
+/// newer AdwPreferences rows). Before the fix the strict enum rejected the
+/// *whole* reply, so `cached_accessibles` returned `Err` and blanked everything
+/// — not just the one unknown row. The `adw` fixture has `ComboRow`/`SwitchRow`/
+/// `ActionRow`/`EntryRow`/`ButtonRow` realized at construction, which is what
+/// surfaces the high role index.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn cache_items_tolerate_unknown_role_index() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    // Realize the interactive row children (the GtkSwitch inside an
+    // AdwSwitchRow is `ATSPI_ROLE_SWITCH` = index 130, which atspi 0.29's enum
+    // lacks). They aren't cached until focused, mirroring the reporter's
+    // focus_walk-then-read repro.
+    session.focus_walk(15).await?;
+
+    // The core regression: the call must succeed (and return the cache) rather
+    // than erroring out on the first unrecognised role index.
+    let items = session.cached_accessibles().await?;
+    assert!(
+        !items.is_empty(),
+        "cached_accessibles returned no items — the cache read was blanked"
+    );
+
+    // Informational: surface which roles the atspi enum didn't know but we kept
+    // as `unknown-role-N` instead of failing the parse.
+    let unknown: Vec<&str> = items
+        .iter()
+        .filter(|c| c.role.starts_with("unknown-role-"))
+        .map(|c| c.role.as_str())
+        .collect();
+    eprintln!(
+        "cached {} items; {} with unknown role index: {:?}",
+        items.len(),
+        unknown.len(),
+        unknown
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// OPEN 2 regression (two parts):
+///   1. `Locator::activate()` drives the AT-SPI `Action` interface — verified on
+///      a `GtkButton`, which exposes it (the class of widget the reporter's
+///      *working* cases use: buttons, links, cards).
+///   2. An activatable `AdwActionRow` — which exposes **no** AT-SPI Action — is
+///      activated by a pixel `click()` scoped to the row (`//ListItem`), the
+///      path the Bug 7 fix made land correctly. (`find_by_text(title)`/a bare
+///      `//*[@name]` resolve to the row's same-named title `Label` instead, the
+///      reporter's likely miss.)
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn activate_drives_action_and_rows_activate_via_click() -> anyhow::Result<()> {
+    init_tracing();
+
+    // Part 1: activate() on an Action-exposing GtkButton.
+    {
+        let (session, _state) = start_fixture_session("gtk4").await?;
+        let cursor = session.stdout_cursor();
+        session
+            .locate("//Button[@name='primary-button']")
+            .activate()
+            .await?;
+        session
+            .wait_for_stdout_line(
+                cursor,
+                |l| l.contains("clicked primary-button"),
+                Duration::from_secs(3),
+            )
+            .await?;
+        kill(session).await?;
+    }
+
+    // Part 2: AdwActionRow activated via click() on the row (ListItem).
+    {
+        let (session, _state) = start_fixture_session("adw").await?;
+        let cursor = session.stdout_cursor();
+        session
+            .locate("//ListItem[@name='adw-action-row']")
+            .click()
+            .await?;
+        let line = session
+            .wait_for_stdout_line(
+                cursor,
+                |l| l.contains("activated adw-action-row"),
+                Duration::from_secs(3),
+            )
+            .await?;
+        assert!(
+            line.contains("activated adw-action-row"),
+            "click() on the row should fire connect_activated, got: {line}"
+        );
+        kill(session).await?;
+    }
+
+    Ok(())
+}
+
+/// OPEN 2 probe: which path activates an activatable `AdwActionRow`? Compares a
+/// screen-space `pointer_click` (pixel) against the AT-SPI `click()`
+/// (`Action.do_action` path) — the fixture's `adw-action-row` emits
+/// `activated adw-action-row` on `connect_activated`. **Finding:** when scoped
+/// to the row (`//ListItem[...]`) *both* fire; the reporter's failure was a
+/// selector/OCR resolving to the title `Label` child (same name, on top), where
+/// a pixel click doesn't activate the row. `activate()` (AT-SPI do_action) is
+/// the deterministic path. Diagnostic — read the ACT lines on stderr.
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn adw_action_row_activation_probe() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    // A) pixel pointer_click at the row's screen centre.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//ListItem[@name='adw-action-row']")
+        .pointer_click(waydriver::PointerButton::Left)
+        .await?;
+    let pix = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("activated adw-action-row"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!("ACT pointer_click fired activation = {}", pix.is_ok());
+
+    // B) AT-SPI click() on the ROW (tries do_action(0), then pixel fallback).
+    let cursor = session.stdout_cursor();
+    let click_res = session
+        .locate("//ListItem[@name='adw-action-row']")
+        .click()
+        .await;
+    let act = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("activated adw-action-row"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!(
+        "ACT row click() result={:?} fired activation = {}",
+        click_res.map(|_| "ok"),
+        act.is_ok()
+    );
+
+    // C) pixel pointer_click on the title LABEL child (what find_by_text(title)
+    // targets) — does clicking the label activate the enclosing row?
+    let cursor = session.stdout_cursor();
+    let lbl = session
+        .locate("//Label[@name='adw-action-row']")
+        .pointer_click(waydriver::PointerButton::Left)
+        .await;
+    let lbl_act = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("activated adw-action-row"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!(
+        "ACT label pointer_click result={:?} fired activation = {}",
+        lbl.map(|_| "ok"),
+        lbl_act.is_ok()
+    );
+
+    // D) does the row expose AT-SPI Action at all? (activate() path)
+    let cursor = session.stdout_cursor();
+    let act_res = session
+        .locate("//ListItem[@name='adw-action-row']")
+        .activate()
+        .await;
+    let act_fired = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("activated adw-action-row"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!(
+        "ACT activate() result={:?} fired activation = {}",
+        act_res.as_ref().map(|_| "ok").map_err(|e| e.to_string()),
+        act_fired.is_ok()
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
 /// The supported read-path for lazily-realized widgets: `focus_walk` to
 /// force-realize them, then `hidden_accessibles` to discover/inspect them via
 /// the app's AT-SPI cache (the `GetChildren` tree never repairs — see
@@ -1198,7 +1391,7 @@ async fn middle_click_probe_adw_tab_bar() -> anyhow::Result<()> {
     // ActionRow and confirm its activation event. Proves pointer clicks
     // land in this section before measuring the middle button.
     let row = session
-        .locate("//*[@name='adw-action-row']")
+        .locate("//ListItem[@name='adw-action-row']")
         .first()
         .bounds()
         .await?;

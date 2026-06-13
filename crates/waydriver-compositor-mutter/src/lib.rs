@@ -176,7 +176,13 @@ pub struct MutterCompositor {
     wayland_display: String,
     runtime_dir: PathBuf,
     mutter_dbus_address: String,
-    mutter_dbus_pid: Option<u32>,
+    /// The private session bus, run as a *managed* `dbus-daemon` child (rather
+    /// than `dbus-launch`, which daemonizes it out of our process tree). Kept
+    /// alive for the compositor's lifetime; killed on `stop()`/`Drop` and —
+    /// via [`set_pdeathsig`] — reaped by the kernel if the controlling process
+    /// is hard-killed, taking the D-Bus-activated `at-spi-bus-launcher` down
+    /// with it instead of orphaning a stale a11y bus.
+    dbus_daemon: Option<Child>,
     mutter: Option<Child>,
     pipewire: Option<Child>,
     wireplumber: Option<Child>,
@@ -238,7 +244,7 @@ impl MutterCompositor {
             wayland_display,
             runtime_dir,
             mutter_dbus_address: String::new(),
-            mutter_dbus_pid: None,
+            dbus_daemon: None,
             mutter: None,
             pipewire: None,
             wireplumber: None,
@@ -359,19 +365,50 @@ impl MutterCompositor {
             Vec::new()
         };
 
-        // Step 1: Private D-Bus for mutter (so its ScreenCast API doesn't conflict with host).
-        let dbus_output = Command::new("dbus-launch")
-            .arg("--sh-syntax")
-            .output()
-            .await?;
-        if !dbus_output.status.success() {
+        // Step 1: Private D-Bus for mutter (so its ScreenCast API doesn't
+        // conflict with host). Run `dbus-daemon` directly as a managed,
+        // PDEATHSIG-protected child instead of `dbus-launch`: dbus-launch
+        // daemonizes the bus out of our process tree, so a hard-killed
+        // controlling process would orphan it — and the `at-spi-bus-launcher`
+        // it D-Bus-activates, whose stale socket then GUID-mismatches every
+        // later run. As our own child, the kernel reaps it on hard-kill.
+        let mut dbus_cmd = Command::new("dbus-daemon");
+        dbus_cmd
+            .args(["--session", "--print-address", "--nofork", "--nopidfile"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        set_pdeathsig(&mut dbus_cmd);
+        let mut dbus_daemon = dbus_cmd.spawn().map_err(|source| MutterError::Spawn {
+            process: "dbus-daemon",
+            source,
+        })?;
+        // `--print-address` writes the bus address as the first stdout line,
+        // then the daemon runs in the foreground. Read that one line, then drop
+        // the reader — the daemon writes nothing further to stdout.
+        let stdout = dbus_daemon.stdout.take().ok_or_else(|| {
+            MutterError::DbusLaunchFailed("dbus-daemon stdout was not captured".to_string())
+        })?;
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut addr_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut addr_line),
+        )
+        .await
+        .map_err(|_| {
+            MutterError::DbusLaunchFailed("timed out reading dbus-daemon address".to_string())
+        })?
+        .map_err(|e| MutterError::DbusLaunchFailed(format!("reading dbus-daemon address: {e}")))?;
+        drop(reader);
+        let address = addr_line.trim().to_string();
+        if address.is_empty() {
             return Err(MutterError::DbusLaunchFailed(
-                String::from_utf8_lossy(&dbus_output.stderr).into_owned(),
+                "dbus-daemon printed an empty address".to_string(),
             ));
         }
-        let dbus_stdout = String::from_utf8_lossy(&dbus_output.stdout);
-        self.mutter_dbus_address = parse_dbus_address(&dbus_stdout)?;
-        self.mutter_dbus_pid = Some(parse_dbus_pid(&dbus_stdout)?);
+        self.mutter_dbus_address = address;
+        self.dbus_daemon = Some(dbus_daemon);
         tracing::debug!(id = self.id, mutter_dbus_address = %self.mutter_dbus_address, "private D-Bus for mutter");
 
         // Step 2: PipeWire + WirePlumber (for screenshots via ScreenCast).
@@ -388,17 +425,18 @@ impl MutterCompositor {
         // explicit `XDG_RUNTIME_DIR` override below isn't enough.
         // Symptom: `ScreenCast.Start` fails with "Couldn't connect
         // pipewire context" on every session after the first.
-        let pipewire = Command::new("pipewire")
+        let mut pipewire_cmd = Command::new("pipewire");
+        pipewire_cmd
             .env_remove("PIPEWIRE_REMOTE")
             .env("DBUS_SESSION_BUS_ADDRESS", &self.mutter_dbus_address)
             .env("XDG_RUNTIME_DIR", &runtime_str)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|source| MutterError::Spawn {
-                process: "pipewire",
-                source,
-            })?;
+            .stderr(Stdio::null());
+        set_pdeathsig(&mut pipewire_cmd);
+        let pipewire = pipewire_cmd.spawn().map_err(|source| MutterError::Spawn {
+            process: "pipewire",
+            source,
+        })?;
         self.pipewire = Some(pipewire);
 
         // Wait for pipewire's socket to appear before launching
@@ -409,12 +447,15 @@ impl MutterCompositor {
         // just as expensive to probe.
         wait_for_pipewire_socket(&runtime_str).await?;
 
-        let wireplumber = Command::new("wireplumber")
+        let mut wireplumber_cmd = Command::new("wireplumber");
+        wireplumber_cmd
             .env_remove("PIPEWIRE_REMOTE")
             .env("DBUS_SESSION_BUS_ADDRESS", &self.mutter_dbus_address)
             .env("XDG_RUNTIME_DIR", &runtime_str)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        set_pdeathsig(&mut wireplumber_cmd);
+        let wireplumber = wireplumber_cmd
             .spawn()
             .map_err(|source| MutterError::Spawn {
                 process: "wireplumber",
@@ -434,7 +475,8 @@ impl MutterCompositor {
         tracing::debug!(id = self.id, "PipeWire + WirePlumber started");
 
         // Step 3: mutter in headless Wayland mode (on its private D-Bus).
-        let mutter = Command::new("mutter")
+        let mut mutter_cmd = Command::new("mutter");
+        mutter_cmd
             .args([
                 "--headless",
                 "--wayland",
@@ -451,12 +493,12 @@ impl MutterCompositor {
             // per-session keyfile GSettings store written above.
             .envs(config_env.iter().map(|(k, v)| (*k, v.as_str())))
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|source| MutterError::Spawn {
-                process: "mutter",
-                source,
-            })?;
+            .stderr(Stdio::inherit());
+        set_pdeathsig(&mut mutter_cmd);
+        let mutter = mutter_cmd.spawn().map_err(|source| MutterError::Spawn {
+            process: "mutter",
+            source,
+        })?;
         self.mutter = Some(mutter);
         tracing::debug!(id = self.id, wayland_display = %self.wayland_display, "mutter spawned");
 
@@ -639,10 +681,11 @@ impl CompositorRuntime for MutterCompositor {
             let _ = pipewire.wait().await;
         }
 
-        if let Some(pid) = self.mutter_dbus_pid.take() {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
+        // Kill the private bus last: its death drops the a11y bus connection,
+        // so the D-Bus-activated `at-spi-bus-launcher` exits with it.
+        if let Some(mut dbus) = self.dbus_daemon.take() {
+            let _ = dbus.kill().await;
+            let _ = dbus.wait().await;
         }
 
         let _ = tokio::fs::remove_dir_all(&self.runtime_dir).await;
@@ -679,10 +722,8 @@ impl Drop for MutterCompositor {
         if let Some(ref mut child) = self.pipewire {
             let _ = child.start_kill();
         }
-        if let Some(pid) = self.mutter_dbus_pid {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
+        if let Some(ref mut child) = self.dbus_daemon {
+            let _ = child.start_kill();
         }
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
     }
@@ -690,29 +731,31 @@ impl Drop for MutterCompositor {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn parse_dbus_address(output: &str) -> std::result::Result<String, MutterError> {
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("DBUS_SESSION_BUS_ADDRESS='") {
-            if let Some(addr) = rest.strip_suffix("';") {
-                return Ok(addr.to_string());
+/// Linux parent-death protection for a spawned session daemon: ask the kernel
+/// to `SIGKILL` the child the instant the spawning thread dies.
+///
+/// Drop/`stop()`-based teardown can't run when the *controlling* process is
+/// itself hard-killed (`SIGKILL`, `panic = "abort"`, OOM, a CI/test-runner
+/// timeout). Without this, such a death orphans the whole session quartet —
+/// `dbus-daemon`, `pipewire`, `wireplumber`, `mutter` — and, worst of all, the
+/// D-Bus-activated `at-spi-bus-launcher`, whose stale a11y-bus socket then
+/// GUID-mismatches every later run. `PR_SET_PDEATHSIG` closes that hole at the
+/// kernel level. The `getppid` check covers the race where the parent dies
+/// between fork and exec (the child would otherwise miss the death signal).
+fn set_pdeathsig(cmd: &mut Command) {
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // async-signal-safe libc functions (prctl, getppid, _exit).
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                return Err(std::io::Error::last_os_error());
             }
-        }
+            if libc::getppid() == 1 {
+                libc::_exit(0);
+            }
+            Ok(())
+        });
     }
-    Err(MutterError::DbusOutputMissingField {
-        field: "DBUS_SESSION_BUS_ADDRESS",
-    })
-}
-
-fn parse_dbus_pid(output: &str) -> std::result::Result<u32, MutterError> {
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("DBUS_SESSION_BUS_PID=") {
-            let pid_str = rest.trim_end_matches(';').trim();
-            return pid_str.parse().map_err(MutterError::DbusPidParse);
-        }
-    }
-    Err(MutterError::DbusOutputMissingField {
-        field: "DBUS_SESSION_BUS_PID",
-    })
 }
 
 fn parse_resolution(s: &str) -> std::result::Result<(u32, u32), MutterError> {
@@ -888,6 +931,108 @@ async fn wait_for_pipewire_socket(runtime_dir: &str) -> std::result::Result<(), 
 mod tests {
     use super::*;
 
+    /// Proves [`set_pdeathsig`]'s mechanism: a child spawned with
+    /// `PR_SET_PDEATHSIG = SIGKILL` is reaped by the kernel when its parent is
+    /// hard-killed (bypassing all Drop/teardown) — the exact protection that
+    /// stops a SIGKILL'd run from orphaning the session daemons + the
+    /// `at-spi-bus-launcher`.
+    ///
+    /// Re-execs the test binary as a *helper*: the helper spawns `sleep 300`
+    /// with the same `pre_exec` as `set_pdeathsig`, writes its PID to a shared
+    /// pidfile, then blocks. The supervisor reads the PID, `SIGKILL`s the helper
+    /// (so no Drop runs), and asserts the kernel reaps the `sleep`.
+    #[test]
+    #[ignore = "spawns and SIGKILLs a subprocess; run manually with --ignored"]
+    fn pdeathsig_reaps_orphaned_child() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command as StdCommand;
+
+        // The supervisor passes the pidfile path; its presence selects the role.
+        if let Ok(pidfile) = std::env::var("WD_PDEATHSIG_PIDFILE") {
+            // Helper role: spawn `sleep` protected by PR_SET_PDEATHSIG.
+            let mut sleep = StdCommand::new("sleep");
+            sleep.arg("300");
+            // SAFETY: only async-signal-safe libc calls before exec.
+            unsafe {
+                sleep.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() == 1 {
+                        libc::_exit(0);
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = sleep.spawn().expect("spawn sleep");
+            // Write+rename so the supervisor never reads a half-written pid.
+            let tmp = format!("{pidfile}.tmp");
+            std::fs::write(&tmp, child.id().to_string()).unwrap();
+            std::fs::rename(&tmp, &pidfile).unwrap();
+            // Block on the sleep until the supervisor SIGKILLs us (also
+            // satisfies clippy::zombie_processes — the child is waited on).
+            let _ = child.wait();
+            return;
+        }
+
+        // Supervisor role: re-exec self as the helper.
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("sleep.pid");
+        let exe = std::env::current_exe().unwrap();
+        let mut helper = StdCommand::new(exe)
+            .args([
+                "--exact",
+                "tests::pdeathsig_reaps_orphaned_child",
+                "--ignored",
+            ])
+            .env("WD_PDEATHSIG_PIDFILE", &pidfile)
+            .spawn()
+            .expect("spawn helper");
+
+        // Wait for the helper to publish the sleep PID.
+        let mut sleep_pid = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(pid) = s.trim().parse::<i32>() {
+                    sleep_pid = Some(pid);
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let sleep_pid = sleep_pid.expect("helper never published the sleep PID");
+
+        // The sleep is alive while the helper lives.
+        assert_eq!(
+            unsafe { libc::kill(sleep_pid, 0) },
+            0,
+            "sleep ({sleep_pid}) should be running before the helper is killed"
+        );
+
+        // Hard-kill the helper — no Drop, no teardown.
+        unsafe {
+            libc::kill(helper.id() as i32, libc::SIGKILL);
+        }
+        let _ = helper.wait();
+
+        // The kernel must SIGKILL the orphaned sleep; init reaps the zombie.
+        let mut reaped = false;
+        for _ in 0..50 {
+            if unsafe { libc::kill(sleep_pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !reaped {
+            unsafe { libc::kill(sleep_pid, libc::SIGKILL) };
+        }
+        assert!(
+            reaped,
+            "PR_SET_PDEATHSIG did not reap the orphaned child after its parent was SIGKILLed"
+        );
+    }
+
     /// Live end-to-end check that a fractional scale is actually applied by a
     /// real mutter. Requires the runtime stack (mutter, pipewire, wireplumber,
     /// dbus-launch) on `PATH` plus the GSettings schemas in `XDG_DATA_DIRS`, so
@@ -931,38 +1076,6 @@ mod tests {
             (applied - 1.5).abs() < 0.01,
             "expected logical scale ~1.5 (fractional scaling enabled via keyfile), got {applied}"
         );
-    }
-
-    #[test]
-    fn test_parse_dbus_address_valid() {
-        let output = "DBUS_SESSION_BUS_ADDRESS='unix:abstract=/tmp/dbus-XXX,guid=abc123';\nDBUS_SESSION_BUS_PID=12345;\n";
-        let addr = parse_dbus_address(output).unwrap();
-        assert_eq!(addr, "unix:abstract=/tmp/dbus-XXX,guid=abc123");
-    }
-
-    #[test]
-    fn test_parse_dbus_address_missing() {
-        let output = "DBUS_SESSION_BUS_PID=12345;\n";
-        assert!(parse_dbus_address(output).is_err());
-    }
-
-    #[test]
-    fn test_parse_dbus_pid_valid() {
-        let output = "DBUS_SESSION_BUS_ADDRESS='unix:abstract=/tmp/dbus-XXX,guid=abc123';\nDBUS_SESSION_BUS_PID=12345;\n";
-        let pid = parse_dbus_pid(output).unwrap();
-        assert_eq!(pid, 12345);
-    }
-
-    #[test]
-    fn test_parse_dbus_pid_missing() {
-        let output = "DBUS_SESSION_BUS_ADDRESS='unix:abstract=/tmp/dbus-XXX,guid=abc123';\n";
-        assert!(parse_dbus_pid(output).is_err());
-    }
-
-    #[test]
-    fn test_parse_dbus_pid_invalid() {
-        let output = "DBUS_SESSION_BUS_PID=notanumber;\n";
-        assert!(parse_dbus_pid(output).is_err());
     }
 
     #[tokio::test]
