@@ -24,6 +24,26 @@
 //!   ~5–20 s for the one-time ocrs model download (~50 MB).
 //! - Each subsequent call: ~200–500 ms (screenshot + inference).
 //!
+//! **Build profile matters enormously.** The figures above assume an
+//! *optimized* build. OCR cost is dominated by rten inference, which is
+//! roughly **30× slower at the dev profile's opt-level 0** — measured
+//! ~5–8 s/full-frame pass optimized vs ~50–200 s unoptimized on CPU-only
+//! hosts. `cargo test` consumers should add a dependency-only override to
+//! the **workspace root** `Cargo.toml` (Cargo ignores profile overrides
+//! elsewhere):
+//!
+//! ```toml
+//! [profile.dev.package."*"]
+//! opt-level = 3
+//! ```
+//!
+//! The engine loader logs a warning when it detects a debug build.
+//! Scoping also matters: a [`crate::Locator::find_by_text`]-style scoped
+//! search crops the frame to the scope *before* inference, so it both
+//! recognizes better and pays for fewer text lines; an unscoped
+//! [`Session::find_by_text`] OCRs the entire frame. Repeated lookups on an
+//! unchanged frame reuse one OCR pass via the per-frame cache.
+//!
 //! ## Action surface
 //!
 //! [`VisualLocator`] supports `count`, `bounds`, `click`, `hover`,

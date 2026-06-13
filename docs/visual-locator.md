@@ -762,6 +762,26 @@ doesn't work for your widget.
 | `Locator::last_region`                    | +10–30 ms over OCR          |
 | `Locator::find_regions` (full sweep)      | +30–100 ms (depends on chain depth) |
 
+**These latencies assume an optimized build.** rten inference dominates OCR
+cost and is roughly **30× slower at the dev profile's opt-level 0**: measured
+~5–8 s per full-frame pass with optimized dependencies vs ~50–200 s without,
+on CPU-only hosts. Consumers running the visual feature under `cargo test`
+must add a dependency-only override to the **workspace root** `Cargo.toml`
+(Cargo ignores profile overrides declared anywhere else — a library can't
+ship this for you):
+
+```toml
+[profile.dev.package."*"]
+opt-level = 3
+```
+
+The engine loader logs a warning at init when it detects a debug build. Two
+further cost levers already built in: a scoped `Locator::find_by_text` crops
+the frame to the parent's bounds *before* inference (fewer pixels, fewer text
+lines — only the unscoped `Session::find_by_text` pays for the full frame),
+and the per-frame OCR cache means repeated lookups on an unchanged screen
+reuse a single pass.
+
 ## When to use what
 
 - **Default path** — `Locator::click` against an XPath. Use this

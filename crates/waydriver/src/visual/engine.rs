@@ -25,6 +25,31 @@ pub(super) fn load_engine_blocking(
     detection_path: std::path::PathBuf,
     recognition_path: std::path::PathBuf,
 ) -> Result<Arc<OcrEngine>> {
+    // OCR cost is dominated by rten inference, and an unoptimized (dev
+    // profile) rten is ~30x slower — minutes per full-frame pass instead of
+    // seconds. Consumers hit this by running `cargo test` without dependency
+    // opt-level overrides and then watching every `find_by_text` blow past
+    // the 120s visual auto-wait budget (which is calibrated for optimized
+    // builds). Surface the fix at the one place every visual call funnels
+    // through. Keyed on this crate's own debug_assertions because rten's
+    // opt-level isn't observable at runtime — note the override does NOT
+    // clear debug_assertions, so the message tells already-fixed consumers
+    // to ignore it.
+    if cfg!(debug_assertions) {
+        tracing::warn!(
+            "visual: waydriver was compiled in a dev/debug profile — rten OCR inference \
+             is ~30x slower unoptimized (minutes per full-frame pass instead of seconds), \
+             and the 120s visual auto-wait default assumes an optimized build. If OCR is \
+             slow, add this to your WORKSPACE ROOT Cargo.toml (optimizes dependencies \
+             only; your own code stays fast to build):\n\n\
+             [profile.dev.package.\"*\"]\n\
+             opt-level = 3\n\n\
+             Already applied an override like that? Then OCR is fast and this warning is \
+             a false positive (opt-level overrides don't clear cfg(debug_assertions)) — \
+             ignore it."
+        );
+    }
+
     let started = std::time::Instant::now();
     tracing::info!(
         detection = %detection_path.display(),
