@@ -383,6 +383,19 @@ impl Locator {
     /// or hasn't been laid out yet (`get_extents` returned a zero-area
     /// rect). Callers that want to tolerate missing bounds should use
     /// [`Locator::inspect_all`] and read `ElementInfo::bounds` directly.
+    /// The element's bounding rectangle in **window-relative** logical
+    /// pixels, as AT-SPI reports them (`CoordType::Window`).
+    ///
+    /// **Do not feed this straight to the pointer API.**
+    /// [`pointer_motion_absolute`](crate::Session::pointer_motion_absolute)
+    /// and friends consume *screen-absolute* coordinates; under headless
+    /// mutter the two differ by the toplevel's on-screen origin (mutter
+    /// reports `CoordType::Screen` as `(0, 0)`, so window-relative is all
+    /// AT-SPI gives). For pointer targeting, use
+    /// [`screen_bounds`](Self::screen_bounds) (or the ready-made
+    /// [`pointer_click`](Self::pointer_click) / `hover` / `double_click` /
+    /// `right_click` / `drag_to`, which translate internally). `bounds()`
+    /// itself is for layout math and crop rectangles relative to the window.
     pub async fn bounds(&self) -> Result<crate::atspi::Rect> {
         let info = self.wait_for_existing().await?;
         info.bounds.ok_or_else(|| {
@@ -391,6 +404,43 @@ impl Locator {
                 self.xpath
             ))
         })
+    }
+
+    /// The element's bounding rectangle in **screen-absolute** logical
+    /// pixels — [`bounds`](Self::bounds) translated through
+    /// [`Session::to_screen_bounds`](crate::Session::to_screen_bounds).
+    /// This is the rectangle to use when driving the pointer at the widget
+    /// yourself; the built-in pointer actions already go through it.
+    pub async fn screen_bounds(&self) -> Result<crate::atspi::Rect> {
+        let bounds = self.bounds().await?;
+        self.session.to_screen_bounds(bounds).await
+    }
+
+    /// Click this element with `button` via synthesized **pointer** events
+    /// (motion → press → release) at its on-screen centre.
+    ///
+    /// Unlike [`click`](Self::click) — which invokes the AT-SPI
+    /// `Action` interface and only falls back to a left pointer click —
+    /// this always drives the real pointer with the button you choose, so
+    /// it reaches gesture-only behaviours that have no accessible action:
+    /// the motivating case is `AdwTabBar`'s middle-click-to-close. Auto-waits
+    /// for actionability and resolves screen coordinates via
+    /// [`screen_bounds`](Self::screen_bounds), reusing the visual-click
+    /// cold-start warmup so the first motion after a fresh session binds
+    /// pointer focus before the button fires.
+    pub async fn pointer_click(&self, button: crate::backend::PointerButton) -> Result<()> {
+        let (cx, cy) = self.wait_and_center().await?;
+        self.session.cold_start_click(cx, cy, button).await
+    }
+
+    /// Middle-click this element via synthesized pointer events.
+    /// Shorthand for [`pointer_click`](Self::pointer_click) with
+    /// [`PointerButton::Middle`](crate::backend::PointerButton::Middle) —
+    /// the button with no AT-SPI action, needed for e.g. `AdwTabBar`
+    /// middle-click-close.
+    pub async fn middle_click(&self) -> Result<()> {
+        self.pointer_click(crate::backend::PointerButton::Middle)
+            .await
     }
     /// Text contents of the matched element via the AT-SPI Text interface.
     /// Unlike other metadata, text isn't captured in the snapshot — each
@@ -436,13 +486,14 @@ impl Locator {
                         self.xpath
                     ))
                 })?;
+                let screen = self.session.to_screen_bounds(bounds).await?;
                 tracing::debug!(
                     xpath = %self.xpath, %bus, %path,
-                    cx = bounds.center_x(), cy = bounds.center_y(),
+                    cx = screen.center_x(), cy = screen.center_y(),
                     "click: AT-SPI Action not supported; falling back to pointer click"
                 );
                 self.session
-                    .pointer_motion_absolute(bounds.center_x() as f64, bounds.center_y() as f64)
+                    .pointer_motion_absolute(screen.center_x() as f64, screen.center_y() as f64)
                     .await?;
                 self.session
                     .pointer_button(crate::backend::PointerButton::Left)
@@ -547,13 +598,14 @@ impl Locator {
                         self.xpath
                     ))
                 })?;
+                let screen = self.session.to_screen_bounds(bounds).await?;
                 tracing::debug!(
                     xpath = %self.xpath, %bus, %path,
-                    cx = bounds.center_x(), cy = bounds.center_y(),
+                    cx = screen.center_x(), cy = screen.center_y(),
                     "fill: Component::grab_focus not supported; falling back to pointer click"
                 );
                 self.session
-                    .pointer_motion_absolute(bounds.center_x() as f64, bounds.center_y() as f64)
+                    .pointer_motion_absolute(screen.center_x() as f64, screen.center_y() as f64)
                     .await?;
                 self.session
                     .pointer_button(crate::backend::PointerButton::Left)
@@ -807,13 +859,21 @@ impl Locator {
         // "clamp to top-left, then offset to center" is the simplest way
         // to reach a known absolute coordinate. The clamp amount is just
         // a large value that any realistic viewport fits inside.
+        //
+        // The offset is a *screen-absolute* target (we start from the
+        // clamped 0,0), so translate the window-relative scroll bounds first
+        // — otherwise the wheel lands over the wrong surface when the
+        // toplevel isn't at the screen origin. `scroll_bounds` stays
+        // window-relative below for the direction math (compared against the
+        // equally window-relative element bounds).
+        let scroll_screen = self.session.to_screen_bounds(scroll_bounds).await?;
         self.session
             .pointer_motion_relative(-10_000.0, -10_000.0)
             .await?;
         self.session
             .pointer_motion_relative(
-                scroll_bounds.center_x() as f64,
-                scroll_bounds.center_y() as f64,
+                scroll_screen.center_x() as f64,
+                scroll_screen.center_y() as f64,
             )
             .await?;
 
@@ -907,9 +967,13 @@ impl Locator {
             ))
         })?;
 
+        // The screenshot is screen-pixel space; AT-SPI bounds are
+        // window-relative — translate before cropping or we'd crop the
+        // wrong rectangle whenever the toplevel isn't at the screen origin.
+        let screen = self.session.to_screen_bounds(bounds).await?;
         let raw = self.session.take_screenshot().await?;
         let full = decode_screenshot_png(&raw)?;
-        let cropped = crop_to_bounds(full, bounds)?;
+        let cropped = crop_to_bounds(full, screen)?;
 
         let mut out = Vec::new();
         let encoder = image::codecs::png::PngEncoder::new(&mut out);
@@ -919,12 +983,18 @@ impl Locator {
         Ok(out)
     }
 
-    /// OCR-backed visual locator pre-scoped to this element's
-    /// screen-rectangle. Returns a [`VisualLocator`](crate::VisualLocator)
+    /// OCR-backed visual locator pre-scoped to this element's on-screen
+    /// rectangle. Returns a [`VisualLocator`](crate::VisualLocator)
     /// that searches *only* within the AT-SPI bounds of this locator —
     /// the screenshot is cropped before OCR runs, which makes searches
     /// inside a known parent both faster (less pixels) and more
     /// accurate (less surrounding text to confuse the recogniser).
+    ///
+    /// The parent's AT-SPI bounds are window-relative, so they're
+    /// translated to screen pixels via
+    /// [`Session::to_screen_bounds`](crate::Session::to_screen_bounds)
+    /// before scoping — otherwise the crop would land on the wrong region
+    /// when the toplevel isn't at the screen origin.
     ///
     /// Use this when AT-SPI sees the parent but not the target widget
     /// (the motivating case is libadwaita's lazy-realization bugs —
@@ -941,14 +1011,18 @@ impl Locator {
                 self.xpath
             ))
         })?;
-        Ok(self.session.find_by_text(text).within(bounds))
+        let screen = self.session.to_screen_bounds(bounds).await?;
+        Ok(self.session.find_by_text(text).within(screen))
     }
 
-    /// Template-matching locator pre-scoped to this element's
-    /// AT-SPI screen rectangle. Returns an
+    /// Template-matching locator pre-scoped to this element's on-screen
+    /// rectangle. Returns an
     /// [`ImageLocator`](crate::visual::ImageLocator) restricted to
     /// the cropped region — faster than a screen-wide search and
-    /// fewer false positives.
+    /// fewer false positives. The parent's window-relative AT-SPI bounds
+    /// are translated to screen pixels via
+    /// [`Session::to_screen_bounds`](crate::Session::to_screen_bounds)
+    /// before scoping.
     ///
     /// See [`Session::find_image`](crate::Session::find_image) for
     /// the matching algorithm and when to reach for this vs.
@@ -965,7 +1039,8 @@ impl Locator {
                 self.xpath
             ))
         })?;
-        Ok(self.session.find_image(png_bytes)?.within(bounds))
+        let screen = self.session.to_screen_bounds(bounds).await?;
+        Ok(self.session.find_image(png_bytes)?.within(screen))
     }
 
     /// Find all visually-distinct enclosing regions around `inner`,
@@ -1176,8 +1251,13 @@ impl Locator {
         result.and(up)
     }
 
-    /// Auto-wait for actionability and return the element's bounds centre
-    /// in logical pixels, ready to feed into `pointer_motion_absolute`.
+    /// Auto-wait for actionability and return the element's centre in
+    /// *screen-absolute* logical pixels, ready to feed into
+    /// `pointer_motion_absolute`. AT-SPI `bounds()` are window-relative, so
+    /// this translates them through
+    /// [`Session::to_screen_bounds`](crate::Session::to_screen_bounds) — the
+    /// shared bridge that keeps `hover`/`double_click`/`right_click`/`drag_to`
+    /// landing on the widget when the toplevel isn't at the screen origin.
     async fn wait_and_center(&self) -> Result<(f64, f64)> {
         let info = self.wait_for_actionable().await?;
         let bounds = info.bounds.ok_or_else(|| {
@@ -1186,7 +1266,8 @@ impl Locator {
                 self.xpath
             ))
         })?;
-        Ok((bounds.center_x() as f64, bounds.center_y() as f64))
+        let screen = self.session.to_screen_bounds(bounds).await?;
+        Ok((screen.center_x() as f64, screen.center_y() as f64))
     }
 
     /// Find the closest scrollable ancestor of the element this locator

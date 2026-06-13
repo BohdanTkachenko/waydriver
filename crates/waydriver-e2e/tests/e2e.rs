@@ -1086,6 +1086,507 @@ async fn grab_probe_popover_input_routing() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Control for the Bug 7 probe: do pointer events land in the gtk4 section
+/// at all? Motion over hover-target must emit pointer-enter (pure motion
+/// delivery, no click semantics), and a right press on ctx-target must emit
+/// its context event. Diagnostic — read the CTRL lines on stderr.
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn pointer_delivery_control_gtk4() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let hb = session
+        .locate("//*[@name='hover-target']")
+        .first()
+        .bounds()
+        .await?;
+    let cursor = session.stdout_cursor();
+    session
+        .pointer_motion_absolute((hb.x - 30).max(0) as f64, hb.y as f64)
+        .await?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    session
+        .pointer_motion_absolute((hb.x + hb.width / 2) as f64, (hb.y + hb.height / 2) as f64)
+        .await?;
+    let enter = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("pointer-enter hover-target"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!("CTRL: motion delivered (hover enter) = {}", enter.is_ok());
+
+    let cb = session
+        .locate("//*[@name='ctx-target']")
+        .first()
+        .bounds()
+        .await?;
+    let cursor = session.stdout_cursor();
+    session
+        .pointer_motion_absolute((cb.x + cb.width / 2) as f64, (cb.y + cb.height / 2) as f64)
+        .await?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    session
+        .pointer_button_down(waydriver::PointerButton::Right)
+        .await?;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    session
+        .pointer_button_up(waydriver::PointerButton::Right)
+        .await?;
+    let ctx = session
+        .wait_for_stdout_line(cursor, |l| l.contains("ctx-target"), Duration::from_secs(3))
+        .await;
+    eprintln!(
+        "CTRL: right-click delivered (ctx event) = {} ({:?})",
+        ctx.is_ok(),
+        ctx.as_deref().unwrap_or("<nothing>")
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Bug 7 repro infrastructure (middle-click vs AdwTabBar) + an unresolved
+/// confound. The fixture now has an `AdwTabView`/`AdwTabBar` with three pages
+/// (middle-click-close observable via the `tab-count` event) and a plain
+/// `mid-target` `GestureClick` that reports which button number GTK received.
+///
+/// **RESOLVED — not a middle-button bug.** `coord_source_confound_probe` and
+/// `screen_vs_window_extents_probe` isolated the real cause: `Locator::bounds()`
+/// returns *window-relative* coordinates (atspi.rs reads `CoordType::Window`),
+/// but `pointer_motion_absolute` consumes *screen-absolute* coordinates. The
+/// gap is the toplevel's on-screen origin — and mutter centers the single
+/// toplevel, so origin = ((screen − window-content)/2) (measured (151, 63) ≈
+/// derived (152, 64) for a 720×640 window on 1024×768). A click at `bounds()`
+/// therefore misses by that offset for *every* button; the middle button was
+/// never the variable. A click at `bounds()` + origin lands. AT-SPI Screen
+/// extents are uniformly (0,0) and the toplevel has no Component interface, so
+/// the origin must be derived (centering) — it isn't available raw.
+/// Diagnostic — read the MID lines on stderr.
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn middle_click_probe_adw_tab_bar() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    async fn click_at(
+        session: &Arc<Session>,
+        x: f64,
+        y: f64,
+        button: waydriver::PointerButton,
+    ) -> anyhow::Result<()> {
+        // Two-step approach motion + settles: same recipe as the visual
+        // locator's cold-start click, so pointer focus is bound before the
+        // button event.
+        session.pointer_motion_absolute(x - 25.0, y).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        session.pointer_motion_absolute(x, y).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Separate press/settle/release — the same shape as the visual
+        // locator's cold_start_click; an atomic press+release pair can be
+        // coalesced/dropped by GTK's gesture machinery in headless mutter.
+        session.pointer_button_down(button).await?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        session.pointer_button_up(button).await?;
+        Ok(())
+    }
+
+    // ── M0: known-good pointer baseline — left-click the activatable
+    // ActionRow and confirm its activation event. Proves pointer clicks
+    // land in this section before measuring the middle button.
+    let row = session
+        .locate("//*[@name='adw-action-row']")
+        .first()
+        .bounds()
+        .await?;
+    let cursor = session.stdout_cursor();
+    click_at(
+        &session,
+        (row.x + row.width / 2) as f64,
+        (row.y + row.height / 2) as f64,
+        waydriver::PointerButton::Left,
+    )
+    .await?;
+    let m0 = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("activated adw-action-row"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!(
+        "MID M0: baseline left-click on action row works = {}",
+        m0.is_ok()
+    );
+
+    // ── M1: which button numbers does GTK receive on a plain target? ──
+    let b = session
+        .locate("//Label[@name='mid-target']")
+        .bounds()
+        .await?;
+    eprintln!("MID M1: mid-target bounds = {b:?}");
+    let (cx, cy) = ((b.x + b.width / 2) as f64, (b.y + b.height / 2) as f64);
+    for (button, expect) in [
+        (waydriver::PointerButton::Left, "button=1"),
+        (waydriver::PointerButton::Middle, "button=2"),
+        (waydriver::PointerButton::Right, "button=3"),
+    ] {
+        let cursor = session.stdout_cursor();
+        click_at(&session, cx, cy, button).await?;
+        let got = session
+            .wait_for_stdout_line(
+                cursor,
+                |l| l.contains("pressed mid-target"),
+                Duration::from_secs(3),
+            )
+            .await;
+        eprintln!(
+            "MID M1: {button:?} delivered = {} (expected {expect}, got {:?})",
+            got.as_deref().map(|l| l.contains(expect)).unwrap_or(false),
+            got.as_deref().unwrap_or("<nothing>")
+        );
+    }
+
+    // ── M2: middle-click an AdwTabBar tab — does the page close? ──
+    // Both the tab and its page-content Label are named tab-two; the tab
+    // widget is the one inside the tab bar (smallest y).
+    let candidates = session.locate("//*[@name='tab-two']").inspect_all().await?;
+    eprintln!(
+        "MID M2: tab-two candidates = {:?}",
+        candidates
+            .iter()
+            .map(|c| (c.role.clone(), c.bounds))
+            .collect::<Vec<_>>()
+    );
+    let tab = candidates
+        .iter()
+        .filter(|c| c.role == "Tab")
+        .filter_map(|c| c.bounds.map(|b| (c.role.clone(), b)))
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no role=Tab tab-two with bounds in the tree"))?;
+    let (tx, ty) = (
+        (tab.1.x + tab.1.width / 2) as f64,
+        (tab.1.y + tab.1.height / 2) as f64,
+    );
+    let cursor = session.stdout_cursor();
+    click_at(&session, tx, ty, waydriver::PointerButton::Middle).await?;
+    let closed = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("tab-count 2"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!(
+        "MID M2: middle-click on tab (role {} at {:?}) closed it = {} ({:?})",
+        tab.0,
+        tab.1,
+        closed.is_ok(),
+        closed.as_deref().unwrap_or("<no tab-count event>")
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// **Decisive Bug 7 probe.** Resolves the coordinate-source confound:
+/// `Locator::bounds()` returns *window-relative* extents (atspi.rs reads
+/// `CoordType::Window` because headless mutter reports `Screen` as `(0,0)`),
+/// but `pointer_motion_absolute` consumes *absolute screen* coordinates. If
+/// the toplevel isn't pinned at the screen origin, a click placed at
+/// `bounds()` lands offset by the window's on-screen position — which is
+/// exactly the path the reporter took for AdwTabBar middle-click (no AT-SPI
+/// action exists for middle-click-close, so raw pointer events at `bounds()`
+/// were the only option).
+///
+/// Measures the *same* widget (`mid-target`, which has a visible text label
+/// AND reports the button number GTK received) two ways on the *same*
+/// main-window surface:
+///   - A1: AT-SPI window-relative `bounds()` center.
+///   - A2: OCR screen-pixel `find_by_text("mid-target").bounds()` center.
+/// Then left-clicks at each and reports which fired. The center delta
+/// (A2 − A1) should equal the window's on-screen origin; if A2 fires and A1
+/// misses by that delta, the confound is coordinate space, not the button.
+/// Diagnostic — read the COORD lines on stderr (OCR pass is slow in debug).
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn coord_source_confound_probe() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    async fn left_click_at(session: &Arc<Session>, x: f64, y: f64) -> anyhow::Result<()> {
+        session.pointer_motion_absolute(x - 25.0, y).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        session.pointer_motion_absolute(x, y).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        session
+            .pointer_button_down(waydriver::PointerButton::Left)
+            .await?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        session
+            .pointer_button_up(waydriver::PointerButton::Left)
+            .await?;
+        Ok(())
+    }
+
+    // ── A1: AT-SPI window-relative bounds ──────────────────────────────
+    let atspi = session
+        .locate("//Label[@name='mid-target']")
+        .bounds()
+        .await?;
+    eprintln!("COORD: AT-SPI (window-relative) bounds = {atspi:?}");
+
+    // ── A2: OCR screen-pixel bounds for the same label ─────────────────
+    let ocr = session.find_by_text("mid-target").bounds().await?;
+    eprintln!("COORD: OCR (screen-pixel) bounds      = {ocr:?}");
+
+    let (dx, dy) = (
+        ocr.center_x() - atspi.center_x(),
+        ocr.center_y() - atspi.center_y(),
+    );
+    eprintln!("COORD: center delta (OCR - AT-SPI) = ({dx}, {dy})  <- expected window origin");
+
+    // ── Click at the AT-SPI center (the natural-but-wrong path) ────────
+    let cursor = session.stdout_cursor();
+    left_click_at(&session, atspi.center_x() as f64, atspi.center_y() as f64).await?;
+    let at_atspi = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("pressed mid-target"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!(
+        "COORD: click at AT-SPI center fired = {} ({:?})",
+        at_atspi.is_ok(),
+        at_atspi.as_deref().unwrap_or("<nothing>")
+    );
+
+    // ── Click at the OCR center (screen-absolute) ──────────────────────
+    let cursor = session.stdout_cursor();
+    left_click_at(&session, ocr.center_x() as f64, ocr.center_y() as f64).await?;
+    let at_ocr = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("pressed mid-target"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!(
+        "COORD: click at OCR center fired = {} ({:?})",
+        at_ocr.is_ok(),
+        at_ocr.as_deref().unwrap_or("<nothing>")
+    );
+
+    // ── Click at AT-SPI center + delta (proves the offset correction) ──
+    let cursor = session.stdout_cursor();
+    left_click_at(
+        &session,
+        (atspi.center_x() + dx) as f64,
+        (atspi.center_y() + dy) as f64,
+    )
+    .await?;
+    let at_corrected = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("pressed mid-target"),
+            Duration::from_secs(3),
+        )
+        .await;
+    eprintln!(
+        "COORD: click at AT-SPI center + delta fired = {} ({:?})",
+        at_corrected.is_ok(),
+        at_corrected.as_deref().unwrap_or("<nothing>")
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// **Bug 7 regression.** Pointer-based `Locator` actions now translate
+/// window-relative AT-SPI bounds into screen coordinates
+/// (`Session::to_screen_bounds`), so they land on the widget even though
+/// mutter centers the toplevel off the screen origin. Before the fix every
+/// one of these silently missed. Covers the new `middle_click`/`pointer_click`
+/// plus `hover`/`right_click` (which share the now-translated `wait_and_center`).
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn pointer_actions_land_via_screen_translation() -> anyhow::Result<()> {
+    init_tracing();
+
+    // ── adw: middle + left pointer_click deliver the right button ──────
+    {
+        let (session, _state) = start_fixture_session("adw").await?;
+
+        // Scope the Locator so its session Arc clone drops before `kill`
+        // takes ownership of the unique reference.
+        {
+            let mid = session.locate("//Label[@name='mid-target']");
+
+            let cursor = session.stdout_cursor();
+            mid.middle_click().await?;
+            let l = session
+                .wait_for_stdout_line(
+                    cursor,
+                    |l| l.contains("pressed mid-target"),
+                    Duration::from_secs(5),
+                )
+                .await?;
+            assert!(
+                l.contains("button=2"),
+                "middle_click should deliver pointer button 2, got: {l}"
+            );
+
+            let cursor = session.stdout_cursor();
+            mid.pointer_click(waydriver::PointerButton::Left).await?;
+            let l = session
+                .wait_for_stdout_line(
+                    cursor,
+                    |l| l.contains("pressed mid-target"),
+                    Duration::from_secs(5),
+                )
+                .await?;
+            assert!(
+                l.contains("button=1"),
+                "pointer_click(Left) should deliver pointer button 1, got: {l}"
+            );
+        }
+
+        kill(session).await?;
+    }
+
+    // ── gtk4: pointer_click lands by coordinate (geometry proof) ───────
+    // primary-button has an AT-SPI action, but pointer_click deliberately
+    // bypasses it and clicks by translated screen coordinate, so a
+    // "clicked primary-button" event proves the gtk4 window origin resolved
+    // correctly (a different window size than adw).
+    {
+        let (session, _state) = start_fixture_session("gtk4").await?;
+        eprintln!("gtk4 window_origin = {:?}", session.window_origin().await?);
+
+        let cursor = session.stdout_cursor();
+        session
+            .locate("//Button[@name='primary-button']")
+            .pointer_click(waydriver::PointerButton::Left)
+            .await?;
+        session
+            .wait_for_stdout_line(
+                cursor,
+                |l| l.contains("clicked primary-button"),
+                Duration::from_secs(5),
+            )
+            .await?;
+
+        // hover + right_click share the same translated path.
+        let cursor = session.stdout_cursor();
+        session.locate("//*[@name='hover-target']").hover().await?;
+        session
+            .wait_for_stdout_line(
+                cursor,
+                |l| l.contains("pointer-enter hover-target"),
+                Duration::from_secs(5),
+            )
+            .await?;
+
+        let cursor = session.stdout_cursor();
+        session
+            .locate("//*[@name='ctx-target']")
+            .right_click()
+            .await?;
+        session
+            .wait_for_stdout_line(cursor, |l| l.contains("ctx-target"), Duration::from_secs(5))
+            .await?;
+
+        kill(session).await?;
+    }
+
+    Ok(())
+}
+
+/// Fix-strategy probe for Bug 7: is there a usable window-origin source?
+/// `coord_source_confound_probe` proved `bounds()` is window-relative and the
+/// pointer API wants screen-absolute, with the gap = the window's on-screen
+/// origin. To self-correct, waydriver needs that origin. The `atspi.rs`
+/// comment claims headless mutter reports `CoordType::Screen` as `(0,0)`.
+/// This dumps Screen *and* Window extents for the toplevel frame and a leaf
+/// (`mid-target`) so we can see whether Screen is uniformly `(0,0)` (→ origin
+/// must come from the compositor) or whether the toplevel/leaf Screen extents
+/// actually carry the offset (→ trivial translate). Read the GEOM lines.
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn screen_vs_window_extents_probe() -> anyhow::Result<()> {
+    use atspi::proxy::component::ComponentProxy;
+    use atspi::CoordType;
+
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    let conn = session
+        .a11y_connection
+        .as_ref()
+        .expect("session has a11y connection")
+        .clone();
+
+    async fn dump(
+        conn: &zbus::Connection,
+        label: &str,
+        bus: &str,
+        path: &str,
+    ) -> anyhow::Result<()> {
+        let comp = ComponentProxy::builder(conn)
+            .destination(bus.to_string())?
+            .path(path.to_string())?
+            .build()
+            .await?;
+        let screen = comp.get_extents(CoordType::Screen).await.ok();
+        let window = comp.get_extents(CoordType::Window).await.ok();
+        eprintln!("GEOM {label}: screen={screen:?} window={window:?}");
+        Ok(())
+    }
+
+    // Toplevel frame: the outermost node under the app root.
+    let top = session.locate("//*").inspect_all().await?;
+    if let Some(frame) = top.first() {
+        dump(&conn, "toplevel", &frame.ref_.0, &frame.ref_.1).await?;
+    }
+    // Any node that reports a role of window/frame/dialog.
+    for e in &top {
+        if matches!(e.role.as_str(), "frame" | "window" | "dialog") {
+            dump(&conn, &format!("role={}", e.role), &e.ref_.0, &e.ref_.1).await?;
+        }
+    }
+
+    // The leaf we clicked in the confound probe.
+    let mid = session
+        .locate("//Label[@name='mid-target']")
+        .inspect_all()
+        .await?;
+    if let Some(m) = mid.first() {
+        dump(&conn, "mid-target", &m.ref_.0, &m.ref_.1).await?;
+    }
+
+    // Top-5 largest window-relative bboxes — to see whether an overflowing
+    // scroll child outranks the actual window content box.
+    let mut areas: Vec<(i64, waydriver::Rect)> = top
+        .iter()
+        .filter_map(|e| e.bounds.map(|b| (b.width as i64 * b.height as i64, b)))
+        .collect();
+    areas.sort_by_key(|(a, _)| std::cmp::Reverse(*a));
+    let (sw, sh) = (1024i32, 768i32);
+    for (i, (_, b)) in areas.iter().take(5).enumerate() {
+        eprintln!(
+            "GEOM bbox#{i} = {b:?}  => centered origin = ({}, {})",
+            (sw - b.width) / 2,
+            (sh - b.height) / 2
+        );
+    }
+
+    kill(session).await?;
+    Ok(())
+}
+
 /// Documented-negative for the libadwaita lazy-realization gap (see
 /// `docs/visual-locator.md`). We tried every client-side way to *force* the
 /// missing accessibles to register and none work: `GetChildren` /

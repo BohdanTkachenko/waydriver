@@ -519,6 +519,11 @@ pub struct Session {
     /// start. Read by the cold-start warmup paths in
     /// `VisualLocator::click` and `RegionLocator::click`.
     pub(crate) visual_click_tuning: VisualClickTuning,
+    /// Cached virtual-monitor pixel size, decoded lazily from the first
+    /// screenshot. Constant for a session (the headless monitor never
+    /// resizes), so it's memoised to keep [`window_origin`](Self::window_origin)
+    /// from grabbing a frame on every pointer action.
+    screen_size: std::sync::OnceLock<(i32, i32)>,
 }
 
 impl Session {
@@ -698,6 +703,7 @@ impl Session {
             visual_region_tuning: cfg.visual_region_tuning,
             visual_text_tuning: cfg.visual_text_tuning,
             visual_click_tuning: cfg.visual_click_tuning,
+            screen_size: std::sync::OnceLock::new(),
         };
 
         Ok(session)
@@ -898,6 +904,37 @@ impl Session {
         self.input
             .pointer_axis_discrete(axis, steps, &self.cancellation)
             .await
+    }
+
+    /// Pointer "click" using the cold-start warmup recipe shared by the
+    /// visual locator and [`Locator::pointer_click`](crate::Locator::pointer_click).
+    /// `cx`/`cy` are **screen-absolute** logical pixels. When the warmup is
+    /// enabled (see [`VisualClickTuning`]) it sends an approach motion +
+    /// settle — so the first motion after a fresh session binds pointer focus
+    /// before the press — then a separate press/settle/release of `button`.
+    /// With the warmup disabled it falls through to a single motion + click.
+    pub(crate) async fn cold_start_click(
+        &self,
+        cx: f64,
+        cy: f64,
+        button: PointerButton,
+    ) -> Result<()> {
+        let t = self.visual_click_tuning;
+        if t.cold_start_warmup_enabled {
+            let warmup_x = (cx - t.cold_start_warmup_offset_px).max(0.0);
+            let warmup_y = (cy - t.cold_start_warmup_offset_px).max(0.0);
+            self.pointer_motion_absolute(warmup_x, warmup_y).await?;
+            tokio::time::sleep(t.cold_start_motion_settle).await;
+            self.pointer_motion_absolute(cx, cy).await?;
+            tokio::time::sleep(t.cold_start_motion_settle).await;
+            self.pointer_button_down(button).await?;
+            tokio::time::sleep(t.cold_start_press_settle).await;
+            self.pointer_button_up(button).await?;
+        } else {
+            self.pointer_motion_absolute(cx, cy).await?;
+            self.pointer_button(button).await?;
+        }
+        Ok(())
     }
 
     /// Wayland display socket name this session is running against.
@@ -1148,6 +1185,69 @@ impl Session {
         self.locate(&find_by_id_xpath(id))
     }
 
+    /// Translate a *window-relative* AT-SPI rectangle (as returned by
+    /// [`Locator::bounds`](crate::Locator::bounds)) into the *screen-absolute*
+    /// pixel space the pointer API
+    /// ([`pointer_motion_absolute`](Self::pointer_motion_absolute)) consumes.
+    ///
+    /// AT-SPI extents under headless mutter are window-relative — `atspi.rs`
+    /// reads `CoordType::Window` because mutter reports `CoordType::Screen`
+    /// as `(0, 0)` for every widget. Feeding `bounds()` straight to the
+    /// pointer therefore misses the widget by the toplevel's on-screen
+    /// origin. Mutter centers the single toplevel on the virtual monitor, so
+    /// that origin is derived as `((screen − window-content) / 2)` (verified
+    /// to within 1px). [`Locator::pointer_click`](crate::Locator::pointer_click),
+    /// `hover`, `double_click`, `right_click`, and `drag_to` all route through
+    /// this, so callers rarely need it directly — reach for it when you read a
+    /// rect via `bounds()` and want to drive the pointer there yourself.
+    ///
+    /// **Caveat:** assumes mutter's single centered toplevel. Widgets inside a
+    /// *separate* OS-level dialog window (rare in modern libadwaita, which
+    /// renders dialogs in-window) center against their own window, so the
+    /// main-window origin computed here won't match — use the visual locator
+    /// ([`Session::find_by_text`](Self::find_by_text)), which works in screen
+    /// space, for those.
+    pub async fn to_screen_bounds(
+        self: &Arc<Self>,
+        window_rel: crate::atspi::Rect,
+    ) -> Result<crate::atspi::Rect> {
+        let (ox, oy) = self.window_origin().await?;
+        Ok(crate::atspi::Rect {
+            x: window_rel.x + ox,
+            y: window_rel.y + oy,
+            width: window_rel.width,
+            height: window_rel.height,
+        })
+    }
+
+    /// On-screen origin `(x, y)` of the app's toplevel under headless mutter:
+    /// the offset that maps a window-relative AT-SPI rect to screen pixels.
+    /// See [`to_screen_bounds`](Self::to_screen_bounds) for the derivation
+    /// and caveats.
+    pub async fn window_origin(self: &Arc<Self>) -> Result<(i32, i32)> {
+        let (sw, sh) = self.screen_size().await?;
+        let els = self.locate("//*").inspect_all().await?;
+        centered_window_origin(els.into_iter().filter_map(|e| e.bounds), sw, sh).ok_or_else(|| {
+            Error::atspi(
+                "window_origin: AT-SPI tree has no on-screen-sized elements to size the toplevel"
+                    .to_string(),
+            )
+        })
+    }
+
+    /// Virtual-monitor pixel size, memoised. Decoded from a screenshot the
+    /// first time so it's correct regardless of the configured resolution.
+    async fn screen_size(self: &Arc<Self>) -> Result<(i32, i32)> {
+        if let Some(sz) = self.screen_size.get() {
+            return Ok(*sz);
+        }
+        let shot = self.take_screenshot().await?;
+        let img = crate::locator::decode_screenshot_png(&shot)?;
+        let sz = (img.width() as i32, img.height() as i32);
+        let _ = self.screen_size.set(sz);
+        Ok(sz)
+    }
+
     /// Locator matching any element whose accessible name equals `name`.
     pub fn find_by_name(self: &Arc<Self>, name: &str) -> Locator {
         self.locate(&find_by_name_xpath(name))
@@ -1263,6 +1363,31 @@ impl Session {
     }
 }
 
+/// Center-derive the toplevel's on-screen origin `(x, y)` from the
+/// window-relative AT-SPI bounds in the tree and the monitor size `sw`×`sh`.
+///
+/// Headless mutter centers the single toplevel on the virtual monitor, so the
+/// origin is `((screen − window-content) / 2)`. The content box is taken as the
+/// **largest bbox that fits within the screen**: a centered window never
+/// exceeds the monitor, but a scrollable child can report a logical bbox
+/// taller/wider than the viewport (observed: a 696×800 list inside a 720×640
+/// window on a 768px-tall screen), which would otherwise be mistaken for the
+/// window. Returns `None` when no bbox fits the screen.
+fn centered_window_origin(
+    bounds: impl IntoIterator<Item = crate::atspi::Rect>,
+    sw: i32,
+    sh: i32,
+) -> Option<(i32, i32)> {
+    let content = bounds
+        .into_iter()
+        .filter(|b| b.width <= sw && b.height <= sh)
+        .max_by_key(|b| b.width as i64 * b.height as i64)?;
+    Some((
+        ((sw - content.width) / 2).max(0),
+        ((sh - content.height) / 2).max(0),
+    ))
+}
+
 fn find_by_id_xpath(id: &str) -> String {
     format!("//*[@id={}]", xpath_literal(id))
 }
@@ -1333,6 +1458,7 @@ impl Session {
             visual_region_tuning: VisualRegionTuning::default(),
             visual_text_tuning: VisualTextTuning::default(),
             visual_click_tuning: VisualClickTuning::default(),
+            screen_size: std::sync::OnceLock::new(),
         }
     }
 
@@ -1543,6 +1669,49 @@ mod tests {
         let addr = "unix:path=/run/user/1000/bus";
         let result = get_host_session_bus_inner(Some(addr));
         assert_eq!(result, addr);
+    }
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> crate::atspi::Rect {
+        crate::atspi::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn centered_window_origin_centers_the_largest_fitting_box() {
+        // A 720×640 window on a 1024×768 monitor → ((1024-720)/2, (768-640)/2).
+        let boxes = [rect(0, 0, 720, 640), rect(12, 420, 696, 32)];
+        assert_eq!(centered_window_origin(boxes, 1024, 768), Some((152, 64)));
+    }
+
+    #[test]
+    fn centered_window_origin_ignores_overflowing_scroll_child() {
+        // The 696×800 child is taller than the 768px screen and has the
+        // largest area — but a centered window can't exceed the monitor, so
+        // it must be filtered out in favour of the real 720×640 window.
+        let boxes = [
+            rect(12, 360, 696, 800), // overflowing scroll content (area 556800)
+            rect(0, 0, 720, 640),    // the real window (area 460800)
+        ];
+        assert_eq!(centered_window_origin(boxes, 1024, 768), Some((152, 64)));
+    }
+
+    #[test]
+    fn centered_window_origin_clamps_negative_to_zero() {
+        // A window as large as the screen sits at the origin, not a negative
+        // coordinate.
+        let boxes = [rect(0, 0, 1024, 768)];
+        assert_eq!(centered_window_origin(boxes, 1024, 768), Some((0, 0)));
+    }
+
+    #[test]
+    fn centered_window_origin_none_when_nothing_fits() {
+        // Every bbox overflows the screen → no usable content box.
+        let boxes = [rect(0, 0, 2000, 2000)];
+        assert_eq!(centered_window_origin(boxes, 1024, 768), None);
     }
 
     #[test]

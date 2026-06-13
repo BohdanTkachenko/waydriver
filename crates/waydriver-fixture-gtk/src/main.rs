@@ -512,6 +512,49 @@ fn build_dialog_row(parent: &adw::ApplicationWindow) -> GtkBox {
 fn append_adw_widgets(col: &GtkBox, parent: &adw::ApplicationWindow) {
     col.append(&build_adw_preferences_group());
     col.append(&build_adw_dialog_row(parent));
+    col.append(&build_adw_tab_row());
+}
+
+/// Middle-click instrumentation: a plain target that reports *which* pointer
+/// button GTK actually received (separates "BTN_MIDDLE never delivered" from
+/// "AdwTabBar's middle-click-close gesture didn't fire"), plus an
+/// `AdwTabBar`/`AdwTabView` with three pages whose built-in middle-click
+/// close is observable via the `tab-count` event (n-pages drops on close).
+fn build_adw_tab_row() -> GtkBox {
+    let col = GtkBox::new(Orientation::Vertical, 4);
+
+    let mid_target = Label::new(Some("mid-target"));
+    mid_target.set_size_request(160, 32);
+    mid_target.set_can_target(true);
+    let click = GestureClick::new();
+    // Button 0 = listen to every button; the event reports which arrived.
+    click.set_button(0);
+    // Capture phase: see the press even if a descendant/ancestor gesture
+    // would claim it during bubble.
+    click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    click.connect_pressed(|g, n_press, _x, _y| {
+        emit(&format!(
+            "pressed mid-target button={} n={n_press}",
+            g.current_button()
+        ));
+    });
+    mid_target.add_controller(click);
+    col.append(&mid_target);
+
+    let view = adw::TabView::new();
+    for name in ["tab-one", "tab-two", "tab-three"] {
+        let page = view.append(&Label::new(Some(name)));
+        page.set_title(name);
+    }
+    view.connect_n_pages_notify(|v| emit(&format!("tab-count {}", v.n_pages())));
+    let bar = adw::TabBar::new();
+    bar.set_view(Some(&view));
+    // Middle-click close only applies to non-pinned tabs; AdwTabBar enables
+    // it by default. Keep the view short — the pages are just labels.
+    view.set_size_request(-1, 40);
+    col.append(&bar);
+    col.append(&view);
+    col
 }
 
 fn build_adw_preferences_group() -> adw::PreferencesGroup {

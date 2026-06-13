@@ -74,22 +74,10 @@ use crate::session::{Session, VisualTextTuning};
 /// per-step sleeps. When the warmup is disabled, falls through to a
 /// single motion + button-press, no sleeps.
 pub(crate) async fn cold_start_click(session: &Arc<Session>, cx: f64, cy: f64) -> Result<()> {
-    let t = session.visual_click_tuning;
-    if t.cold_start_warmup_enabled {
-        let warmup_x = (cx - t.cold_start_warmup_offset_px).max(0.0);
-        let warmup_y = (cy - t.cold_start_warmup_offset_px).max(0.0);
-        session.pointer_motion_absolute(warmup_x, warmup_y).await?;
-        tokio::time::sleep(t.cold_start_motion_settle).await;
-        session.pointer_motion_absolute(cx, cy).await?;
-        tokio::time::sleep(t.cold_start_motion_settle).await;
-        session.pointer_button_down(PointerButton::Left).await?;
-        tokio::time::sleep(t.cold_start_press_settle).await;
-        session.pointer_button_up(PointerButton::Left).await?;
-    } else {
-        session.pointer_motion_absolute(cx, cy).await?;
-        session.pointer_button(PointerButton::Left).await?;
-    }
-    Ok(())
+    // Delegates to the shared, button-generic recipe on `Session`
+    // (`Locator::pointer_click` uses the same one). Visual clicks are always
+    // the primary button.
+    session.cold_start_click(cx, cy, PointerButton::Left).await
 }
 
 pub(crate) use engine::{ensure_engine, EngineResult};
