@@ -453,6 +453,24 @@ impl Locator {
         atspi_client::read_text_on(a11y, &self.xpath, &bus, &path).await
     }
 
+    /// Current value, range, and step of the matched element via the AT-SPI
+    /// `Value` interface — scroll bars, sliders, progress bars, spin buttons.
+    ///
+    /// Like [`text`](Self::text), this isn't part of the snapshot: each call
+    /// makes a live read through the Value proxy after auto-waiting for the
+    /// element to exist. The headline use is reading a scrolled view's offset,
+    /// which AT-SPI exposes nowhere else — locate the `scroll bar` inside the
+    /// scrolled window and read [`ValueInfo::current`](crate::atspi::ValueInfo);
+    /// `minimum`/`maximum` bound the travel. Pair with
+    /// [`scroll`](Self::scroll) to drive the offset and assert it moved.
+    /// Returns an AT-SPI error when the element doesn't implement `Value`.
+    pub async fn value(&self) -> Result<crate::atspi::ValueInfo> {
+        let info = self.wait_for_existing().await?;
+        let a11y = self.a11y()?;
+        let (bus, path) = info.ref_;
+        atspi_client::read_value_on(a11y, &self.xpath, &bus, &path).await
+    }
+
     // ── Actions (auto-wait for actionability) ──────────────────────────────
 
     /// Invoke the primary action (index 0) on the matched element.
@@ -899,27 +917,10 @@ impl Locator {
 
         // Fallback path: park the pointer over the scrollable's center and
         // emit discrete wheel ticks, re-checking bounds after each one.
-        // Mutter's RemoteDesktop only supports relative pointer motion, so
-        // "clamp to top-left, then offset to center" is the simplest way
-        // to reach a known absolute coordinate. The clamp amount is just
-        // a large value that any realistic viewport fits inside.
-        //
-        // The offset is a *screen-absolute* target (we start from the
-        // clamped 0,0), so translate the window-relative scroll bounds first
-        // — otherwise the wheel lands over the wrong surface when the
-        // toplevel isn't at the screen origin. `scroll_bounds` stays
-        // window-relative below for the direction math (compared against the
-        // equally window-relative element bounds).
-        let scroll_screen = self.session.to_screen_bounds(scroll_bounds).await?;
-        self.session
-            .pointer_motion_relative(-10_000.0, -10_000.0)
-            .await?;
-        self.session
-            .pointer_motion_relative(
-                scroll_screen.center_x() as f64,
-                scroll_screen.center_y() as f64,
-            )
-            .await?;
+        // `scroll_bounds` stays window-relative below for the direction math
+        // (compared against the equally window-relative element bounds); the
+        // parking itself translates to screen space — see `park_pointer_over`.
+        self.park_pointer_over(scroll_bounds).await?;
 
         for _ in 0..MAX_WHEEL_TICKS {
             let direction = wheel_direction(&elem_bounds, &scroll_bounds);
@@ -952,6 +953,56 @@ impl Locator {
              likely ignored synthesized axis events",
             self.xpath
         )))
+    }
+
+    /// Park the pointer over the centre of `bounds` (a window-relative rect).
+    ///
+    /// Mutter's RemoteDesktop exposes only *relative* pointer motion, so the
+    /// simplest way to reach a known absolute coordinate is to clamp to the
+    /// top-left corner with a large negative delta, then offset to the
+    /// target's screen-absolute centre. `bounds` is window-relative;
+    /// [`Session::to_screen_bounds`](crate::Session::to_screen_bounds)
+    /// translates it first so the pointer lands on the right surface even when
+    /// the toplevel isn't at the screen origin. Shared by [`scroll`](Self::scroll)
+    /// and the wheel fallback in [`scroll_into_view`](Self::scroll_into_view).
+    async fn park_pointer_over(&self, bounds: crate::atspi::Rect) -> Result<()> {
+        let screen = self.session.to_screen_bounds(bounds).await?;
+        self.session
+            .pointer_motion_relative(-10_000.0, -10_000.0)
+            .await?;
+        self.session
+            .pointer_motion_relative(screen.center_x() as f64, screen.center_y() as f64)
+            .await?;
+        Ok(())
+    }
+
+    /// Scroll the matched element by `steps` wheel detents along `axis`.
+    ///
+    /// Parks the pointer over the element's centre and emits a discrete
+    /// pointer-axis (wheel) event: positive `steps` scroll down / right,
+    /// negative up / left, matching
+    /// [`Session::pointer_axis_discrete`](crate::Session::pointer_axis_discrete).
+    /// Unlike [`scroll_into_view`](Self::scroll_into_view) — which scrolls a
+    /// *container* until this element is visible — this drives the located
+    /// area's own scroll position directly. Pair it with [`value`](Self::value)
+    /// on the view's scroll bar to assert the offset moved, or over-scroll
+    /// (more detents than the content is long) to park a view at an edge.
+    ///
+    /// Auto-waits for the element to exist and expose Component bounds. The
+    /// area only actually scrolls if the pointer landing over it owns a
+    /// scrollable region under the toolkit; for keyboard-driven scrollback
+    /// (e.g. a terminal's `Shift+Page_Up`) use
+    /// [`Session::press_chord`](crate::Session::press_chord) instead.
+    pub async fn scroll(&self, axis: crate::backend::PointerAxis, steps: i32) -> Result<()> {
+        let info = self.wait_for_existing().await?;
+        let bounds = info.bounds.ok_or_else(|| {
+            Error::atspi(format!(
+                "no bounds available for {} — can't scroll without Component extents",
+                self.xpath
+            ))
+        })?;
+        self.park_pointer_over(bounds).await?;
+        self.session.pointer_axis_discrete(axis, steps).await
     }
 
     // ── Element-scoped pointer actions ─────────────────────────────────────

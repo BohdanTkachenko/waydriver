@@ -6,6 +6,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::selection::SelectionProxy;
 use atspi::proxy::text::TextProxy;
+use atspi::proxy::value::ValueProxy;
 use atspi::{CoordType, ScrollType, State, StateSet};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -191,6 +192,19 @@ async fn build_selection<'a>(
     path: &str,
 ) -> zbus::Result<SelectionProxy<'a>> {
     SelectionProxy::builder(conn)
+        .destination(bus_name.to_owned())?
+        .path(path.to_owned())?
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+}
+
+async fn build_value<'a>(
+    conn: &'a zbus::Connection,
+    bus_name: &str,
+    path: &str,
+) -> zbus::Result<ValueProxy<'a>> {
+    ValueProxy::builder(conn)
         .destination(bus_name.to_owned())?
         .path(path.to_owned())?
         .cache_properties(CacheProperties::No)
@@ -1268,6 +1282,67 @@ pub async fn read_text_on(
         .await
         .map_err(|e| map_action_err(xpath, bus, path, e))?;
     Ok(s)
+}
+
+/// Snapshot of an element's AT-SPI `Value` interface: its current position
+/// plus the range and step it moves within.
+///
+/// Backs [`read_value_on`] and [`crate::Locator::value`]. The headline use is
+/// reading a scrolled view's offset — locate the `scroll bar` inside the
+/// scrolled window and read [`current`](Self::current); [`minimum`](Self::minimum)
+/// / [`maximum`](Self::maximum) bound the travel. The same fields describe
+/// sliders, progress bars, and spin buttons.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValueInfo {
+    /// Current value (`CurrentValue`) — e.g. a scroll bar's offset.
+    pub current: f64,
+    /// Lower bound of the range (`MinimumValue`).
+    pub minimum: f64,
+    /// Upper bound of the range (`MaximumValue`).
+    pub maximum: f64,
+    /// Smallest step the value changes by (`MinimumIncrement`); `0.0` when the
+    /// toolkit doesn't advertise one.
+    pub minimum_increment: f64,
+}
+
+/// Read the AT-SPI `Value` interface of the element identified by `(bus, path)`
+/// — current position, range, and minimum increment.
+///
+/// Mirrors [`read_text_on`]: a live read after the caller has resolved the
+/// reference. A `(bus, path)` gone stale between resolution and the call maps
+/// to [`Error::ElementStale`] via [`map_action_err`]; an element that doesn't
+/// implement `Value` surfaces as an [`Error::Atspi`] from the same mapper.
+pub async fn read_value_on(
+    conn: &zbus::Connection,
+    xpath: &str,
+    bus: &str,
+    path: &str,
+) -> Result<ValueInfo> {
+    let v = build_value(conn, bus, path)
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    let current = v
+        .current_value()
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    let minimum = v
+        .minimum_value()
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    let maximum = v
+        .maximum_value()
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    let minimum_increment = v
+        .minimum_increment()
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    Ok(ValueInfo {
+        current,
+        minimum,
+        maximum,
+        minimum_increment,
+    })
 }
 
 #[cfg(test)]

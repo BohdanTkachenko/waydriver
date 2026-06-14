@@ -26,9 +26,22 @@
 //!
 //! Mutter and the app both use [`config_dir`] under the session's runtime dir,
 //! so a single keyfile written by the compositor before mutter starts is read
-//! by both. The compositor is the sole writer (it runs first and mutter needs
-//! the file in place at launch); the app just inherits the same
+//! by both. The compositor writes the **complete** file at launch (it runs
+//! first and mutter needs the file in place); the app just inherits the same
 //! `XDG_CONFIG_HOME`.
+//!
+//! ## Live updates
+//!
+//! [`live_write`] rewrites the keyfile **in place** after launch — the path
+//! behind [`crate::Session::set_setting`]. GIO's keyfile backend runs a
+//! `GFileMonitor` on the file, so an in-place rewrite (same inode, via
+//! [`write_keyfile`]'s truncating `std::fs::write`) makes the already-running
+//! app re-emit its GSettings `changed` signal and re-apply the new value live.
+//! The rewrite preserves every existing entry — the compositor's
+//! `experimental-features` seed and any launch-time seeds — by reading the
+//! current file back through [`parse_keyfile`] first. It's best-effort w.r.t.
+//! an app that also writes the same keyfile, but in practice apps only read
+//! these keys.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -152,6 +165,57 @@ pub fn write_keyfile(runtime_dir: &Path, entries: &[GSettingEntry]) -> std::io::
     std::fs::write(path, render_keyfile(entries))
 }
 
+/// Parse keyfile text back into entries — the inverse of [`render_keyfile`].
+///
+/// Tolerant line parser: a `[group/path]` header maps back to a dotted schema
+/// (`group.path`), a `key=value` line splits on the **first** `=` with the
+/// value kept verbatim (GVariant text can itself contain `=`), and blank lines
+/// plus `#` comments are skipped. Lines before any group header, and headers
+/// that aren't bracketed, are ignored rather than erroring — the file is
+/// machine-written by [`render_keyfile`], so this only has to be lenient enough
+/// to round-trip our own output and survive light hand edits.
+pub fn parse_keyfile(text: &str) -> Vec<GSettingEntry> {
+    let mut entries = Vec::new();
+    let mut schema: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(group) = line.strip_prefix('[').and_then(|g| g.strip_suffix(']')) {
+            schema = Some(group.replace('/', "."));
+            continue;
+        }
+        if let (Some(schema), Some((key, value))) = (&schema, line.split_once('=')) {
+            entries.push(GSettingEntry::new(schema.clone(), key.trim(), value));
+        }
+    }
+    entries
+}
+
+/// Apply a single GSettings change to a session's keyfile **in place**, after
+/// launch — the storage half of [`crate::Session::set_setting`].
+///
+/// Reads the current keyfile (treated as empty if it doesn't exist yet),
+/// appends `entry`, and rewrites via [`write_keyfile`]. Because the new entry
+/// is appended last, [`render_keyfile`]'s last-wins merge upserts the target
+/// key while preserving every other entry (the mutter `experimental-features`
+/// seed, launch-time seeds, and any prior live writes). The truncating in-place
+/// write keeps the file's inode, so the running app's `GFileMonitor` fires and
+/// GIO re-emits the GSettings `changed` signal — see the module-level
+/// "Live updates" note for why this reaches an already-running app.
+pub fn live_write(runtime_dir: &Path, entry: &GSettingEntry) -> std::io::Result<()> {
+    let path = keyfile_path(runtime_dir);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut entries = parse_keyfile(&existing);
+    entries.push(entry.clone());
+    write_keyfile(runtime_dir, &entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +278,107 @@ mod tests {
         .unwrap();
         let written = std::fs::read_to_string(keyfile_path(dir.path())).unwrap();
         assert_eq!(written, "[org/gnome/mutter]\nexperimental-features=['x']\n");
+    }
+
+    #[test]
+    fn parse_round_trips_render() {
+        let entries = [
+            GSettingEntry::new(
+                "org.gnome.mutter",
+                "experimental-features",
+                "['scale-monitor-framebuffer']",
+            ),
+            GSettingEntry::new("org.gnome.desktop.interface", "text-scaling-factor", "1.5"),
+        ];
+        // render → parse recovers both entries (order is render's sorted order).
+        let parsed = parse_keyfile(&render_keyfile(&entries));
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&entries[0]));
+        assert!(parsed.contains(&entries[1]));
+    }
+
+    #[test]
+    fn parse_skips_blanks_and_comments() {
+        let text = "# leading comment\n\n[org/gnome/mutter]\n# inline comment\n\
+                    experimental-features=['x']\n";
+        assert_eq!(
+            parse_keyfile(text),
+            vec![GSettingEntry::new(
+                "org.gnome.mutter",
+                "experimental-features",
+                "['x']"
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_keeps_value_verbatim_past_first_equals() {
+        // A value that itself contains '=' must only split on the first one.
+        assert_eq!(
+            parse_keyfile("[a/b]\nkey=a=b=c\n"),
+            vec![GSettingEntry::new("a.b", "key", "a=b=c")]
+        );
+    }
+
+    #[test]
+    fn live_write_upserts_target_key_preserving_others() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seed as the compositor does: the mutter feature flag + an initial value.
+        write_keyfile(
+            dir.path(),
+            &[
+                GSettingEntry::new(
+                    "org.gnome.mutter",
+                    "experimental-features",
+                    "['scale-monitor-framebuffer']",
+                ),
+                GSettingEntry::new("org.gnome.desktop.interface", "text-scaling-factor", "1.0"),
+            ],
+        )
+        .unwrap();
+
+        // Live-update only the one key, post-launch.
+        live_write(
+            dir.path(),
+            &GSettingEntry::new("org.gnome.desktop.interface", "text-scaling-factor", "2.0"),
+        )
+        .unwrap();
+
+        let parsed = parse_keyfile(&std::fs::read_to_string(keyfile_path(dir.path())).unwrap());
+        // The mutter seed is preserved …
+        assert!(parsed.contains(&GSettingEntry::new(
+            "org.gnome.mutter",
+            "experimental-features",
+            "['scale-monitor-framebuffer']",
+        )));
+        // … and the target key holds the new value with no duplicate left behind.
+        let scaling: Vec<_> = parsed
+            .iter()
+            .filter(|e| e.key == "text-scaling-factor")
+            .collect();
+        assert_eq!(scaling.len(), 1);
+        assert_eq!(scaling[0].value, "2.0");
+    }
+
+    #[test]
+    fn live_write_creates_keyfile_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        live_write(
+            dir.path(),
+            &GSettingEntry::new(
+                "org.gnome.desktop.interface",
+                "color-scheme",
+                "'prefer-dark'",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_keyfile(&std::fs::read_to_string(keyfile_path(dir.path())).unwrap()),
+            vec![GSettingEntry::new(
+                "org.gnome.desktop.interface",
+                "color-scheme",
+                "'prefer-dark'"
+            )]
+        );
     }
 }

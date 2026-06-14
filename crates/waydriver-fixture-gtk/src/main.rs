@@ -70,7 +70,7 @@ use adw::prelude::*;
 use gtk4::{
     gdk, gio, glib, Box as GtkBox, Button, CheckButton, ComboBoxText, DragSource, DropDown,
     DropTarget, Entry, EventControllerMotion, GestureClick, Label, ListBox, ListBoxRow, MenuButton,
-    Orientation, PopoverMenu, ScrolledWindow, StringList, TextView, ToggleButton,
+    Orientation, PopoverMenu, Scale, ScrolledWindow, StringList, TextView, ToggleButton,
 };
 use libadwaita as adw;
 use std::cell::RefCell;
@@ -229,6 +229,7 @@ fn append_gtk4_widgets(col: &GtkBox, parent: &adw::ApplicationWindow) {
     col.append(&build_list_section());
     col.append(&build_notes_area());
     col.append(&build_scroll_area());
+    col.append(&build_value_slider());
     col.append(&build_pointer_targets_row());
     col.append(&build_dialog_row(parent));
 }
@@ -436,6 +437,26 @@ fn build_scroll_area() -> ScrolledWindow {
         emit(&format!("scrolled scroll-area value={:.1}", adj.value()));
     });
     scroll
+}
+
+/// A labelled slider exposing the AT-SPI `Value` interface, read back by
+/// `Locator::value`. Fixed range 0..100 with an initial value of 25 so a test
+/// can assert exact `current` / `minimum` / `maximum` numbers; emits
+/// `slider value=<n>` on change so a drive can also be confirmed via stdout.
+fn build_value_slider() -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.append(&Label::new(Some("Volume")));
+
+    let slider = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+    slider.set_value(25.0);
+    slider.set_hexpand(true);
+    slider.set_size_request(160, -1);
+    name(&slider, "value-slider");
+    slider.connect_value_changed(|s| {
+        emit(&format!("slider value={:.1}", s.value()));
+    });
+    row.append(&slider);
+    row
 }
 
 /// The header-bar main menu. Uses `GMenuModel` to match the exact pattern
