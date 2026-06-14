@@ -14,6 +14,7 @@ use crate::atspi as atspi_client;
 use crate::backend::{CaptureBackend, CompositorRuntime, InputBackend, PointerAxis, PointerButton};
 use crate::capture::VideoRecorder;
 use crate::error::{Error, Result};
+use crate::gaction;
 use crate::locator::Locator;
 
 /// Fallback default timeout for auto-wait and explicit `wait_for_*` methods
@@ -490,6 +491,23 @@ pub struct Session {
     /// same environment, used by [`Session::launch_secondary`] to exercise
     /// single-instance `GApplication` command-line forwarding.
     secondary_spec: SecondaryLaunchSpec,
+    /// Session-bus address (`DBUS_SESSION_BUS_ADDRESS`) the app was spawned
+    /// against. The app exports its `app.*` / `win.*` GActions over
+    /// `org.gtk.Actions` on *this* bus — a different bus than
+    /// [`a11y_connection`](Self::a11y_connection). Stored so
+    /// [`activate_action`](Self::activate_action) can lazily connect. See
+    /// [`crate::gaction`].
+    dbus_address: String,
+    /// PID of the spawned app process, captured at start. Used to find the
+    /// app's own well-known bus name on the session bus: a GApplication owns
+    /// its id as a name whose owning-connection PID is this. `None` for mock
+    /// test sessions.
+    app_pid: Option<u32>,
+    /// Lazily-established session-bus connection plus the discovered
+    /// `org.gtk.Actions` address, populated on the first
+    /// [`activate_action`](Self::activate_action) / [`list_actions`](Self::list_actions)
+    /// call so AT-SPI-only sessions never pay for it.
+    gtk_actions: tokio::sync::OnceCell<gaction::GtkActionsTarget>,
     /// Default timeout (in nanoseconds) applied to auto-wait on Locator
     /// actions and explicit `wait_for_*` calls. Stored as AtomicU64 so
     /// [`set_default_timeout`] can mutate it behind an `Arc<Session>`
@@ -776,6 +794,10 @@ impl Session {
             });
         }
 
+        // Capture the app PID before `app` moves into the struct — it keys
+        // `org.gtk.Actions` discovery to the right session-bus name.
+        let app_pid = app.id();
+
         let session = Session {
             id,
             app_name: cfg.app_name,
@@ -784,6 +806,9 @@ impl Session {
             a11y_connection: Some(a11y_connection),
             external_sinks,
             secondary_spec,
+            dbus_address,
+            app_pid,
+            gtk_actions: tokio::sync::OnceCell::new(),
             default_timeout_ns: AtomicU64::new(resolve_default_timeout().as_nanos() as u64),
             gsettings_isolated: cfg.gsettings_isolated,
             cancellation,
@@ -1514,6 +1539,68 @@ impl Session {
             ))),
         }
     }
+
+    /// Lazily connect to the session bus and discover the app's
+    /// `org.gtk.Actions` address, caching both for subsequent calls.
+    async fn gtk_actions_target(&self) -> Result<&gaction::GtkActionsTarget> {
+        self.gtk_actions
+            .get_or_try_init(|| async {
+                let pid = self.app_pid.ok_or_else(|| {
+                    Error::atspi(
+                        "org.gtk.Actions: app PID unavailable (mock/test session has no \
+                         session-bus application to drive)",
+                    )
+                })?;
+                let conn = gaction::connect_session_bus(&self.dbus_address).await?;
+                let addr = gaction::discover_application(&conn, pid).await?;
+                tracing::debug!(
+                    bus_name = %addr.bus_name,
+                    base_path = %addr.base_path,
+                    "discovered org.gtk.Actions application"
+                );
+                Ok(gaction::GtkActionsTarget { conn, addr })
+            })
+            .await
+    }
+
+    /// Fire a GAction the app exported over the **`org.gtk.Actions`**
+    /// interface on the session bus, identified by its prefixed name.
+    ///
+    /// This is the reach-for path when the thing you want to drive is a
+    /// GAction-only item — `GtkPopoverMenu` entries (primary/context/tab
+    /// menus), `AdwTabOverview`, and some dialog bodies — that GTK4
+    /// lazily-realizes and never publishes to the AT-SPI `GetChildren`
+    /// tree **or** `Cache.GetItems`, so there is no `(bus, path)` for
+    /// [`Locator::activate`](crate::Locator::activate) to grab. Instead of an
+    /// accessible, it talks to the action groups `GApplication` /
+    /// `GtkApplicationWindow` export on the app's *own* bus name (see
+    /// [`crate::gaction`]).
+    ///
+    /// `action` is a GTK prefixed action name — `"app.<name>"` for
+    /// application actions, `"win.<name>"` for the active window's actions —
+    /// and may carry a string target via the GMenu detailed-name suffix
+    /// (`"app.section::adw"`). Firing requires knowing the action name
+    /// out-of-band (an app-internal contract), so this is a test affordance,
+    /// not a general locator. AT-SPI actions don't repaint under headless
+    /// mutter and GActions are the same: follow up with input if you need a
+    /// redraw, and confirm the handler ran via
+    /// [`wait_for_stdout_line`](Self::wait_for_stdout_line) or an observable
+    /// state change.
+    pub async fn activate_action(&self, action: &str) -> Result<()> {
+        let target = self.gtk_actions_target().await?;
+        gaction::activate(&target.conn, &target.addr, action).await
+    }
+
+    /// List the prefixed names (`app.*`, `win.*`) of every GAction the app
+    /// exposes over `org.gtk.Actions`.
+    ///
+    /// Discovery / debugging companion to [`activate_action`](Self::activate_action):
+    /// `org.gtk.Actions` reports action *names* but no human-readable labels,
+    /// so this tells you which actions exist, not what menu item each backs.
+    pub async fn list_actions(&self) -> Result<Vec<String>> {
+        let target = self.gtk_actions_target().await?;
+        gaction::list_all(&target.conn, &target.addr).await
+    }
 }
 
 /// XPath-based element targeting entry points. Implemented on `Arc<Session>`
@@ -1829,6 +1916,11 @@ impl Session {
                 env: Vec::new(),
                 cwd: None,
             },
+            // Mock sessions have no real session-bus app to drive; GAction
+            // discovery would find no matching name and error.
+            dbus_address: String::new(),
+            app_pid: None,
+            gtk_actions: tokio::sync::OnceCell::new(),
             default_timeout_ns: AtomicU64::new(FALLBACK_DEFAULT_TIMEOUT.as_nanos() as u64),
             // Mock sessions have no real isolated keyfile store, so live
             // `set_setting` is unavailable (it returns the isolation-required

@@ -938,6 +938,71 @@ async fn activate_drives_action_and_rows_activate_via_click() -> anyhow::Result<
     Ok(())
 }
 
+/// Issue #33 (Fix 3): drive GAction-only items over `org.gtk.Actions`.
+///
+/// `GtkPopoverMenu` / dialog items whose only role is "fire a GAction" never
+/// enter the AT-SPI tree or cache, so there is no `(bus, path)` for
+/// `Locator::activate` to grab. `Session::activate_action` instead talks to
+/// the `app.*` / `win.*` action groups the app exports on its own session-bus
+/// name. Verifies app actions, window actions, a string-target action, and
+/// `list_actions`, each confirmed by the fixture's stdout side-effect.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn gaction_activation_fires_app_and_win_actions() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // app-level action (no parameter).
+    let cursor = session.stdout_cursor();
+    session.activate_action("app.ping").await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("action-activated app.ping"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // window-level action — exported at <base>/window/<id>, a different
+    // action group than `app.*`.
+    let cursor = session.stdout_cursor();
+    session.activate_action("win.ping").await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("action-activated win.ping"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // string-target action via the GMenu detailed-name form.
+    let cursor = session.stdout_cursor();
+    session.activate_action("app.echo::hello").await?;
+    let line = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("action-activated app.echo"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    assert!(
+        line.contains(r#"param="hello""#),
+        "string target should reach the handler, got: {line}"
+    );
+
+    // Enumeration covers app.* and win.* groups.
+    let actions = session.list_actions().await?;
+    for expected in ["app.ping", "app.echo", "app.section", "win.ping"] {
+        assert!(
+            actions.iter().any(|a| a == expected),
+            "list_actions() should include {expected}, got: {actions:?}"
+        );
+    }
+
+    kill(session).await?;
+    Ok(())
+}
+
 /// OPEN 2 probe: which path activates an activatable `AdwActionRow`? Compares a
 /// screen-space `pointer_click` (pixel) against the AT-SPI `click()`
 /// (`Action.do_action` path) — the fixture's `adw-action-row` emits

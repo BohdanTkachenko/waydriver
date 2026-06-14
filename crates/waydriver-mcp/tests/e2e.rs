@@ -66,6 +66,7 @@ async fn run_fixture_test(command: tokio::process::Command) -> anyhow::Result<()
         "kill_session",
         "dump_tree",
         "query",
+        "list_actions",
         "click",
         "focus",
         "set_text",
@@ -73,6 +74,7 @@ async fn run_fixture_test(command: tokio::process::Command) -> anyhow::Result<()
         "read_text",
         "type_text",
         "press_key",
+        "activate_action",
         "move_pointer",
         "pointer_click",
         "take_screenshot",
@@ -151,6 +153,64 @@ async fn run_fixture_test(command: tokio::process::Command) -> anyhow::Result<()
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    // Fire a GAction over org.gtk.Actions (issue #33) and confirm the
+    // fixture's handler ran via its stdout side-effect — the path for
+    // GAction-only menu/dialog items that never enter the AT-SPI tree.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("activate_action").with_arguments(
+                serde_json::json!({"session_id": session_id, "action": "app.ping"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "activate_action(app.ping) failed: {}",
+        result_text(&result)
+    );
+    // `after: 0` scans the whole buffer: the unique side-effect line may
+    // already be buffered by the time this runs (Activate is fire-and-forget).
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("wait_for_stdout_line").with_arguments(
+                serde_json::json!({
+                    "session_id": session_id,
+                    "contains": "action-activated app.ping",
+                    "after": 0,
+                    "timeout_ms": 3000
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "GAction side-effect not observed on stdout: {}",
+        result_text(&result)
+    );
+
+    // list_actions enumerates both the app.* and win.* groups.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("list_actions").with_arguments(
+                serde_json::json!({"session_id": session_id})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("app.ping") && text.contains("win.ping"),
+        "list_actions should include app.ping and win.ping, got: {text}"
+    );
 
     // Take a screenshot — verify the path includes a counter-suffixed
     // filename. We intentionally take only one: CI's headless mutter

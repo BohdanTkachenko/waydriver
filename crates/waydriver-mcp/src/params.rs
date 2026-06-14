@@ -158,6 +158,17 @@ pub struct LaunchSecondaryParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ActivateActionParams {
+    /// Session ID
+    pub session_id: String,
+    /// Prefixed GAction name to fire over `org.gtk.Actions`: `app.<name>`
+    /// for an application action or `win.<name>` for the active window's.
+    /// A string target may be appended with the GMenu detailed-name syntax,
+    /// e.g. `app.section::adw`.
+    pub action: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueryParams {
     /// Session ID
     pub session_id: String,

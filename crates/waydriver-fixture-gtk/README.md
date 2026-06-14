@@ -86,6 +86,28 @@ The items inside the popover are radio-style view-switcher entries
 bound to the stateful `app.section` GAction. Clicking one rebuilds the
 content area without restarting the app and updates the button label.
 
+## GAction test affordances
+
+A `GtkPopoverMenu` item's only role is "fire a GAction", and such items
+are never published to the AT-SPI tree or `Cache.GetItems`, so there is
+no `(bus, path)` to activate. The fixture exports plain actions over the
+`org.gtk.Actions` D-Bus interface (the `app.*` / `win.*` groups GTK
+exports on the app's own bus name) so tests can drive that surface via
+`Session::activate_action` / `Session::list_actions` and observe the
+handler through stdout events:
+
+| Action            | Parameter | Emits                                          |
+|-------------------|-----------|------------------------------------------------|
+| `app.ping`        | none      | `action-activated app.ping`                    |
+| `app.echo`        | string    | `action-activated app.echo param="<value>"`    |
+| `win.ping`        | none      | `action-activated win.ping`                    |
+| `app.section`     | string    | (no stdout; swaps the visible section)         |
+
+`app.echo` takes a string target — fire it with the GMenu detailed-name
+form, e.g. `activate_action("app.echo::hello")`. `win.ping` is added to
+the `AdwApplicationWindow` (the `win.*` group), exported at
+`<base>/window/<id>`, distinct from the application action group.
+
 ## Action events
 
 Every interactive widget prints a line to stdout when its primary signal
@@ -134,6 +156,9 @@ fixture-event: toggled lazy-switch active=true
 fixture-event: notification-sent fire-notification id=1
 fixture-event: open-uri-requested open-uri uri="https://example.com/waydriver"
 fixture-event: command-line-forwarded args=["forwarded-token-xyz"]
+fixture-event: action-activated app.ping
+fixture-event: action-activated app.echo param="hello"
+fixture-event: action-activated win.ping
 ```
 
 Quoting: string fields use Rust `{:?}` debug formatting (embedded quotes

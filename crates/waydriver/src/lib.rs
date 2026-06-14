@@ -15,6 +15,9 @@ pub mod backend;
 pub mod capture;
 /// Error types used throughout the crate.
 pub mod error;
+/// Driving GTK `app.*` / `win.*` GActions over the `org.gtk.Actions`
+/// session-bus interface — for menu/dialog items absent from the AT-SPI tree.
+pub mod gaction;
 /// Per-session GSettings isolation via the keyfile backend.
 pub mod gsettings;
 /// X11 keysym utilities for keyboard input.
