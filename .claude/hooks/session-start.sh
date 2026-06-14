@@ -9,10 +9,12 @@
 #
 # Limitation (by design): the `waydriver-fixture-gtk` crate needs the gtk-rs
 # `libadwaita` `v1_6` feature, which requires the C libadwaita >= 1.6. Ubuntu
-# 24.04 only ships libadwaita 1.5, so that single crate cannot be built here —
-# exactly why CI builds it only inside the `fedora:42` container. Build/test
-# the rest of the workspace with `--exclude waydriver-fixture-gtk`; the GTK
-# fixture and full GTK e2e path remain Docker-only, as in CI.
+# 24.04 only ships libadwaita 1.5, so that single crate cannot be built here.
+# `--exclude waydriver-fixture-gtk` keeps the everyday loop fast — but if you
+# change the fixture OR `waydriver-e2e`, do NOT defer verification to CI: build
+# and run them in the Fedora dev-container (`scripts/dev-container.sh`, which
+# auto-starts dockerd here). CI's `e2e` job runs only `fixture_via_docker`, so
+# the `waydriver-e2e --ignored` suite runs nowhere but that container.
 set -euo pipefail
 
 # Only act in the remote (Claude Code on the web) environment. On a local Nix
@@ -61,4 +63,7 @@ fi
 
 echo "[session-start] System dependencies ready (Ubuntu/apt, non-Nix cloud env)."
 echo "[session-start] 'waydriver-fixture-gtk' is unbuildable here (needs libadwaita>=1.6; Ubuntu 24.04 ships 1.5)."
-echo "[session-start] Build/test with: cargo <build|clippy|test> --workspace --exclude waydriver-fixture-gtk"
+echo "[session-start] Fast loop for the rest: cargo <build|clippy|test> --workspace --exclude waydriver-fixture-gtk"
+echo "[session-start] Changed the fixture or waydriver-e2e? Verify in Fedora — don't defer to CI:"
+echo "[session-start]   scripts/dev-container.sh bash -lc 'cargo build -p waydriver-fixture-gtk && dbus-run-session -- cargo test -p waydriver-e2e -- --ignored --test-threads=1'"
+echo "[session-start]   (CI's e2e job runs ONLY fixture_via_docker — the waydriver-e2e suite runs nowhere but that container.)"
