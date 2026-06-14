@@ -963,7 +963,10 @@ pub struct CachedAccessible {
     /// snapshot's element names. Falls back to the raw role name when it
     /// doesn't form a valid identifier.
     pub role: String,
-    /// Accessible name, if non-empty.
+    /// Accessible name. When the entry exposes no direct name, this is
+    /// backfilled from its `LABELLED_BY` relation (e.g. a libadwaita row's
+    /// title `Label`), so cache-only rows stay identifiable. `None` only when
+    /// neither source yields text.
     pub name: Option<String>,
     /// Lowercase names of the AT-SPI states set on the entry, filtered
     /// to the same set the snapshot emits.
@@ -974,10 +977,55 @@ pub struct CachedAccessible {
     pub child_count: i32,
 }
 
+/// Resolve the accessible name an entry exposes via its `LABELLED_BY`
+/// relation. libadwaita rows (AdwActionRow/SwitchRow/ComboRow/SpinRow)
+/// carry no direct `name`; their accessible name lives on a title `Label`
+/// referenced through this relation. Returns the (space-joined) text of the
+/// relation targets, or `None` when there is no such relation or the targets
+/// carry no text.
+///
+/// Tolerant by design: any D-Bus error along the way maps to `None`, so a
+/// nameless entry simply stays nameless rather than failing the whole cache
+/// read. Inherits the connection's [`A11Y_METHOD_TIMEOUT`], so a stuck bridge
+/// bounds each call rather than hanging the read.
+async fn labelled_by_name(conn: &zbus::Connection, bus: &str, path: &str) -> Option<String> {
+    let accessible = build_accessible(conn, bus, path).await.ok()?;
+    let targets = accessible
+        .get_relation_set()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|(kind, _)| *kind == atspi::RelationType::LabelledBy)
+        .map(|(_, targets)| targets)?;
+    let mut label = String::new();
+    for target in targets {
+        // Relation targets within the same app carry an empty bus name; fall
+        // back to this entry's own bus, exactly like `cache_items` does.
+        let target_bus = target.name_as_str().unwrap_or(bus);
+        let Ok(proxy) = build_accessible(conn, target_bus, target.path_as_str()).await else {
+            continue;
+        };
+        if let Ok(text) = proxy.name().await {
+            if !text.is_empty() {
+                if !label.is_empty() {
+                    label.push(' ');
+                }
+                label.push_str(&text);
+            }
+        }
+    }
+    (!label.is_empty()).then_some(label)
+}
+
 /// Read the application's AT-SPI cache (`Cache.GetItems` on the app's
 /// bus name). Returns every cached accessible mapped into waydriver's
 /// conventions. The cache reflects realized contexts, not tree
 /// membership — see [`CachedAccessible`].
+///
+/// Entries with no direct `name` get one resolution attempt through their
+/// `LABELLED_BY` relation (see [`labelled_by_name`]), so libadwaita rows that
+/// label themselves via a title `Label` come back identifiable instead of
+/// nameless.
 pub async fn cache_items(conn: &zbus::Connection, app_bus: &str) -> Result<Vec<CachedAccessible>> {
     // Deserialize the `Cache.GetItems` reply into a *tolerant* shape: the role
     // is read as a raw `u32` rather than the `atspi` crate's `Role` enum.
@@ -1018,34 +1066,43 @@ pub async fn cache_items(conn: &zbus::Connection, app_bus: &str) -> Result<Vec<C
         .await
         .map_err(|e| Error::atspi_with("Cache.GetItems", e))?;
 
-    Ok(items
-        .into_iter()
-        .map(
-            |(object, _app, parent, _index, children, _ifaces, _short, role_idx, name, states)| {
-                let role = cache_role_name(role_idx);
-                let emitted_states = EMITTED_STATES
-                    .iter()
-                    .filter(|(state, _)| states.contains(*state))
-                    .map(|(_, attr)| (*attr).to_string())
-                    .collect();
-                let parent_path = match parent.path_as_str() {
-                    "/org/a11y/atspi/null" | "" => None,
-                    p => Some(p.to_string()),
-                };
-                CachedAccessible {
-                    ref_: (
-                        object.name_as_str().unwrap_or(app_bus).to_string(),
-                        object.path_as_str().to_string(),
-                    ),
-                    role,
-                    name: (!name.is_empty()).then_some(name),
-                    states: emitted_states,
-                    parent_path,
-                    child_count: children,
-                }
-            },
-        )
-        .collect())
+    // `map`'s closure can't be async, and resolving LABELLED_BY needs a D-Bus
+    // round-trip per nameless entry, so collect with an explicit async loop.
+    let mut cached = Vec::with_capacity(items.len());
+    for (object, _app, parent, _index, children, _ifaces, _short, role_idx, name, states) in items {
+        let role = cache_role_name(role_idx);
+        let emitted_states = EMITTED_STATES
+            .iter()
+            .filter(|(state, _)| states.contains(*state))
+            .map(|(_, attr)| (*attr).to_string())
+            .collect();
+        let parent_path = match parent.path_as_str() {
+            "/org/a11y/atspi/null" | "" => None,
+            p => Some(p.to_string()),
+        };
+        let ref_ = (
+            object.name_as_str().unwrap_or(app_bus).to_string(),
+            object.path_as_str().to_string(),
+        );
+        // libadwaita rows expose their name via LABELLED_BY, not a direct
+        // `name`; resolve it so cache-only rows are identifiable. Named entries
+        // skip the round-trips, and a failed resolution leaves the entry
+        // nameless rather than erroring the whole read.
+        let name = if name.is_empty() {
+            labelled_by_name(conn, &ref_.0, &ref_.1).await
+        } else {
+            Some(name)
+        };
+        cached.push(CachedAccessible {
+            ref_,
+            role,
+            name,
+            states: emitted_states,
+            parent_path,
+            child_count: children,
+        });
+    }
+    Ok(cached)
 }
 
 /// Ask the toolkit to scroll the element identified by `(bus, path)` into
