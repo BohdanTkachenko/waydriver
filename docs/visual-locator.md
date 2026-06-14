@@ -775,6 +775,12 @@ ship this for you):
 opt-level = 3
 ```
 
+(waydriver's own workspace root already applies this to just the rten/ocrs
+crates, so in-repo contributors and the e2e suite get optimized OCR in
+dev/test builds without the broader `"*"` override. The init warning below
+still fires for in-repo debug builds — an `opt-level` override does not clear
+`cfg(debug_assertions)` — and is a known false-positive there.)
+
 The engine loader logs a warning at init when it detects a debug build. Two
 further cost levers already built in: a scoped `Locator::find_by_text` crops
 the frame to the parent's bounds *before* inference (fewer pixels, fewer text
