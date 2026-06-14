@@ -607,6 +607,31 @@ impl Session {
         tracing::info!(id, "starting session");
 
         let dbus_address = get_host_session_bus()?;
+
+        // Stand up the mock external-effect sinks *before* launching the app, so
+        // they claim the well-known names first. A GTK app contacts the portal
+        // (and a notification daemon) during startup; in a full desktop / the
+        // Fedora e2e image that D-Bus-activates the real `xdg-desktop-portal`,
+        // which would then own `org.freedesktop.portal.Desktop` before we could
+        // — silently disabling capture. Claiming first makes our mock the
+        // portal/daemon the app talks to. Best-effort: a failure here never
+        // fails session startup (capture just stays inactive).
+        let external_sinks = if cfg.capture_external_effects {
+            match crate::sink::ExternalSinks::start(&dbus_address).await {
+                Ok(sinks) => Some(sinks),
+                Err(e) => {
+                    tracing::warn!(
+                        id,
+                        error = %e,
+                        "external-effect capture setup failed; continuing without it"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Build the app env once and reuse it for the captured secondary-launch
         // spec, so a secondary instance lands on the same bus / display / dirs.
         let app_env = app_env_pairs(
@@ -665,25 +690,6 @@ impl Session {
         let a11y_connection = atspi_client::connect_a11y(&dbus_address).await?;
         let (app_bus_name, app_path) = wait_for_app(&a11y_connection, &cfg.app_name).await?;
         tracing::info!(id, app_name = %cfg.app_name, %app_bus_name, "session ready");
-
-        // Optionally stand up the mock external-effect sinks on the app's
-        // session bus. Best-effort: a failure here (bad address, registration)
-        // must not fail an otherwise-ready session — capture simply stays off.
-        let external_sinks = if cfg.capture_external_effects {
-            match crate::sink::ExternalSinks::start(&dbus_address).await {
-                Ok(sinks) => Some(sinks),
-                Err(e) => {
-                    tracing::warn!(
-                        id,
-                        error = %e,
-                        "external-effect capture setup failed; continuing without it"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         // Start a keepalive ScreenCast stream. In headless mutter the
         // compositor only delivers Wayland frame callbacks while it is
