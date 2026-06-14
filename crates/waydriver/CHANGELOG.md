@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.3.3](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.3.2...waydriver-v0.3.3) - 2026-06-14
+
+### Added
+
+- *(locator)* drag_to_coords for off-window drop endpoints
+- *(gaction)* drive app.*/win.* GActions via org.gtk.Actions ([#33](https://github.com/BohdanTkachenko/waydriver/pull/33))
+- external-effect sinks (notifications/portal) + single-instance CLI forwarding
+- *(atspi)* activate cache-only accessibles by (bus, path) ref
+- *(visual)* add perceptual baseline-compare primitive
+- live GSettings writes + AT-SPI Value/scroll readback
+- *(visual)* per-search OCR upscale via VisualLocator::with_upscale ([#23](https://github.com/BohdanTkachenko/waydriver/pull/23))
+- *(session)* expose key_down/key_up for held-modifier gestures
+
+### Fixed
+
+- *(session)* claim external-effect sink names before launching the app
+- *(atspi)* resolve LABELLED_BY names for cache-only rows
+
+### Other
+
+- release v0.3.2
+- add cloud-env (non-Nix) dev tooling for SessionStart and Fedora container
+- limit rustdoc to the crate itself (--no-deps)
+
 ## [0.3.2](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.3.1...waydriver-v0.3.2) - 2026-06-14
 
 ### Added
