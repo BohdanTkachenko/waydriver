@@ -228,6 +228,20 @@ pub struct DragToParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DragToCoordsParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector for the drag source; must resolve to exactly one element.
+    pub source_xpath: String,
+    /// Screen-absolute X coordinate (logical pixels) to drop at. May lie off
+    /// the source window — e.g. empty space with no element under it.
+    pub x: f64,
+    /// Screen-absolute Y coordinate (logical pixels) to drop at. May lie off
+    /// the source window — e.g. empty space with no element under it.
+    pub y: f64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetTextParams {
     /// Session ID
     pub session_id: String,

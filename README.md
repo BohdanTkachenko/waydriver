@@ -131,7 +131,7 @@ about stale element handles. Common methods:
 | Method                                     | What it does                                     |
 | ------------------------------------------ | ------------------------------------------------ |
 | `click()` / `double_click()` / `right_click()` | Invoke the AT-SPI `Action` interface (primary, secondary, tertiary actions) |
-| `hover()` / `drag_to(target)`              | Pointer-driven hover and drag — lands on real Wayland input events for repaint |
+| `hover()` / `drag_to(target)` / `drag_to_coords(x, y)` | Pointer-driven hover and drag — lands on real Wayland input events for repaint. `drag_to_coords` releases at raw screen coordinates, so the drop can land off-window (e.g. libadwaita tab drag-out) |
 | `focus()` / `scroll_into_view()`           | `Component::grab_focus` and `scroll_to`/`scroll_to_point` |
 | `set_text(s)` / `fill(s)`                  | Direct `EditableText` write vs. focus-and-type fallback for widgets without `EditableText` (e.g. `GtkTextView`) |
 | `select_option(by)`                        | Pick a child of a Selection-interface container by label or index |
@@ -163,6 +163,7 @@ with `.nth(i)` or a more specific XPath.
 | `click` / `double_click` / `right_click` | Invoke an element's primary / secondary / tertiary AT-SPI `Action`. Auto-waits for visibility + enablement. |
 | `hover`           | Move the pointer to an element's center — drives a real Wayland motion event so hover-state UI repaints |
 | `drag_to`         | Press, move across an element's center, release — full Wayland drag gesture |
+| `drag_to_coords`  | Like `drag_to`, but release at raw screen-absolute `(x, y)` — drop onto empty space or off the source window (libadwaita tab drag-out and other "drop onto nothing" DnD) |
 | `focus`           | Give keyboard focus to an element via AT-SPI `Component::grab_focus`  |
 | `set_text`        | Replace an editable element's contents via `EditableText` (fast, requires the interface) |
 | `fill`            | Focus + clear + type — fallback for widgets without `EditableText` (e.g. `GtkTextView`/`GtkEntry`). Tries AT-SPI `Component::grab_focus` first; widgets whose bridge doesn't expose Component (the documented GTK4 case) fall back to a pointer click at the widget's centre to drive focus through the input layer, the same way a user would. Set `assume_focused: true` to skip the whole focus step when the target is already focused. Supports `caret_nav`/`select_all` clear modes. |

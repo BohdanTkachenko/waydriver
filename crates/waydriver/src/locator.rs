@@ -1352,7 +1352,44 @@ impl Locator {
     pub async fn drag_to(&self, target: &Locator) -> Result<()> {
         let (sx, sy) = self.wait_and_center().await?;
         let (tx, ty) = target.wait_and_center().await?;
+        self.drag_between(sx, sy, tx, ty).await
+    }
 
+    /// Drag from the centre of this element to arbitrary **screen-absolute**
+    /// coordinates with the primary mouse button held down.
+    ///
+    /// Unlike [`drag_to`](Self::drag_to), the drop endpoint is a raw
+    /// `(x, y)` point rather than another element, so the release can land
+    /// on empty screen space or off the source window entirely — coordinates
+    /// where no AT-SPI node exists to serve as a [`Locator`]. This is what
+    /// libadwaita's tab drag-out (`AdwTabView::connect_create_window`) and
+    /// other "drop onto nothing" DnD contracts need.
+    ///
+    /// Coordinates are in the same screen-absolute logical-pixel space as
+    /// [`screen_bounds`](Self::screen_bounds) and
+    /// [`Session::pointer_motion_absolute`](crate::Session::pointer_motion_absolute);
+    /// derive off-window targets from `self.screen_bounds()` (e.g.
+    /// `bounds.x - 50.0`, `bounds.y + 200.0`).
+    ///
+    /// The gesture moves in small linear steps (see
+    /// [`DRAG_INTERMEDIATE_STEPS`]) just like `drag_to`, so GTK4's DnD
+    /// threshold fires reliably. Auto-waits for the source to be
+    /// resolvable, showing, and enabled before the button is pressed; on any
+    /// mid-drag error the button is released before the error propagates so
+    /// subsequent calls don't inherit a stuck button.
+    pub async fn drag_to_coords(&self, x: f64, y: f64) -> Result<()> {
+        let (sx, sy) = self.wait_and_center().await?;
+        self.drag_between(sx, sy, x, y).await
+    }
+
+    /// Press the primary button at `(sx, sy)`, step the pointer to
+    /// `(tx, ty)` through [`DRAG_INTERMEDIATE_STEPS`] intermediate waypoints,
+    /// then release. Shared body of [`drag_to`](Self::drag_to) and
+    /// [`drag_to_coords`](Self::drag_to_coords); both endpoints are
+    /// screen-absolute logical pixels. On any motion error the button is
+    /// released before the error bubbles up so the next call doesn't inherit
+    /// a stuck mouse state.
+    async fn drag_between(&self, sx: f64, sy: f64, tx: f64, ty: f64) -> Result<()> {
         self.session.pointer_motion_absolute(sx, sy).await?;
         self.session
             .pointer_button_down(crate::backend::PointerButton::Left)
