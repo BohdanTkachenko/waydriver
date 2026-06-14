@@ -8,13 +8,12 @@ use atspi::proxy::selection::SelectionProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::proxy::value::ValueProxy;
 use atspi::{CoordType, ScrollType, State, StateSet};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 use sxd_document::parser;
 use sxd_xpath::{Context, Factory, Value};
+use tokio::task::JoinSet;
 use zbus::proxy::CacheProperties;
 
 use crate::error::{Error, Result};
@@ -404,17 +403,66 @@ pub async fn snapshot_tree(
     app_bus_name: &str,
     app_path: &str,
 ) -> Result<String> {
-    let app_root = build_accessible(conn, app_bus_name, app_path)
+    // Validate the root up front so a bad app reference still surfaces as the
+    // same error as before. The concurrent fetch below tolerates per-node build
+    // failures by skipping the node — right for children, but for the root it
+    // would silently yield an empty snapshot instead of a clear error.
+    build_accessible(conn, app_bus_name, app_path)
         .await
         .map_err(|e| Error::atspi_with("failed to get app root", e))?;
 
+    let nodes = fetch_subtree(conn, app_bus_name, app_path).await;
+
     let mut output = String::new();
     output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    snapshot_node(conn, &app_root, app_bus_name, app_path, 0, &mut output).await;
+    let root_key = (app_bus_name.to_string(), app_path.to_string());
+    if nodes.contains_key(&root_key) {
+        serialize_node(&nodes, &root_key, 0, &mut output);
+    }
     Ok(output)
 }
 
-type SnapshotFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+/// Per-node data captured by the concurrent fetch ([`fetch_subtree`]) and later
+/// rendered to XML by [`serialize_node`]. Splitting capture (I/O-bound, run
+/// concurrently) from rendering (pure, ordered) is what lets the walk fan out
+/// both the per-node reads and the child recursion while still emitting a
+/// document-ordered snapshot identical to the old sequential walk.
+struct RawNode {
+    /// AT-SPI `(bus, path)` identity — also this node's key in the fetch map.
+    bus: String,
+    path: String,
+    /// Recursion depth at first discovery (root = 0). Drives the depth cap.
+    depth: usize,
+    /// Raw AT-SPI role, with `"unknown"` substituted on a failed read (same
+    /// fallback the old walk used, so the emitted element tag is unchanged).
+    raw_role: String,
+    name: String,
+    states: StateSet,
+    attrs: HashMap<String, String>,
+    bounds: Option<Rect>,
+    /// Whether `GetChildren` returned a non-empty list. Mirrors the old walk's
+    /// open-tag-vs-self-close decision, which keyed off the *raw* reply being
+    /// non-empty — independent of whether those children then resolved.
+    had_children: bool,
+    /// Child `(bus, path)` refs in document order (only those whose ref carried
+    /// a resolvable bus name; the rest are dropped, exactly as before).
+    children: Vec<(String, String)>,
+}
+
+/// Depth cap: nodes deeper than this are emitted self-closed and their children
+/// are not fetched — the same `depth > 20` guard the sequential walk used to
+/// bound pathological / cyclic trees.
+const MAX_DEPTH: usize = 20;
+
+/// How many node fetches run concurrently. Each in-flight node issues up to 6
+/// D-Bus calls at once, so this bounds outstanding calls on the a11y connection
+/// at 8 × 6 = 48 — well under a session bus daemon's default
+/// `max_replies_per_connection` of 128, leaving headroom even if a session runs
+/// a couple of snapshots at once (exceeding the cap would make `GetChildren`
+/// fail and silently drop a subtree). The synthetic benchmark saturates by this
+/// point anyway: a real toolkit answers a11y queries on a single main-loop
+/// thread, so wider fan-out mostly just hides transport latency.
+const WALK_CONCURRENCY: usize = 8;
 
 /// Snapshot policy: per-node D-Bus introspection calls
 /// (`name`, `get_role_name`, `get_state`, `get_attributes`) that
@@ -444,118 +492,227 @@ where
     T::default()
 }
 
-fn snapshot_node<'a>(
-    conn: &'a zbus::Connection,
-    proxy: &'a AccessibleProxy<'a>,
-    bus_name: &'a str,
-    path: &'a str,
-    depth: usize,
-    output: &'a mut String,
-) -> SnapshotFuture<'a> {
-    Box::pin(async move {
-        // role has its own non-Default fallback ("unknown") because
-        // an empty role string would change the meaning of the
-        // emitted XML element tag (`role_to_element_name` would map
-        // it to `<Node>` for a different reason than the
-        // genuinely-unmapped role case).
-        let raw_role = proxy.get_role_name().await.unwrap_or_else(|e| {
-            tracing::warn!(
-                %bus_name, %path, error = %e,
-                "snapshot: get_role_name failed; substituting \"unknown\""
-            );
-            "unknown".into()
-        });
-        let name: String = proxy
-            .name()
-            .await
-            .unwrap_or_else(|e| snapshot_default_on_err(bus_name, path, "name", e));
-        let states: StateSet = proxy
-            .get_state()
-            .await
-            .unwrap_or_else(|e| snapshot_default_on_err(bus_name, path, "get_state", e));
-        let attrs: HashMap<String, String> = proxy
-            .get_attributes()
-            .await
-            .unwrap_or_else(|e| snapshot_default_on_err(bus_name, path, "get_attributes", e));
-        // Fetch window-relative bounds via the Component interface. Any
-        // error — element doesn't implement Component, toolkit refused,
-        // D-Bus NoReply — maps to "no bounds available" rather than
-        // aborting the snapshot. This preserves the invariant that a
-        // snapshot always succeeds even when individual nodes misbehave.
-        //
-        // `Window` over `Screen`: under headless mutter the toolkit
-        // routinely reports `(0, 0)` for screen-relative positions (no
-        // actual screen to anchor to), which defeats the bounds-based
-        // overflow check in `Locator::scroll_into_view` and makes every
-        // widget look like it's at the origin. Window-relative coords
-        // are stable across headless/headed and give enough signal for
-        // layout math.
-        let bounds = extents_on(conn, bus_name, path, CoordType::Window)
-            .await
-            .ok()
-            .flatten();
+/// Concurrently capture the AT-SPI subtree rooted at `(root_bus, root_path)`
+/// into a `(bus, path) -> RawNode` map.
+///
+/// A bounded worker pool ([`WALK_CONCURRENCY`] nodes in flight) fetches each
+/// node — its per-node reads fanned out via `join!` — then enqueues that node's
+/// children. A `seen` set dedups, so a malformed tree that reaches the same
+/// accessible from two parents (or forms a cycle) is fetched at most once; the
+/// depth cap is then enforced during rendering, which is what terminates a
+/// cyclic tree. Turning the old ~6N *serial* round-trips into a bounded-width
+/// fan-out is the whole point (issue #11).
+async fn fetch_subtree(
+    conn: &zbus::Connection,
+    root_bus: &str,
+    root_path: &str,
+) -> HashMap<(String, String), RawNode> {
+    let mut nodes: HashMap<(String, String), RawNode> = HashMap::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut queue: VecDeque<(String, String, usize)> = VecDeque::new();
+    let mut workers: JoinSet<Option<RawNode>> = JoinSet::new();
 
-        let element_name = role_to_element_name(&raw_role).unwrap_or_else(|| "Node".to_string());
+    seen.insert((root_bus.to_string(), root_path.to_string()));
+    queue.push_back((root_bus.to_string(), root_path.to_string(), 0));
 
-        let indent = "  ".repeat(depth);
-        let _ = write!(output, "{indent}<{element_name}");
-
-        // The raw AT-SPI role is always emitted as an attribute so metadata
-        // reads (Locator::role, query responses) can read directly from the
-        // snapshot without a second round-trip. The element tag doubles as a
-        // convenient XPath node-test but loses fidelity for weird roles that
-        // fall back to <Node>; the `role` attribute is the source of truth.
-        let _ = write!(output, " role=\"{}\"", xml_escape(&raw_role));
-        if !name.is_empty() {
-            let _ = write!(output, " name=\"{}\"", xml_escape(&name));
-        }
-        for (state, attr) in EMITTED_STATES {
-            if states.contains(*state) {
-                let _ = write!(output, " {attr}=\"true\"");
-            }
-        }
-        if let Some(bb) = bounds {
-            let _ = write!(output, " bbox=\"{}\"", bb.to_bbox_string());
-        }
-        for (key, value) in &attrs {
-            if let Some(safe) = sanitize_attr_key(key) {
-                let _ = write!(output, " {}=\"{}\"", safe, xml_escape(value));
-            }
-        }
-        let _ = write!(
-            output,
-            " _ref=\"{}|{}\"",
-            xml_escape(bus_name),
-            xml_escape(path)
-        );
-
-        if depth > 20 {
-            output.push_str("/>\n");
-            return;
+    loop {
+        // Top up the in-flight set from the queue.
+        while workers.len() < WALK_CONCURRENCY {
+            let Some((bus, path, depth)) = queue.pop_front() else {
+                break;
+            };
+            // zbus connections are cheap Arc-backed handles; cloning lets each
+            // fetch be a `'static` spawned task without borrowing `conn`.
+            let conn = conn.clone();
+            workers.spawn(fetch_one(conn, bus, path, depth));
         }
 
-        let children = match proxy.get_children().await {
-            Ok(c) if !c.is_empty() => c,
-            _ => {
-                output.push_str("/>\n");
-                return;
+        // Nothing running and nothing queued ⇒ done.
+        let Some(joined) = workers.join_next().await else {
+            break;
+        };
+        let node = match joined {
+            Ok(Some(node)) => node,
+            // A node whose proxy couldn't be built is skipped — exactly as the
+            // sequential walk skipped a child it failed to `build_accessible`.
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "snapshot: node fetch task failed; skipping");
+                continue;
             }
         };
 
-        output.push_str(">\n");
-        for child_ref in &children {
-            let Some(child_bus) = child_ref.name_as_str() else {
-                continue;
-            };
-            let child_path = child_ref.path_as_str();
-            let child = match build_accessible(conn, child_bus, child_path).await {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            snapshot_node(conn, &child, child_bus, child_path, depth + 1, output).await;
+        for (cbus, cpath) in &node.children {
+            let key = (cbus.clone(), cpath.clone());
+            // `insert` returns false if already queued/fetched — the dedup.
+            if seen.insert(key.clone()) {
+                queue.push_back((key.0, key.1, node.depth + 1));
+            }
         }
-        let _ = writeln!(output, "{indent}</{element_name}>");
+        nodes.insert((node.bus.clone(), node.path.clone()), node);
+    }
+
+    nodes
+}
+
+/// Fetch one node's metadata and child refs, with the per-node reads issued
+/// concurrently (`join!`) instead of one-after-another. Returns `None` when the
+/// accessible proxy can't be built, so the caller skips the node — matching the
+/// sequential walk's child handling.
+async fn fetch_one(
+    conn: zbus::Connection,
+    bus: String,
+    path: String,
+    depth: usize,
+) -> Option<RawNode> {
+    let proxy = build_accessible(&conn, &bus, &path).await.ok()?;
+
+    // role keeps its own non-Default "unknown" fallback: an empty role string
+    // would change the emitted element tag (`role_to_element_name` -> `<Node>`),
+    // so it can't share `snapshot_default_on_err`.
+    let role_fut = async {
+        proxy.get_role_name().await.unwrap_or_else(|e| {
+            tracing::warn!(
+                %bus, %path, error = %e,
+                "snapshot: get_role_name failed; substituting \"unknown\""
+            );
+            "unknown".to_string()
+        })
+    };
+    let name_fut = async {
+        proxy
+            .name()
+            .await
+            .unwrap_or_else(|e| snapshot_default_on_err(&bus, &path, "name", e))
+    };
+    let states_fut = async {
+        proxy
+            .get_state()
+            .await
+            .unwrap_or_else(|e| snapshot_default_on_err(&bus, &path, "get_state", e))
+    };
+    let attrs_fut = async {
+        proxy
+            .get_attributes()
+            .await
+            .unwrap_or_else(|e| snapshot_default_on_err(&bus, &path, "get_attributes", e))
+    };
+    // Window-relative bounds via the Component interface. Any error — no
+    // Component, toolkit refused, D-Bus NoReply — maps to "no bounds available"
+    // rather than aborting the snapshot. `Window` over `Screen`: headless mutter
+    // reports `(0, 0)` for screen-relative positions, which would defeat the
+    // bounds-based overflow check in `Locator::scroll_into_view`.
+    let bounds_fut = async {
+        extents_on(&conn, &bus, &path, CoordType::Window)
+            .await
+            .ok()
+            .flatten()
+    };
+    // Children are only fetched within the depth cap. `had_children` tracks the
+    // *raw* reply being non-empty (it drives open-vs-self-close); the returned
+    // refs are filtered to those carrying a resolvable bus name.
+    let children_fut = async {
+        if depth > MAX_DEPTH {
+            return (false, Vec::new());
+        }
+        match proxy.get_children().await {
+            Ok(c) if !c.is_empty() => {
+                let refs = c
+                    .iter()
+                    .filter_map(|child| {
+                        child
+                            .name_as_str()
+                            .map(|b| (b.to_string(), child.path_as_str().to_string()))
+                    })
+                    .collect();
+                (true, refs)
+            }
+            _ => (false, Vec::new()),
+        }
+    };
+
+    let (raw_role, name, states, attrs, bounds, (had_children, children)) = tokio::join!(
+        role_fut,
+        name_fut,
+        states_fut,
+        attrs_fut,
+        bounds_fut,
+        children_fut
+    );
+
+    Some(RawNode {
+        bus,
+        path,
+        depth,
+        raw_role,
+        name,
+        states,
+        attrs,
+        bounds,
+        had_children,
+        children,
     })
+}
+
+/// Render the subtree at `key` into `output` in document order — the pure,
+/// sequential half of the walk. Emits byte-for-byte the same XML the old
+/// `snapshot_node` wrote; the depth cap is enforced here (self-close at
+/// `depth > MAX_DEPTH`), which terminates rendering of a cyclic tree.
+fn serialize_node(
+    nodes: &HashMap<(String, String), RawNode>,
+    key: &(String, String),
+    depth: usize,
+    output: &mut String,
+) {
+    // A child ref that isn't in the map failed to build and was skipped during
+    // the fetch — the same outcome as the old walk's `continue`.
+    let Some(node) = nodes.get(key) else {
+        return;
+    };
+
+    let element_name = role_to_element_name(&node.raw_role).unwrap_or_else(|| "Node".to_string());
+
+    let indent = "  ".repeat(depth);
+    let _ = write!(output, "{indent}<{element_name}");
+
+    // The raw AT-SPI role is always emitted as an attribute so metadata reads
+    // (Locator::role, query responses) can read directly from the snapshot. The
+    // element tag doubles as a convenient XPath node-test but loses fidelity for
+    // weird roles that fall back to <Node>; the `role` attribute is the truth.
+    let _ = write!(output, " role=\"{}\"", xml_escape(&node.raw_role));
+    if !node.name.is_empty() {
+        let _ = write!(output, " name=\"{}\"", xml_escape(&node.name));
+    }
+    for (state, attr) in EMITTED_STATES {
+        if node.states.contains(*state) {
+            let _ = write!(output, " {attr}=\"true\"");
+        }
+    }
+    if let Some(bb) = node.bounds {
+        let _ = write!(output, " bbox=\"{}\"", bb.to_bbox_string());
+    }
+    for (attr_key, value) in &node.attrs {
+        if let Some(safe) = sanitize_attr_key(attr_key) {
+            let _ = write!(output, " {}=\"{}\"", safe, xml_escape(value));
+        }
+    }
+    let _ = write!(
+        output,
+        " _ref=\"{}|{}\"",
+        xml_escape(&node.bus),
+        xml_escape(&node.path)
+    );
+
+    if depth > MAX_DEPTH || !node.had_children {
+        output.push_str("/>\n");
+        return;
+    }
+
+    output.push_str(">\n");
+    for child_key in &node.children {
+        serialize_node(nodes, child_key, depth + 1, output);
+    }
+    let _ = writeln!(output, "{indent}</{element_name}>");
 }
 
 // ── XPath evaluation ────────────────────────────────────────────────────────
@@ -1471,6 +1628,200 @@ mod tests {
     fn xml_escape_basic() {
         assert_eq!(xml_escape("<a&b>\"'"), "&lt;a&amp;b&gt;&quot;&apos;");
         assert_eq!(xml_escape("hello"), "hello");
+    }
+
+    // ── serialize_node: the rendering half of the (now parallel) walk ────────
+    //
+    // The concurrent fetch (fetch_subtree/fetch_one) is covered structurally by
+    // `tests/atspi_tree_walk_bench.rs` and behaviorally by the GTK e2e suite;
+    // these pin the *output format* byte-for-byte so the parallelization can't
+    // silently change the snapshot a Locator's XPath runs against.
+
+    #[allow(clippy::too_many_arguments)]
+    fn raw(
+        bus: &str,
+        path: &str,
+        depth: usize,
+        role: &str,
+        name: &str,
+        states: StateSet,
+        attrs: &[(&str, &str)],
+        bounds: Option<Rect>,
+        had_children: bool,
+        children: &[(&str, &str)],
+    ) -> RawNode {
+        RawNode {
+            bus: bus.to_string(),
+            path: path.to_string(),
+            depth,
+            raw_role: role.to_string(),
+            name: name.to_string(),
+            states,
+            attrs: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            bounds,
+            had_children,
+            children: children
+                .iter()
+                .map(|(b, p)| (b.to_string(), p.to_string()))
+                .collect(),
+        }
+    }
+
+    fn key(bus: &str, path: &str) -> (String, String) {
+        (bus.to_string(), path.to_string())
+    }
+
+    #[test]
+    fn serialize_node_matches_sequential_format() {
+        // A frame with two resolvable children and one that failed to build
+        // (absent from the map → skipped, exactly as the old walk's `continue`).
+        let mut nodes: HashMap<(String, String), RawNode> = HashMap::new();
+        nodes.insert(
+            key("app", "/root"),
+            raw(
+                "app",
+                "/root",
+                0,
+                "frame",
+                "Main",
+                StateSet::empty(),
+                &[],
+                Some(Rect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 50,
+                }),
+                true,
+                &[("app", "/a"), ("app", "/b"), ("app", "/missing")],
+            ),
+        );
+        nodes.insert(
+            key("app", "/a"),
+            raw(
+                "app",
+                "/a",
+                1,
+                "push button",
+                "OK",
+                StateSet::new(State::Showing | State::Enabled),
+                &[("toolkit", "gtk")],
+                None,
+                false,
+                &[],
+            ),
+        );
+        nodes.insert(
+            key("app", "/b"),
+            raw(
+                "app",
+                "/b",
+                1,
+                "label",
+                "",
+                StateSet::empty(),
+                &[],
+                None,
+                false,
+                &[],
+            ),
+        );
+
+        let mut out = String::new();
+        serialize_node(&nodes, &key("app", "/root"), 0, &mut out);
+
+        // Note the exact shape: role always present; name only when non-empty;
+        // states in EMITTED_STATES order; bbox when bounds present; toolkit
+        // attrs after; `_ref` last; 2-space indent per depth; self-closing
+        // leaves; the unresolved `/missing` child contributes nothing.
+        let expected = concat!(
+            "<Frame role=\"frame\" name=\"Main\" bbox=\"0,0,100,50\" _ref=\"app|/root\">\n",
+            "  <PushButton role=\"push button\" name=\"OK\" showing=\"true\" enabled=\"true\" toolkit=\"gtk\" _ref=\"app|/a\"/>\n",
+            "  <Label role=\"label\" _ref=\"app|/b\"/>\n",
+            "</Frame>\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn serialize_node_opens_and_closes_when_children_unresolved() {
+        // had_children=true but every child ref is absent from the map (all
+        // failed to build) → an open+close pair, never self-closed. Mirrors the
+        // old walk, whose self-close decision keyed off the *raw* GetChildren
+        // reply being non-empty, not on the children resolving.
+        let mut nodes: HashMap<(String, String), RawNode> = HashMap::new();
+        nodes.insert(
+            key("app", "/p"),
+            raw(
+                "app",
+                "/p",
+                0,
+                "panel",
+                "",
+                StateSet::empty(),
+                &[],
+                None,
+                true,
+                &[("app", "/gone")],
+            ),
+        );
+        let mut out = String::new();
+        serialize_node(&nodes, &key("app", "/p"), 0, &mut out);
+        assert_eq!(out, "<Panel role=\"panel\" _ref=\"app|/p\">\n</Panel>\n");
+    }
+
+    #[test]
+    fn serialize_node_self_closes_past_depth_cap() {
+        // Rendered past the depth cap, a node self-closes and does not recurse
+        // even though it has children in the map — the guard that terminates a
+        // cyclic tree (the fetch keys on path, so a cycle is captured once and
+        // rendering, not fetching, bounds the expansion).
+        let mut nodes: HashMap<(String, String), RawNode> = HashMap::new();
+        nodes.insert(
+            key("app", "/deep"),
+            raw(
+                "app",
+                "/deep",
+                MAX_DEPTH + 1,
+                "panel",
+                "",
+                StateSet::empty(),
+                &[],
+                None,
+                true,
+                &[("app", "/child")],
+            ),
+        );
+        nodes.insert(
+            key("app", "/child"),
+            raw(
+                "app",
+                "/child",
+                MAX_DEPTH + 2,
+                "label",
+                "childname",
+                StateSet::empty(),
+                &[],
+                None,
+                false,
+                &[],
+            ),
+        );
+
+        let mut out = String::new();
+        serialize_node(&nodes, &key("app", "/deep"), MAX_DEPTH + 1, &mut out);
+
+        assert!(
+            out.trim_end().ends_with("/>"),
+            "node past the depth cap should self-close: {out:?}"
+        );
+        assert!(
+            !out.contains("/child") && !out.contains("childname"),
+            "must not recurse past the depth cap: {out:?}"
+        );
     }
 
     #[test]

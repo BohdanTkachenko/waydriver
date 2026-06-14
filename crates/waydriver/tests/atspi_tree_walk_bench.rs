@@ -1,20 +1,20 @@
 //! Benchmark: AT-SPI tree-walk cost (`waydriver::atspi::snapshot_tree`).
 //!
 //! Issue #11 ("Performance: AT-SPI tree walk cost on large apps") observes that
-//! every `Locator` call re-snapshots the whole AT-SPI tree, and that
-//! `snapshot_node` issues ~6 *serial* D-Bus round-trips per node
-//! (`GetRoleName`, the `Name` property, `GetState`, `GetAttributes`,
-//! `Component.GetExtents`, `GetChildren`). For apps with thousands of accessible
-//! nodes that is O(N) serial round-trips and degrades noticeably — but there is
-//! no large-app fixture in the suite to measure it against.
+//! every `Locator` call re-snapshots the whole AT-SPI tree, and that the walk
+//! makes 6 D-Bus calls per node (`GetRoleName`, the `Name` property, `GetState`,
+//! `GetAttributes`, `Component.GetExtents`, `GetChildren`). The original walk
+//! issued those *serially*, so a tree of N nodes cost ~6N serial round-trips —
+//! O(N) latency that degrades noticeably on large apps. There was no large-app
+//! fixture in the suite to measure it against.
 //!
 //! So this test *synthesizes* one. It stands up a mock AT-SPI application on a
 //! private `dbus-daemon` that serves a tree of a configurable shape and size,
 //! then times the real production walk (`waydriver::atspi::snapshot_tree`)
 //! against it. No GTK, no mutter — just the D-Bus surface the walker actually
-//! touches, so the numbers reflect the per-node round-trip cost the issue is
-//! about and will move when the walk is optimized (e.g. the parallelization
-//! suggested in the issue triage).
+//! touches, so the numbers track the real per-node cost. The walk now fans the
+//! per-node reads and the child recursion out with bounded concurrency, so this
+//! is also the before/after for that change (and for any future tuning).
 //!
 //! Gated `#[ignore]` (it spawns a `dbus-daemon` and runs for several seconds).
 //! Run it and read the printed table with:
@@ -390,15 +390,17 @@ async fn atspi_tree_walk_bench() {
     )
     .await;
 
-    // The walk is ~6 serial D-Bus round-trips per node (issue #11), so the
-    // headline cost is `per-node × N` and grows linearly with the tree. The
-    // absolute per-node figure is environment-bound — each round-trip is routed
-    // through the bus daemon, so a constrained/virtualized host (like CI
-    // sandboxes) sees much higher latency than bare metal — but the linear
-    // scaling and the "re-run on every locator call" multiplier are the points.
+    // The walk makes 6 D-Bus calls per node (issue #11); the cost still scales
+    // with N, but the per-node reads and child recursion now run with bounded
+    // concurrency, so wall-clock is well below the old ~6N serial round-trips.
+    // The absolute per-node figure is environment-bound — each round-trip is
+    // routed through the bus daemon, so a constrained/virtualized host (like CI
+    // sandboxes) sees much higher latency than bare metal — and a real toolkit
+    // serializes its a11y bridge on one thread, capping the win at hiding
+    // transport latency; the linear scaling with N is the portable signal.
     println!(
-        "note: cost is ~6 serial D-Bus round-trips/node; per-node latency is \
-         environment-bound, the linear scaling is not."
+        "note: 6 D-Bus calls/node, now fanned out with bounded concurrency; \
+         per-node latency is environment-bound, the scaling with N is not."
     );
     println!("=== end benchmark ===\n");
 
