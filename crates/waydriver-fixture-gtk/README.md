@@ -8,6 +8,7 @@ cargo run -p waydriver-fixture-gtk                          # default: gtk4
 cargo run -p waydriver-fixture-gtk -- --section=adw         # just libadwaita
 cargo run -p waydriver-fixture-gtk -- --section=dnd         # just drag-and-drop
 cargo run -p waydriver-fixture-gtk -- --section=lazy-a11y   # adw lazy-realization repros
+cargo run -p waydriver-fixture-gtk -- --section=effects     # notification / portal open-URI
 ```
 
 Or use it as an e2e test fixture target:
@@ -37,6 +38,8 @@ Sections:
 3. **dnd** — drag-and-drop source + target + status label
 4. **lazy-a11y** — minimal repros for two libadwaita lazy-realization
    bugs where on-screen widgets never enter the AT-SPI tree
+5. **effects** — buttons that emit external effects (desktop notification,
+   portal open-URI) onto the session bus for waydriver's mock sinks
 
 Only one section is ever live in the a11y tree at a time. There is
 no "all" view: mixing sections makes selectors ambiguous and widgets
@@ -52,8 +55,15 @@ they're the focused section.
 | `--section=adw` / `--section=libadwaita`    | Only Adw widgets                |
 | `--section=dnd` / `--section=drag-and-drop` | Only DnD widgets                |
 | `--section=lazy-a11y` / `--section=lazy`    | Adw lazy-realization repros     |
+| `--section=effects` / `--section=external-effects` | External-effect buttons   |
 
 Legacy alias `--tab=<name>` is accepted for backwards compatibility.
+
+The fixture is a single-instance `GApplication` (`HANDLES_COMMAND_LINE`):
+launching a second instance forwards its command line to the running
+primary, which prints `fixture-event: command-line-forwarded args=[...]`.
+Our own `--section`/`--tab` flag is stripped before GApplication parses
+argv, so positional args passed to a secondary instance forward cleanly.
 
 Useful for one-shot tests: launch the fixture with the section under
 test and the a11y tree contains only that section's widgets, keeping
@@ -121,6 +131,9 @@ fixture-event: clicked open-non-initial-page-dialog
 fixture-event: dialog-opened non-initial-page-dialog
 fixture-event: dialog-closed non-initial-page-dialog
 fixture-event: toggled lazy-switch active=true
+fixture-event: notification-sent fire-notification id=1
+fixture-event: open-uri-requested open-uri uri="https://example.com/waydriver"
+fixture-event: command-line-forwarded args=["forwarded-token-xyz"]
 ```
 
 Quoting: string fields use Rust `{:?}` debug formatting (embedded quotes
@@ -254,6 +267,24 @@ Expected test flow: drag from `drag-source` to `drop-target`, then wait
 for `drop-status` text to change from `ready` to `got dnd-payload-token`.
 That verifies pointer-based DnD end-to-end (once element bounds +
 pointer-based drag primitives land on the waydriver side).
+
+## External-effects tab — widget inventory
+
+Two buttons that emit "external effects" onto the session bus for
+waydriver's mock D-Bus sinks (`Session::capture_external_effects`) to
+capture. Both issue the D-Bus call **directly** (exactly what libnotify /
+the portal helper put on the wire), so the test is deterministic and
+independent of GLib's notification-backend / portal-routing heuristics.
+
+| Widget        | Accessible name     | Effect                                              |
+|---------------|---------------------|----------------------------------------------------|
+| `gtk::Button` | `fire-notification` | `org.freedesktop.Notifications.Notify` (summary `fixture-notification`) |
+| `gtk::Button` | `open-uri`          | `org.freedesktop.portal.OpenURI` for `https://example.com/waydriver` |
+
+Expected test flow: enable capture (`capture_external_effects: true`),
+click the button, wait for its stdout event (`notification-sent` /
+`open-uri-requested`), then read back via `Session::notifications()` /
+`open_uri_requests()` (or the MCP `get_captured_effects` tool).
 
 ## When to add widgets
 

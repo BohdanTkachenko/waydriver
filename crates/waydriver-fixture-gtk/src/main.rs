@@ -14,6 +14,9 @@
 //!   bugs that hide widgets from AT-SPI: a `PreferencesGroup` built with
 //!   `visible:false` then flipped on, and an `AdwPreferencesDialog` where
 //!   `set_visible_page_name` switches to a never-realized page.
+//! - **effects** — buttons that emit "external effects" onto the session
+//!   bus (a desktop notification and a portal open-URI request) for
+//!   waydriver's mock D-Bus sinks to capture. Both call D-Bus directly.
 //!
 //! Only the selected section's widgets live in the AT-SPI tree — no
 //! hidden sibling subtrees and no "show everything at once" mode. That's
@@ -26,8 +29,16 @@
 //! ## CLI
 //!
 //! `--section=<name>` (or the legacy alias `--tab=<name>`). Accepts
-//! `gtk4`, `adw` / `libadwaita`, `dnd` / `drag-and-drop`, or `lazy-a11y`.
-//! Default is `gtk4`.
+//! `gtk4`, `adw` / `libadwaita`, `dnd` / `drag-and-drop`, `lazy-a11y`, or
+//! `effects` / `external-effects`. Default is `gtk4`.
+//!
+//! ## Single-instance CLI forwarding
+//!
+//! The app is a single-instance `GApplication` with `HANDLES_COMMAND_LINE`.
+//! Launching a second instance with extra args forwards them to the primary,
+//! whose `command-line` handler prints
+//! `fixture-event: command-line-forwarded args=[...]`. Our own `--section`
+//! flag is stripped before GApplication sees argv, so it never interferes.
 //!
 //! ## Main menu
 //!
@@ -73,7 +84,7 @@ use gtk4::{
     Orientation, PopoverMenu, Scale, ScrolledWindow, StringList, TextView, ToggleButton,
 };
 use libadwaita as adw;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const APP_ID: &str = "io.github.bohdantkachenko.waydriver.FixtureGtk";
@@ -84,6 +95,7 @@ enum Section {
     Adw,
     Dnd,
     LazyA11y,
+    Effects,
 }
 
 impl Section {
@@ -93,6 +105,7 @@ impl Section {
             "adw" | "libadwaita" => Some(Section::Adw),
             "dnd" | "drag-and-drop" => Some(Section::Dnd),
             "lazy-a11y" | "lazy" => Some(Section::LazyA11y),
+            "effects" | "external-effects" => Some(Section::Effects),
             _ => None,
         }
     }
@@ -106,6 +119,7 @@ impl Section {
             Section::Adw => "adw",
             Section::Dnd => "dnd",
             Section::LazyA11y => "lazy-a11y",
+            Section::Effects => "effects",
         }
     }
 
@@ -118,31 +132,79 @@ impl Section {
             Section::Adw => "libadwaita",
             Section::Dnd => "Drag and drop",
             Section::LazyA11y => "Lazy a11y",
+            Section::Effects => "External effects",
         }
     }
 }
 
 fn main() -> glib::ExitCode {
-    let initial = parse_section_from_args();
-    let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(move |app| build_ui(app, initial));
-    // Pass empty args to GTK; we already consumed our CLI flag.
-    app.run_with_args::<&str>(&[])
+    // Split our own `--section=`/`--tab=` flag out of argv: the primary parses
+    // it to pick the initial section, and the *remaining* argv is handed to
+    // GApplication. With HANDLES_COMMAND_LINE, a secondary instance's leftover
+    // args are forwarded to the primary's `command-line` handler — which is how
+    // single-instance CLI forwarding is exercised. Keeping our own flag out of
+    // what GApplication parses preserves the existing `--section` behavior.
+    let (initial, gtk_argv) = split_section_args(std::env::args());
+
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
+
+    // `command-line` fires on the primary for its own launch and again for each
+    // forwarded secondary invocation. Build the UI on the first call; report the
+    // forwarded args on later ones so tests can observe the forwarding.
+    let built = Cell::new(false);
+    app.connect_command_line(move |app, cmdline| {
+        let argv: Vec<String> = cmdline
+            .arguments()
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        if !built.replace(true) {
+            build_ui(app, initial);
+        } else {
+            // Forwarded from a secondary instance: report what it sent
+            // (skipping argv[0], the program name).
+            let forwarded: Vec<String> = argv.into_iter().skip(1).collect();
+            emit(&format!("command-line-forwarded args={forwarded:?}"));
+            if let Some(win) = app.active_window() {
+                win.present();
+            }
+        }
+        glib::ExitCode::SUCCESS
+    });
+
+    // Safety net: a bare `activate` (no command line) just re-presents.
+    app.connect_activate(|app| {
+        if let Some(win) = app.active_window() {
+            win.present();
+        }
+    });
+
+    app.run_with_args(&gtk_argv)
 }
 
-fn parse_section_from_args() -> Section {
-    for arg in std::env::args().skip(1) {
+/// Pull the first `--section=`/`--tab=` flag out of `args`, returning the chosen
+/// section plus the remaining argv (our flag removed, `argv[0]` preserved) to
+/// hand to GApplication.
+fn split_section_args(args: impl IntoIterator<Item = String>) -> (Section, Vec<String>) {
+    let mut section = Section::Gtk4;
+    let mut rest = Vec::new();
+    for arg in args {
         let value = arg
             .strip_prefix("--section=")
             .or_else(|| arg.strip_prefix("--tab="));
         if let Some(value) = value {
-            return Section::from_str(value).unwrap_or_else(|| {
+            section = Section::from_str(value).unwrap_or_else(|| {
                 eprintln!("unknown --section value {value:?}; defaulting to gtk4");
                 Section::Gtk4
             });
+        } else {
+            rest.push(arg);
         }
     }
-    Section::Gtk4
+    (section, rest)
 }
 
 fn build_ui(app: &adw::Application, initial: Section) {
@@ -214,6 +276,7 @@ fn build_section(section: Section, window: &adw::ApplicationWindow) -> ScrolledW
         Section::Adw => append_adw_widgets(&col, window),
         Section::Dnd => append_dnd_widgets(&col),
         Section::LazyA11y => append_lazy_a11y_widgets(&col, window),
+        Section::Effects => append_effects_widgets(&col),
     }
 
     scroll.set_child(Some(&col));
@@ -481,6 +544,10 @@ fn build_menu_button(initial: Section) -> MenuButton {
     menu.append_item(&gio::MenuItem::new(
         Some("Lazy a11y"),
         Some("app.section::lazy-a11y"),
+    ));
+    menu.append_item(&gio::MenuItem::new(
+        Some("External effects"),
+        Some("app.section::effects"),
     ));
 
     let popover = PopoverMenu::from_model(Some(&menu));
@@ -859,6 +926,89 @@ fn append_lazy_a11y_widgets(col: &GtkBox, parent: &adw::ApplicationWindow) {
         emit("dialog-opened non-initial-page-dialog");
     });
     col.append(&open_non_initial_page);
+}
+
+// ── External-effect widgets ──────────────────────────────────────────────
+//
+// Two buttons that emit "external effects" onto the session bus — a desktop
+// notification and a portal open-URI request — for waydriver's mock sinks to
+// capture. Both make the D-Bus call directly via gio (exactly what libnotify /
+// the portal helper put on the wire), so the test is deterministic and doesn't
+// depend on GLib's notification-backend / portal-routing heuristics.
+
+const EFFECTS_NOTIFY_SUMMARY: &str = "fixture-notification";
+const EFFECTS_NOTIFY_BODY: &str = "fixture body text";
+const EFFECTS_OPEN_URI: &str = "https://example.com/waydriver";
+
+fn append_effects_widgets(col: &GtkBox) {
+    let fire = instrumented_button("fire-notification");
+    fire.connect_clicked(|_| match send_fixture_notification() {
+        Ok(id) => emit(&format!("notification-sent fire-notification id={id}")),
+        Err(e) => emit(&format!("notification-error fire-notification error={e}")),
+    });
+    col.append(&fire);
+
+    let open = instrumented_button("open-uri");
+    open.connect_clicked(|_| match request_open_uri(EFFECTS_OPEN_URI) {
+        Ok(()) => emit(&format!(
+            "open-uri-requested open-uri uri={EFFECTS_OPEN_URI:?}"
+        )),
+        Err(e) => emit(&format!("open-uri-error open-uri error={e}")),
+    });
+    col.append(&open);
+}
+
+/// Post a desktop notification via the freedesktop `Notify` method, returning
+/// the id the daemon (waydriver's mock sink) assigned.
+fn send_fixture_notification() -> Result<u32, glib::Error> {
+    let conn = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)?;
+    let hints = glib::VariantDict::new(None).end(); // a{sv}
+    let actions: Vec<String> = Vec::new();
+    let params = glib::Variant::tuple_from_iter([
+        "waydriver-fixture".to_variant(),    // app_name: s
+        0u32.to_variant(),                   // replaces_id: u
+        "dialog-information".to_variant(),   // app_icon: s
+        EFFECTS_NOTIFY_SUMMARY.to_variant(), // summary: s
+        EFFECTS_NOTIFY_BODY.to_variant(),    // body: s
+        actions.to_variant(),                // actions: as
+        hints,                               // hints: a{sv}
+        (-1i32).to_variant(),                // expire_timeout: i
+    ]);
+    let reply = conn.call_sync(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+        "Notify",
+        Some(&params),
+        None, // reply type unchecked; the reply Variant is still returned
+        gio::DBusCallFlags::NONE,
+        5000,
+        gio::Cancellable::NONE,
+    )?;
+    Ok(reply.get::<(u32,)>().map(|t| t.0).unwrap_or(0))
+}
+
+/// Ask the portal to open `uri` externally via `org.freedesktop.portal.OpenURI`.
+fn request_open_uri(uri: &str) -> Result<(), glib::Error> {
+    let conn = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)?;
+    let options = glib::VariantDict::new(None).end(); // a{sv}
+    let params = glib::Variant::tuple_from_iter([
+        "".to_variant(),  // parent_window: s
+        uri.to_variant(), // uri: s
+        options,          // options: a{sv}
+    ]);
+    conn.call_sync(
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.OpenURI",
+        "OpenURI",
+        Some(&params),
+        None, // reply type unchecked; we don't read the returned handle here
+        gio::DBusCallFlags::NONE,
+        5000,
+        gio::Cancellable::NONE,
+    )?;
+    Ok(())
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────

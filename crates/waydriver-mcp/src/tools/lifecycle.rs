@@ -28,8 +28,8 @@ use waydriver_compositor_mutter::MutterCompositor;
 use waydriver_input_mutter::MutterInput;
 
 use crate::cli::{
-    resolve_gsettings_isolation, resolve_report_dir, resolve_resolution, resolve_scale,
-    resolve_xdg_isolation,
+    resolve_capture_external_effects, resolve_gsettings_isolation, resolve_report_dir,
+    resolve_resolution, resolve_scale, resolve_xdg_isolation,
 };
 use crate::mcp_error::waydriver_to_mcp;
 use crate::params::{SessionIdParams, SetSettingParams, StartSessionParams};
@@ -128,6 +128,10 @@ impl UiTestServer {
         let isolate_settings =
             resolve_gsettings_isolation(self.default_gsettings_isolation, params.isolate_settings);
         let isolate_xdg = resolve_xdg_isolation(self.default_xdg_isolation, params.isolate_xdg);
+        let capture_external_effects = resolve_capture_external_effects(
+            self.default_capture_external_effects,
+            params.capture_external_effects,
+        );
         let gsettings = waydriver::GSettingsConfig {
             isolated: isolate_settings,
             initial: params.gsettings.iter().map(|g| g.to_waydriver()).collect(),
@@ -204,6 +208,7 @@ impl UiTestServer {
                     gsettings_isolated: isolate_settings,
                     xdg_isolated: isolate_xdg,
                     extra_env: Vec::new(),
+                    capture_external_effects,
                 },
             )
             .await
@@ -245,6 +250,7 @@ impl UiTestServer {
                 "resolution": resolution,
                 "scale": scale,
                 "isolate_settings": isolate_settings,
+                "capture_external_effects": capture_external_effects,
             });
             // Best-effort: append_event is internally bounded so a stalled
             // filesystem can't hang us here.

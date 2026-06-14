@@ -86,6 +86,15 @@ pub struct StartSessionParams {
     /// returns an error instead of hanging. When unset, falls back to the
     /// server's `--setup-timeout-secs` flag (default 90).
     pub setup_timeout_secs: Option<u64>,
+    /// Capture the app's external effects: stand up mock D-Bus sinks on this
+    /// session's bus that record desktop notifications
+    /// (`org.freedesktop.Notifications`) and portal open-URI requests
+    /// (`org.freedesktop.portal.Desktop`), readable via `get_captured_effects`.
+    /// When unset, falls back to the server's `--capture-external-effects` flag
+    /// (default off). The sinks own well-known names — safe on the per-session
+    /// bus; on a shared host bus already running a notification daemon or portal
+    /// the claim no-ops and capture stays empty.
+    pub capture_external_effects: Option<bool>,
 }
 
 fn default_report_enabled() -> bool {
@@ -131,6 +140,21 @@ pub struct SetSettingParams {
 pub struct SessionIdParams {
     /// Session ID returned by start_session
     pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LaunchSecondaryParams {
+    /// Session ID returned by start_session
+    pub session_id: String,
+    /// Arguments for the secondary invocation (passed after the app command).
+    /// For a single-instance GApplication these are forwarded to the already-
+    /// running primary instance, which handles them (e.g. opens a file/tab).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Seconds to wait for the secondary process to exit before giving up.
+    /// A single-instance app forwards and exits near-instantly; when unset a
+    /// 15s default applies.
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

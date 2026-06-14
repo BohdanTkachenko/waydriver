@@ -73,6 +73,21 @@ pub struct Cli {
     /// `setup_timeout_secs` argument.
     #[arg(long, default_value_t = 90, env = "WAYDRIVER_SETUP_TIMEOUT_SECS")]
     pub setup_timeout_secs: u64,
+    /// Default for external-effect capture: stand up mock D-Bus sinks on each
+    /// session's bus that record the app's desktop notifications
+    /// (`org.freedesktop.Notifications`) and portal open-URI requests
+    /// (`org.freedesktop.portal.Desktop`), readable via `get_captured_effects`.
+    /// Off by default (opt-in) — the sinks own well-known names, only safe when
+    /// nothing else owns them (always true on the per-session/container bus; on
+    /// a shared host bus the claim no-ops with a warning). Per-session override
+    /// via start_session's `capture_external_effects` argument.
+    #[arg(
+        long,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        env = "WAYDRIVER_CAPTURE_EXTERNAL_EFFECTS"
+    )]
+    pub capture_external_effects: bool,
 }
 
 /// Resolve the effective report dir for a new session: per-session override
@@ -104,6 +119,12 @@ pub fn resolve_gsettings_isolation(default: bool, override_: Option<bool>) -> bo
 /// Resolve the effective XDG base-dir isolation flag for a new session:
 /// per-session override if provided, else the server's default.
 pub fn resolve_xdg_isolation(default: bool, override_: Option<bool>) -> bool {
+    override_.unwrap_or(default)
+}
+
+/// Resolve the effective external-effect-capture flag for a new session:
+/// per-session override if provided, else the server's default.
+pub fn resolve_capture_external_effects(default: bool, override_: Option<bool>) -> bool {
     override_.unwrap_or(default)
 }
 
@@ -269,5 +290,30 @@ mod tests {
     fn cli_accepts_setup_timeout_flag() {
         let cli = Cli::try_parse_from(["waydriver-mcp", "--setup-timeout-secs", "30"]).unwrap();
         assert_eq!(cli.setup_timeout_secs, 30);
+    }
+
+    #[test]
+    fn cli_capture_external_effects_defaults_to_false() {
+        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
+        assert!(!cli.capture_external_effects);
+    }
+
+    #[test]
+    fn cli_capture_external_effects_can_be_enabled() {
+        let cli =
+            Cli::try_parse_from(["waydriver-mcp", "--capture-external-effects", "true"]).unwrap();
+        assert!(cli.capture_external_effects);
+    }
+
+    #[test]
+    fn resolve_capture_external_effects_defaults_to_server_default() {
+        assert!(!resolve_capture_external_effects(false, None));
+        assert!(resolve_capture_external_effects(true, None));
+    }
+
+    #[test]
+    fn resolve_capture_external_effects_uses_override_when_provided() {
+        assert!(resolve_capture_external_effects(false, Some(true)));
+        assert!(!resolve_capture_external_effects(true, Some(false)));
     }
 }

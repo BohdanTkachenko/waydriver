@@ -104,6 +104,15 @@ fn fixture_binary() -> std::path::PathBuf {
 /// a specific `--section` so the AT-SPI tree contains only that
 /// section's widgets.
 async fn start_fixture_session(section: &str) -> anyhow::Result<(Arc<Session>, Arc<MutterState>)> {
+    start_fixture_session_opts(section, false).await
+}
+
+/// Like [`start_fixture_session`], but lets the caller turn on external-effect
+/// capture (mock notification + portal sinks) for the session.
+async fn start_fixture_session_opts(
+    section: &str,
+    capture_external_effects: bool,
+) -> anyhow::Result<(Arc<Session>, Arc<MutterState>)> {
     let mut compositor = MutterCompositor::new();
     compositor.start(None, None).await?;
     // `state()` returns `Option` post-API-tightening; immediately after
@@ -147,6 +156,7 @@ async fn start_fixture_session(section: &str) -> anyhow::Result<(Arc<Session>, A
             gsettings_isolated: true,
             xdg_isolated: true,
             extra_env: Vec::new(),
+            capture_external_effects,
         },
     )
     .await?;
@@ -3089,6 +3099,130 @@ async fn value_reads_slider_range() -> anyhow::Result<()> {
         "slider maximum should be 100, got {}",
         v.maximum
     );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// External-effect capture: clicking the fixture's `fire-notification` button
+/// sends an `org.freedesktop.Notifications.Notify` onto the session bus, which
+/// waydriver's mock sink records and exposes via `Session::notifications`.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_captures_notification() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session_opts("effects", true).await?;
+    assert!(
+        session.external_effects_enabled(),
+        "capture should be active for this session"
+    );
+
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='fire-notification']")
+        .click()
+        .await?;
+    // The fixture sends the notification synchronously, then prints this line.
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("notification-sent fire-notification"),
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    let notes = session.notifications()?;
+    assert_eq!(
+        notes.len(),
+        1,
+        "exactly one notification captured: {notes:?}"
+    );
+    assert_eq!(notes[0].summary, "fixture-notification");
+    assert_eq!(notes[0].body, "fixture body text");
+    assert_eq!(notes[0].app_name, "waydriver-fixture");
+
+    // The wait_for helper sees the same record.
+    let waited = session
+        .wait_for_notification(
+            0,
+            |n| n.summary == "fixture-notification",
+            Duration::from_secs(1),
+        )
+        .await?;
+    assert_eq!(waited.id, notes[0].id);
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// External-effect capture: clicking the fixture's `open-uri` button issues a
+/// portal `OpenURI` request, recorded by the mock portal sink and exposed via
+/// `Session::open_uri_requests`.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_captures_open_uri() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session_opts("effects", true).await?;
+
+    let cursor = session.stdout_cursor();
+    session.locate("//Button[@name='open-uri']").click().await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("open-uri-requested open-uri"),
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    let opened = session.open_uri_requests()?;
+    assert_eq!(opened.len(), 1, "exactly one open-uri captured: {opened:?}");
+    assert_eq!(opened[0].uri, "https://example.com/waydriver");
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// External-effect capture is opt-in: a session started without it reports
+/// disabled and the readback methods error rather than silently returning empty.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_external_capture_off_by_default() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("effects").await?;
+    assert!(!session.external_effects_enabled());
+    assert!(session.notifications().is_err());
+    assert!(session.open_uri_requests().is_err());
+    kill(session).await?;
+    Ok(())
+}
+
+/// Single-instance CLI forwarding: launching a second instance of the fixture
+/// with a positional arg forwards it to the running primary, whose
+/// `command-line` handler prints it.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_forwards_secondary_command_line() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let cursor = session.stdout_cursor();
+    let outcome = session
+        .launch_secondary(vec!["forwarded-token-xyz".to_string()])
+        .await?;
+    eprintln!(
+        "secondary exit={:?} stdout={:?}",
+        outcome.exit_code, outcome.stdout
+    );
+
+    // The *primary* prints what it received from the forwarded command line.
+    let line = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("command-line-forwarded") && l.contains("forwarded-token-xyz"),
+            Duration::from_secs(5),
+        )
+        .await?;
+    eprintln!("observed forwarded command line: {line}");
 
     kill(session).await?;
     Ok(())

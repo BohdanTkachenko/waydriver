@@ -154,7 +154,7 @@ with `.nth(i)` or a more specific XPath.
 
 | Tool              | Purpose                                                               |
 | ----------------- | --------------------------------------------------------------------- |
-| `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir`, `resolution`, `scale`, `isolate_settings`, `gsettings`, `record_video`, `video_bitrate` overrides per session) |
+| `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir`, `resolution`, `scale`, `isolate_settings`, `gsettings`, `record_video`, `video_bitrate`, `capture_external_effects` overrides per session) |
 | `list_sessions`   | List active session ids, app names, and Wayland displays              |
 | `kill_session`    | Tear down a session and clean up all child processes                  |
 | `set_setting`     | Change a GSettings key on the running session live — rewrites the isolated keyfile in place so the app re-applies it via its `changed` handler (cursor, fonts, color-scheme, …) without a restart |
@@ -176,6 +176,8 @@ with `.nth(i)` or a more specific XPath.
 | `pointer_click`   | Press and release a pointer button (defaults to left click)           |
 | `take_screenshot` | Capture a PNG via the keepalive ScreenCast stream and return its path |
 | `compare_element_to_baseline` | Crop an element and diff it against a committed reference PNG (perceptual CIEDE2000) — returns a diff *score* (not a pass/fail verdict) and writes a red-highlighted diff image on mismatch |
+| `get_captured_effects` | Read the desktop notifications and portal open-URI requests the app emitted onto the session bus (mock D-Bus sinks). Requires `capture_external_effects: true` on `start_session`; effects have no AT-SPI projection, so this is the only way to assert on them |
+| `launch_secondary_instance` | Relaunch the app with extra args in the same session env — a single-instance `GApplication` forwards the command line to the running primary; observe the primary's reaction via `wait_for_stdout_line`/`query` |
 
 Selectors use XPath 1.0 against a snapshot of the AT-SPI tree serialized to XML, with role names normalized to PascalCase (e.g. `push button` → `Button`). Example XPaths: `//Button[@name='OK']`, `//Text[@name='search']`, `//MenuItem[contains(@name, 'Mode')]`, `(//Button)[last()]`.
 
@@ -442,6 +444,12 @@ graph LR
     waydriver -- "ScreenCast\nRemoteDesktop" --> private_dbus
     mutter -- "org.gnome.Mutter.*" --> private_dbus
 ```
+
+### External-effect sinks
+
+Some app behaviours leave the process entirely — a desktop notification, a "open this URL" portal request — so they have no AT-SPI projection to query. With `capture_external_effects` enabled, waydriver mocks the daemons that would receive those calls on the app's session bus (`org.freedesktop.Notifications` and `org.freedesktop.portal.Desktop`'s `OpenURI`), records each call, and exposes them via `get_captured_effects` / `Session::notifications()` / `open_uri_requests()`. It's opt-in because the sinks own well-known names — safe on the per-session/container bus, a no-op (with a warning) on a shared host bus that already runs a real daemon.
+
+**Clipboard / PRIMARY-selection readback is not available**: Mutter 46.2 exposes no clipboard D-Bus interface and implements neither `wlr-data-control` nor `ext-data-control-v1`, so there's no out-of-band way to read the selection. The working stopgap is to paste into the app (`Ctrl+V` / middle-click) and read the result back through the AT-SPI `Text` interface (`read_text` / `Locator::text`).
 
 ### Screenshot and recording pipeline
 
