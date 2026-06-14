@@ -26,8 +26,8 @@ use rmcp::{tool, tool_router, ErrorData as McpError};
 use waydriver::keysym::parse_chord;
 
 use crate::params::{
-    ClickByTextParams, ClickParams, ClickTextRegionParams, DoubleClickParams, DragToParams,
-    FillParams, FocusParams, HoverParams, ImageMatchParams, LaunchSecondaryParams,
+    ActivateActionParams, ClickByTextParams, ClickParams, ClickTextRegionParams, DoubleClickParams,
+    DragToParams, FillParams, FocusParams, HoverParams, ImageMatchParams, LaunchSecondaryParams,
     MovePointerAbsoluteParams, MovePointerParams, PointerClickParams, PressKeyParams,
     RightClickParams, ScrollParams, SelectOptionByParam, SelectOptionParams, SetTextParams,
     TypeTextParams,
@@ -398,6 +398,35 @@ impl UiTestServer {
                 s.press_chord(&key)
                     .await
                     .map(|_| format!("Pressed '{key}'"))
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Fire a GTK GAction over the `org.gtk.Actions` D-Bus interface, by its \
+                       prefixed name: `app.<name>` (application action) or `win.<name>` (active \
+                       window action); a string target may be appended via the GMenu \
+                       detailed-name form, e.g. `app.section::adw`. Use this to drive \
+                       GAction-only menu/dialog items (GtkPopoverMenu entries, AdwTabOverview, \
+                       some dialog bodies) that GTK4 lazily-realizes and never publishes to the \
+                       AT-SPI tree, so `click` can't reach them. The action name is app-internal \
+                       knowledge — discover candidates with `list_actions`. Doesn't force a \
+                       repaint; confirm the effect with `wait_for_stdout_line` or a state read."
+    )]
+    pub(crate) async fn activate_action(
+        &self,
+        Parameters(params): Parameters<ActivateActionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = params.action.clone();
+        self.run_action(
+            &params.session_id,
+            "activate_action",
+            serde_json::json!({ "action": params.action }),
+            |s| async move {
+                s.activate_action(&action)
+                    .await
+                    .map(|_| format!("Activated action '{action}'"))
             },
         )
         .await

@@ -441,4 +441,30 @@ impl UiTestServer {
         )
         .await
     }
+
+    #[tool(
+        description = "List the prefixed names (`app.*`, `win.*`) of every GTK GAction the app \
+                       exposes over the `org.gtk.Actions` D-Bus interface. Discovery companion \
+                       to `activate_action`: GActions report names but no human-readable labels, \
+                       so this shows which actions exist, not which menu item each one backs. \
+                       Returns a JSON array of strings."
+    )]
+    pub(crate) async fn list_actions(
+        &self,
+        Parameters(params): Parameters<SessionIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_action(
+            &params.session_id,
+            "list_actions",
+            serde_json::json!({}),
+            |s| async move {
+                let actions = s.list_actions().await?;
+                // serde_json failure on a Vec<String> we just built is
+                // essentially impossible; map it as infra rather than panic.
+                serde_json::to_string_pretty(&actions)
+                    .map_err(|e| waydriver::Error::process_with("serialize actions", e))
+            },
+        )
+        .await
+    }
 }

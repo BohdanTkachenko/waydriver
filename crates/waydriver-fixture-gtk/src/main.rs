@@ -250,6 +250,30 @@ fn build_ui(app: &adw::Application, initial: Section) {
     }
     app.add_action(&section_action);
 
+    // GAction test affordances (issue #33). Plain `app.*` / `win.*` actions
+    // wired to stdout side-effects so e2e tests can fire them over
+    // `org.gtk.Actions` and observe the handler run — the GAction-only
+    // class (popover-menu / tab-overview / dialog items) that never enters
+    // the AT-SPI tree or cache and so has no `(bus, path)` to activate.
+    let app_ping = gio::SimpleAction::new("ping", None);
+    app_ping.connect_activate(|_, _| emit("action-activated app.ping"));
+    app.add_action(&app_ping);
+
+    // Parameterised variant: exercises a string target (GMenu's
+    // `app.echo::<value>` detailed-name form) round-tripping to the handler.
+    let app_echo = gio::SimpleAction::new("echo", Some(glib::VariantTy::STRING));
+    app_echo.connect_activate(|_, target| {
+        let value = target.and_then(|v| v.get::<String>()).unwrap_or_default();
+        emit(&format!("action-activated app.echo param={value:?}"));
+    });
+    app.add_action(&app_echo);
+
+    // Window-scoped action — exported at `<base>/window/<id>`, the `win.*`
+    // surface, distinct from the app action group above.
+    let win_ping = gio::SimpleAction::new("ping", None);
+    win_ping.connect_activate(|_, _| emit("action-activated win.ping"));
+    window.add_action(&win_ping);
+
     let header = adw::HeaderBar::new();
     header.pack_end(&menu_button);
     toolbar.add_top_bar(&header);
