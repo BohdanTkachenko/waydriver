@@ -10,6 +10,15 @@ To add a new tool, add it to `devPackages` in `flake.nix` and run `refresh`. Do 
 
 The shellHook also sets `GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, and prepends `at-spi2-core/libexec` to `PATH` — these cannot come from `buildEnv` alone because GStreamer plugin discovery and the `at-spi-bus-launcher` in `libexec` need explicit env vars.
 
+### Non-Nix development (Ubuntu / other distros)
+
+Nix is the supported path, but the repo also builds on a plain non-Nix host (e.g. the Claude Code cloud env on Ubuntu 24.04, or any Debian/Ubuntu/Fedora machine without Nix). Two helpers cover this:
+
+- **`.claude/hooks/session-start.sh`** — a SessionStart hook that apt-installs the same GStreamer / glib / D-Bus / AT-SPI / PipeWire dev and runtime packages the flake/README provide, ensures the `rustfmt` and `clippy` rustup components exist, and pre-fetches the crate cache so `cargo build/fmt/clippy/test` work without Nix. It is guarded by `$CLAUDE_CODE_REMOTE`, so it is a no-op on a local Nix machine. To install the same packages on another distro, see the dependency tables in `README.md`.
+- **`scripts/dev-container.sh`** — drops you into a Fedora 42 shell (libadwaita ≥ 1.6, Mesa at standard paths, matching the Dockerfile/CI) with the full build + runtime stack and your working tree bind-mounted. Use it to build `waydriver-fixture-gtk` and run the native e2e suite, which cannot build on Ubuntu 24.04 (it ships libadwaita 1.5, but the gtk-rs `v1_6` feature needs ≥ 1.6).
+
+On a non-Nix host, build/test the rest of the workspace with `--exclude waydriver-fixture-gtk`; the GTK fixture and full e2e path stay container-only, as in CI. The `nix run .#mcp` wrapper is unavailable, so set the runtime env vars (`GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, the `at-spi2-core/libexec` path) yourself when running the raw binary.
+
 ## Build and test
 
 With direnv allowed, tools are on `PATH` automatically inside the project directory. Otherwise, use `nix develop --command`:
