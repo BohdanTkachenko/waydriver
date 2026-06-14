@@ -1,0 +1,26 @@
+[book]
+title = "WayDriver"
+authors = ["Bohdan Tkachenko"]
+description = "Headless GUI application testing on Wayland — a Rust library plus an MCP server for driving GTK4 apps."
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/BohdanTkachenko/waydriver"
+git-repository-icon = "fab-github"
+edit-url-template = "https://github.com/BohdanTkachenko/waydriver/edit/main/docs/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
