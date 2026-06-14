@@ -279,14 +279,20 @@ pub struct VisualTextTuning {
     /// context.
     pub ocr_context_padding_px: i32,
 
-    /// **Experimental.** Integer factor the cropped image is upscaled by
+    /// Session-wide default integer factor the cropped image is upscaled by
     /// (Lanczos3) *before* it's fed to ocrs, with detected coordinates scaled
-    /// back to screen space. Intended to make very small UI text (≈11px row
-    /// titles that the detector can miss at native size) legible. Default `1`
-    /// (no upscaling — no behavior change). Set to `2`/`3` when small text
-    /// reads as 0; verify with [`Session::recognized_text`] since the benefit
-    /// is rendering-dependent (clean text already reads fine). Upscaling the
-    /// *full* frame is wasteful — pair this with a scoped `within(...)` crop.
+    /// back to screen space. Makes very small UI text (≈11px row titles that
+    /// the detector can miss at native size) legible. Default `1` (no
+    /// upscaling — no behavior change).
+    ///
+    /// This applies to *every* OCR search in the session. When only a specific
+    /// label is too small, leave this at `1` and upscale just that search with
+    /// [`VisualLocator::with_upscale`](crate::VisualLocator::with_upscale)
+    /// instead — upscaling the full frame for every lookup is wasteful. Either
+    /// way, set `2`/`3` when small text reads as 0 and verify with
+    /// [`Session::recognized_text`]; the benefit is rendering-dependent (clean
+    /// text already reads fine), so pair upscaling with a scoped `within(...)`
+    /// crop.
     pub ocr_upscale_factor: u32,
 
     /// Sample density per axis for the boundary-detection divider

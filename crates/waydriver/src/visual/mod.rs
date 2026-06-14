@@ -149,6 +149,9 @@ pub struct VisualLocator {
     region: Option<Rect>,
     timeout: Option<Duration>,
     match_mode: MatchMode,
+    /// Per-search OCR upscale override; `None` falls back to the session-global
+    /// `ocr_upscale_factor`. Set via [`with_upscale`](Self::with_upscale).
+    upscale: Option<u32>,
 }
 
 impl std::fmt::Debug for VisualLocator {
@@ -159,6 +162,7 @@ impl std::fmt::Debug for VisualLocator {
             .field("match_mode", &self.match_mode)
             .field("region", &self.region)
             .field("timeout", &self.timeout)
+            .field("upscale", &self.upscale)
             .finish()
     }
 }
@@ -178,6 +182,7 @@ impl VisualLocator {
             region: None,
             timeout: None,
             match_mode: MatchMode::default(),
+            upscale: None,
         }
     }
 
@@ -207,6 +212,25 @@ impl VisualLocator {
         }
     }
 
+    /// Upscale this search's crop `factor`× (Lanczos3) before OCR, overriding
+    /// the session-global
+    /// [`ocr_upscale_factor`](crate::VisualTextTuning::ocr_upscale_factor) for
+    /// just this locator.
+    ///
+    /// Use when you know a *specific* label is too small to read at native
+    /// scale (≈11px row titles the detector misses). Scope to it with
+    /// [`within`](Self::within) so only that region is upscaled, set the factor
+    /// to `2`/`3`, and verify with
+    /// [`Session::recognized_text`](crate::Session::recognized_text). `1` (or
+    /// `0`) means native — no upscaling. Upscaling the full frame for every
+    /// lookup is wasteful, so pair this with `within(...)`.
+    pub fn with_upscale(&self, factor: u32) -> VisualLocator {
+        VisualLocator {
+            upscale: Some(factor),
+            ..self.clone()
+        }
+    }
+
     /// The text this locator is searching for. A `VisualLocator`
     /// represents a recognised on-screen label, so this is the
     /// label's expected content (or substring, depending on
@@ -229,6 +253,14 @@ impl VisualLocator {
         self.match_mode
     }
 
+    /// The per-search OCR upscale override set via
+    /// [`with_upscale`](Self::with_upscale), or `None` when this locator uses
+    /// the session-global
+    /// [`ocr_upscale_factor`](crate::VisualTextTuning::ocr_upscale_factor).
+    pub fn upscale(&self) -> Option<u32> {
+        self.upscale
+    }
+
     /// One screenshot + OCR pass, returning every bbox that matches
     /// the search text.
     ///
@@ -248,10 +280,15 @@ impl VisualLocator {
     async fn matches(&self) -> Result<Vec<Rect>> {
         let needle = self.text.clone();
         let mode = self.match_mode;
+        // Per-search upscale override wins over the session-global default.
+        let upscale = self
+            .upscale
+            .unwrap_or(self.session.visual_text_tuning.ocr_upscale_factor);
         let ocr = ocr_lines(
             &self.session,
             self.region,
             self.session.take_screenshot().await?,
+            upscale,
         )
         .await?;
         let mut out = Vec::new();
@@ -893,38 +930,44 @@ pub(crate) struct OcrResult {
 /// OCR is the dominant cost in the visual path — tens of seconds per
 /// full-frame pass on CPU — so repeated lookups on an *unchanged* frame must
 /// not re-run it. Keyed by the captured frame's content hash plus the scoped
-/// region; when a new frame hash arrives the whole map is dropped (the old
-/// frame's results are stale). `Arc` so a hit is a cheap clone, not a deep
-/// copy of the decoded image.
+/// region and the upscale factor it was OCR'd at; when a new frame hash arrives
+/// the whole map is dropped (the old frame's results are stale). `Arc` so a hit
+/// is a cheap clone, not a deep copy of the decoded image.
 /// Region key for the OCR memo: `(x, y, w, h)` in screen coords, or `None`
 /// for a full-frame (unscoped) pass.
 type RegionKey = Option<(i32, i32, i32, i32)>;
 
+/// Memo key: the scoped region (`None` = full frame) plus the upscale factor
+/// the frame was OCR'd at. The factor is part of the key because the same frame
+/// and region OCR'd at different `with_upscale` factors yield different results,
+/// so they must not share a memo entry.
+type OcrCacheKey = (RegionKey, u32);
+
 #[derive(Default)]
 pub(crate) struct OcrCache {
     frame_hash: u64,
-    /// Region (None = full frame) → OCR result for it on the current frame.
-    by_region: std::collections::HashMap<RegionKey, Arc<OcrResult>>,
+    /// (region, upscale) → OCR result for it on the current frame.
+    by_region: std::collections::HashMap<OcrCacheKey, Arc<OcrResult>>,
 }
 
 impl OcrCache {
-    /// Look up `region` for the frame identified by `hash`. If `hash` differs
-    /// from the cached frame, the whole memo is dropped first (the old frame's
-    /// results are stale) and this returns `None`.
-    fn get(&mut self, hash: u64, region: RegionKey) -> Option<Arc<OcrResult>> {
+    /// Look up `region` at `upscale` for the frame identified by `hash`. If
+    /// `hash` differs from the cached frame, the whole memo is dropped first
+    /// (the old frame's results are stale) and this returns `None`.
+    fn get(&mut self, hash: u64, region: RegionKey, upscale: u32) -> Option<Arc<OcrResult>> {
         if self.frame_hash != hash {
             self.frame_hash = hash;
             self.by_region.clear();
         }
-        self.by_region.get(&region).cloned()
+        self.by_region.get(&(region, upscale)).cloned()
     }
 
-    /// Memoize `region`'s result for frame `hash` — but only if `hash` is
-    /// still the current frame (a concurrent OCR of a newer frame may have
-    /// advanced it, in which case this result is already stale).
-    fn put(&mut self, hash: u64, region: RegionKey, result: Arc<OcrResult>) {
+    /// Memoize `region`'s result at `upscale` for frame `hash` — but only if
+    /// `hash` is still the current frame (a concurrent OCR of a newer frame may
+    /// have advanced it, in which case this result is already stale).
+    fn put(&mut self, hash: u64, region: RegionKey, upscale: u32, result: Arc<OcrResult>) {
         if self.frame_hash == hash {
-            self.by_region.insert(region, result);
+            self.by_region.insert((region, upscale), result);
         }
     }
 }
@@ -944,6 +987,7 @@ async fn ocr_lines(
     session: &Arc<Session>,
     region: Option<Rect>,
     png_bytes: Vec<u8>,
+    upscale: u32,
 ) -> Result<Arc<OcrResult>> {
     use ocrs::{ImageSource, TextItem};
 
@@ -952,11 +996,15 @@ async fn ocr_lines(
     // frame hash invalidates the whole memo.
     let region_key = region.map(|r| (r.x, r.y, r.width, r.height));
     let hash = frame_hash(&png_bytes);
+    // Normalize the factor once (`0`/`1` both mean native). It's part of the
+    // memo key, so two searches over the same frame+region at different upscale
+    // factors don't collide.
+    let upscale = upscale.max(1);
     if let Some(hit) = session
         .visual_ocr_cache()
         .lock()
         .unwrap()
-        .get(hash, region_key)
+        .get(hash, region_key, upscale)
     {
         return Ok(hit);
     }
@@ -968,9 +1016,6 @@ async fn ocr_lines(
         .clone()
         .map_err(Error::visual)?;
     let context_pad_px = session.visual_text_tuning.ocr_context_padding_px;
-    // Experimental: upscale the crop before OCR to make tiny glyphs legible.
-    // `1` = off. Detected coordinates are divided back down below.
-    let upscale = session.visual_text_tuning.ocr_upscale_factor.max(1) as i32;
 
     let result = tokio::task::spawn_blocking(move || -> Result<OcrResult> {
         let full = crate::locator::decode_screenshot_png(&png_bytes)
@@ -1013,13 +1058,15 @@ async fn ocr_lines(
         // `upscale` below so hits land in screen space.
         let upscaled_img;
         let (ocr_bytes, ocr_w, ocr_h): (&[u8], u32, u32) = if upscale > 1 {
-            let f = upscale as u32;
+            let f = upscale;
             upscaled_img =
                 image::imageops::resize(&rgb, w * f, h * f, image::imageops::FilterType::Lanczos3);
             (upscaled_img.as_raw(), w * f, h * f)
         } else {
             (rgb.as_raw(), w, h)
         };
+        // ocrs rects are i32; divide detected coords by this to undo the upscale.
+        let upscale_i = upscale as i32;
         let src = ImageSource::from_bytes(ocr_bytes, (ocr_w, ocr_h))
             .map_err(|e| Error::visual(format!("ocrs ImageSource: {e}")))?;
         let input = engine
@@ -1045,10 +1092,10 @@ async fn ocr_lines(
                     // upscale (no-op when `upscale == 1`), then add the crop
                     // origin.
                     let rect = Rect {
-                        x: r.left() / upscale + origin_x,
-                        y: r.top() / upscale + origin_y,
-                        width: (r.width() / upscale).max(1),
-                        height: (r.height() / upscale).max(1),
+                        x: r.left() / upscale_i + origin_x,
+                        y: r.top() / upscale_i + origin_y,
+                        width: (r.width() / upscale_i).max(1),
+                        height: (r.height() / upscale_i).max(1),
                     };
                     (text, rect)
                 })
@@ -1114,7 +1161,7 @@ async fn ocr_lines(
         .visual_ocr_cache()
         .lock()
         .unwrap()
-        .put(hash, region_key, arc.clone());
+        .put(hash, region_key, upscale, arc.clone());
     Ok(arc)
 }
 
@@ -1128,7 +1175,13 @@ pub(crate) async fn list_text(
     scope: Rect,
     png: Vec<u8>,
 ) -> Result<Vec<TextHit>> {
-    let ocr = ocr_lines(session, Some(scope), png).await?;
+    let ocr = ocr_lines(
+        session,
+        Some(scope),
+        png,
+        session.visual_text_tuning.ocr_upscale_factor,
+    )
+    .await?;
     let boundary = BoundaryContext {
         image: &ocr.image,
         crop_origin: ocr.crop_origin,
@@ -1154,7 +1207,13 @@ pub(crate) async fn list_text(
 /// `find_by_text` that returned 0: it shows whether OCR read the target as a
 /// near-miss, mis-recognised it, or never detected it at all.
 pub(crate) async fn recognized_text(session: &Arc<Session>, png: Vec<u8>) -> Result<Vec<TextHit>> {
-    let ocr = ocr_lines(session, None, png).await?;
+    let ocr = ocr_lines(
+        session,
+        None,
+        png,
+        session.visual_text_tuning.ocr_upscale_factor,
+    )
+    .await?;
     let boundary = BoundaryContext {
         image: &ocr.image,
         crop_origin: ocr.crop_origin,
@@ -1186,7 +1245,13 @@ pub(crate) async fn list_labelled_regions(
     png: Vec<u8>,
     tuning: crate::session::VisualRegionTuning,
 ) -> Result<Vec<(TextHit, RegionLocator)>> {
-    let ocr = ocr_lines(session, Some(scope), png.clone()).await?;
+    let ocr = ocr_lines(
+        session,
+        Some(scope),
+        png.clone(),
+        session.visual_text_tuning.ocr_upscale_factor,
+    )
+    .await?;
     let boundary = BoundaryContext {
         image: &ocr.image,
         crop_origin: ocr.crop_origin,
@@ -1492,23 +1557,29 @@ mod tests {
     fn ocr_cache_hits_same_frame_and_region() {
         let mut cache = OcrCache::default();
         let h = 42;
-        assert!(cache.get(h, None).is_none(), "cold cache misses");
-        cache.put(h, None, dummy_result());
-        assert!(cache.get(h, None).is_some(), "same frame+region hits");
+        assert!(cache.get(h, None, 1).is_none(), "cold cache misses");
+        cache.put(h, None, 1, dummy_result());
+        assert!(cache.get(h, None, 1).is_some(), "same frame+region hits");
         // Different region on the same frame is a separate entry.
-        assert!(cache.get(h, Some((0, 0, 10, 10))).is_none());
+        assert!(cache.get(h, Some((0, 0, 10, 10)), 1).is_none());
+        // Same frame+region but a different upscale factor is a separate entry —
+        // the two passes recognise different text, so they must not collide.
+        assert!(
+            cache.get(h, None, 3).is_none(),
+            "different upscale factor is a separate entry"
+        );
     }
 
     #[test]
     fn ocr_cache_invalidates_on_new_frame() {
         let mut cache = OcrCache::default();
-        cache.get(1, None); // establish frame 1 (as ocr_lines' miss path does)
-        cache.put(1, None, dummy_result());
-        assert!(cache.get(1, None).is_some());
+        cache.get(1, None, 1); // establish frame 1 (as ocr_lines' miss path does)
+        cache.put(1, None, 1, dummy_result());
+        assert!(cache.get(1, None, 1).is_some());
         // A new frame hash drops every prior entry.
-        assert!(cache.get(2, None).is_none(), "new frame busts the memo");
+        assert!(cache.get(2, None, 1).is_none(), "new frame busts the memo");
         assert!(
-            cache.get(1, None).is_none(),
+            cache.get(1, None, 1).is_none(),
             "old frame's entry is gone after invalidation"
         );
     }
@@ -1518,9 +1589,9 @@ mod tests {
         let mut cache = OcrCache::default();
         // Current frame is 2 (set via get); a late put for frame 1 must not
         // land — its result is for a frame we've already moved past.
-        assert!(cache.get(2, None).is_none());
-        cache.put(1, None, dummy_result());
-        assert!(cache.get(2, None).is_none(), "stale-frame put rejected");
+        assert!(cache.get(2, None, 1).is_none());
+        cache.put(1, None, 1, dummy_result());
+        assert!(cache.get(2, None, 1).is_none(), "stale-frame put rejected");
     }
 
     #[test]
