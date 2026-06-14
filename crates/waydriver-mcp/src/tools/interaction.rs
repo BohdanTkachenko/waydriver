@@ -4,7 +4,8 @@
 //! Two shapes live here:
 //!
 //! - **Locator-driven** (click, focus, hover, double_click, right_click,
-//!   drag_to, set_text, fill, select_option) resolve an XPath selector
+//!   drag_to, drag_to_coords, set_text, fill, select_option) resolve an
+//!   XPath selector
 //!   first, then act on the matched element. These auto-wait on the
 //!   element via `Locator`'s polling layer.
 //! - **Direct** (type_text, press_key, move_pointer, pointer_click)
@@ -27,10 +28,10 @@ use waydriver::keysym::parse_chord;
 
 use crate::params::{
     ActivateActionParams, ClickByTextParams, ClickParams, ClickTextRegionParams, DoubleClickParams,
-    DragToParams, FillParams, FocusParams, HoverParams, ImageMatchParams, LaunchSecondaryParams,
-    MovePointerAbsoluteParams, MovePointerParams, PointerClickParams, PressKeyParams,
-    RightClickParams, ScrollParams, SelectOptionByParam, SelectOptionParams, SetTextParams,
-    TypeTextParams,
+    DragToCoordsParams, DragToParams, FillParams, FocusParams, HoverParams, ImageMatchParams,
+    LaunchSecondaryParams, MovePointerAbsoluteParams, MovePointerParams, PointerClickParams,
+    PressKeyParams, RightClickParams, ScrollParams, SelectOptionByParam, SelectOptionParams,
+    SetTextParams, TypeTextParams,
 };
 use crate::UiTestServer;
 
@@ -181,6 +182,40 @@ impl UiTestServer {
                     .drag_to(&target)
                     .await
                     .map(|_| format!("Dragged {source_xpath} to {target_xpath}"))
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Drag the element selected by `source_xpath` to the screen-absolute \
+                       coordinates (`x`, `y`) with the primary mouse button held, then release. \
+                       Unlike `drag_to`, the drop point is raw coordinates rather than an \
+                       element, so it can land on empty space or off the source window — needed \
+                       for drag-out gestures like libadwaita tab-to-new-window. Get the source's \
+                       screen rectangle via the `screen_bounds`-style geometry to derive an \
+                       off-window target."
+    )]
+    pub(crate) async fn drag_to_coords(
+        &self,
+        Parameters(params): Parameters<DragToCoordsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let source_xpath = params.source_xpath.clone();
+        let x = params.x;
+        let y = params.y;
+        self.run_action(
+            &params.session_id,
+            "drag_to_coords",
+            serde_json::json!({
+                "source_xpath": params.source_xpath,
+                "x": params.x,
+                "y": params.y,
+            }),
+            |s| async move {
+                s.locate(&source_xpath)
+                    .drag_to_coords(x, y)
+                    .await
+                    .map(|_| format!("Dragged {source_xpath} to ({x}, {y})"))
             },
         )
         .await

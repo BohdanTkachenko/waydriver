@@ -2830,6 +2830,42 @@ async fn fixture_locator_drag_to_drops_payload() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `Locator::drag_to_coords` drives the same DnD machinery as `drag_to` but
+/// releases at raw screen-absolute coordinates rather than onto a resolved
+/// element. Here we feed it the drop-target's own centre (obtained via
+/// `screen_bounds`) so the drop still lands — proving the coordinate path
+/// reaches GTK4's DnD recognizer end-to-end. The off-window drop case
+/// (libadwaita tab drag-out) shares this exact code path; only the endpoint
+/// coordinates differ.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_locator_drag_to_coords_drops_payload() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("dnd").await?;
+
+    let cursor = session.stdout_cursor();
+    let source = session.locate("//*[@name='drag-source']");
+    let target = session.locate("//*[@name='drop-target']");
+
+    // Resolve the target's screen rectangle and aim the drop at its centre,
+    // exercising the coordinate API rather than handing it the Locator.
+    let bounds = target.screen_bounds().await?;
+    source
+        .drag_to_coords(bounds.center_x() as f64, bounds.center_y() as f64)
+        .await?;
+
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dropped drop-target"),
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    kill(session).await?;
+    Ok(())
+}
+
 /// `Session::cancel` interrupts a stuck `wait_for_visible` against a real
 /// mutter + GTK4 fixture within ~1s — the integration counterpart to the
 /// mocked-backend tests in `locator::tests::poll_with_retry_*`.
