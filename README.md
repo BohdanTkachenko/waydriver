@@ -3,9 +3,12 @@
 [![CI](https://github.com/BohdanTkachenko/waydriver/actions/workflows/ci.yml/badge.svg)](https://github.com/BohdanTkachenko/waydriver/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/waydriver.svg)](https://crates.io/crates/waydriver)
 [![docs.rs](https://docs.rs/waydriver/badge.svg)](https://docs.rs/waydriver)
+[![Documentation](https://img.shields.io/badge/docs-waydriver.io-blue)](https://waydriver.io)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A Rust library for headless GUI application testing on Wayland. Launches apps in isolated compositor sessions, interacts with them via AT-SPI accessibility APIs, and captures screenshots and WebM video via PipeWire.
+
+📖 **Full documentation: [waydriver.io](https://waydriver.io)**
 
 The repo also contains `waydriver-mcp`, a standalone MCP server binary built on top of the library that lets AI assistants drive GTK4 apps directly — see [MCP server](#mcp-server) below.
 

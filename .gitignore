@@ -2,5 +2,6 @@
 .nix-profile
 /target
 /result
+/docs/book
 /app.log
 test_*.sh
