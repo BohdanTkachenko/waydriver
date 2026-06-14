@@ -225,6 +225,10 @@ The signal subscription must happen **before** `Session.Start` — mutter emits 
 
 `Session::take_screenshot` uses the keepalive stream (started during `Session::start`) via `CaptureBackend::grab_screenshot`, avoiding per-screenshot stream setup/teardown overhead.
 
+### Baseline comparison (pixel diff)
+
+`crates/waydriver/src/visual/baseline.rs` (feature `visual`) adds a **data-returning** pixel-diff for behaviours that have no AT-SPI projection (CSS-class tints, cursor glyphs, colour/opacity, overlays). It is **not** an assertion: it returns a `BaselineComparison` score and never errors on a visual mismatch. `Locator::compare_to_baseline(baseline_png, tolerance)` captures the element crop (via `Locator::screenshot`, off-runtime in `spawn_blocking`) and diffs it against caller-supplied reference bytes; `Session::compare_to_baseline(actual_png, baseline_png, tolerance)` is the raw-bytes primitive. The headline `score` is the fraction of pixels whose CIEDE2000 ΔE (`visual::color::distance_sq`, reused from the visual locator) exceeds a JND threshold, so it catches both whole-area tints and tiny localized changes; `mean_delta_e` / `max_delta_e` / `ncc` (imageproc NCC) ride along as diagnostics. The MCP tool `compare_element_to_baseline` reads a reference PNG, returns the score JSON, and writes a red-highlighted `*-diff.png` (`visual::diff_to_baseline`) next to the captured crop on mismatch. Deliberately **out of scope** (the consumer's test harness owns these): pass/fail assertions, reference-file storage, and "update baselines" mode.
+
 ### Video recording pipeline
 
 When `SessionConfig::video_output` is set, `Session::start` opens a **dedicated** ScreenCast stream for recording via `CaptureBackend::start_recording_stream` (a separate `recorder_stream` on `Session`, distinct from the keepalive node) and runs a long-lived GStreamer pipeline on *that* node: `pipewiresrc ! videoconvert ! videorate ! video/x-raw,framerate=15/1 ! vp8enc ! webmmux ! filesink`. The `VideoRecorder` handle lives on `Session` and is stopped by `Session::kill` **before** its stream is torn down, so the encoder/muxer still have a live source to flush through.

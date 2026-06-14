@@ -2096,6 +2096,71 @@ async fn fixture_toggle_changes_screenshot() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `Locator::compare_to_baseline` against a captured reference: the same
+/// static frame matches itself; the frame after a real toggle does not.
+/// Proves the perceptual diff reads actual compositor pixels and is a
+/// data primitive (it returns a score, it does not assert).
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_compare_to_baseline_detects_change() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let sel = "//ToggleButton[@name='mode-toggle']";
+
+    // Capture a reference crop of the toggle button in its current state.
+    // `Locator::screenshot` re-encodes a clean PNG, so the bytes can be
+    // fed straight back to `compare_to_baseline` (the consumer would read
+    // these from its committed reference file instead).
+    let reference = session.locate(sel).screenshot().await?;
+    assert!(reference.len() > 100, "reference crop too small");
+
+    // The same static frame matches itself (allow a little antialias jitter).
+    let same = session
+        .locate(sel)
+        .compare_to_baseline(&reference, 0.02)
+        .await?;
+
+    // Toggle it — a real repaint of the checked state.
+    let cursor = session.stdout_cursor();
+    session.locate(sel).click().await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("toggled mode-toggle"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The repainted button no longer matches the original reference. Use a
+    // zero tolerance: any perceptibly-different pixel is a change.
+    let changed = session
+        .locate(sel)
+        .compare_to_baseline(&reference, 0.0)
+        .await?;
+
+    kill(session).await?;
+
+    assert!(
+        same.matched,
+        "static frame should match its own reference: score={}, meanΔE={}, maxΔE={}",
+        same.score, same.mean_delta_e, same.max_delta_e
+    );
+    assert!(
+        same.ncc > 0.9,
+        "structural NCC of a static frame vs itself should be ~1.0, got {}",
+        same.ncc
+    );
+    assert!(
+        !changed.matched && changed.score > 0.0,
+        "toggled button should differ from its reference (score={}, diff_pixels={})",
+        changed.score,
+        changed.diff_pixels
+    );
+    Ok(())
+}
+
 /// XPath tree inspection, counts, and element-not-found error shape.
 #[tokio::test]
 #[ignore = "spawns mutter + pipewire; run manually with --ignored"]

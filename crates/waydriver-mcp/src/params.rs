@@ -534,6 +534,25 @@ pub struct ElementScreenshotParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BaselineCompareParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath of the element to crop and compare. Use `//Window` (or any
+    /// toplevel selector) to compare the whole window.
+    pub xpath: String,
+    /// Filesystem path to the committed reference PNG. Read-only — this
+    /// tool never writes or updates it. Resolved relative to the MCP
+    /// server's working directory.
+    pub baseline_path: String,
+    /// Maximum fraction of differing pixels (in [0, 1]) for `matched` to
+    /// be true. A pixel "differs" when its perceptual CIEDE2000 ΔE
+    /// exceeds a just-noticeable threshold. Defaults to 0.01 (1%) when
+    /// omitted. `matched` is informational; the tool never fails on a
+    /// visual mismatch.
+    pub tolerance: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ImageMatchParams {
     /// Session ID
     pub session_id: String,

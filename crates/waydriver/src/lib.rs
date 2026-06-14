@@ -38,4 +38,6 @@ pub use gsettings::{GSettingEntry, GSettingsConfig};
 pub use locator::{FillMode, Locator, SelectBy};
 pub use session::{Session, SessionConfig, VisualRegionTuning, VisualTextTuning};
 #[cfg(feature = "visual")]
-pub use visual::{ImageLocator, MatchMode, RegionLocator, Shape, TextHit, VisualLocator};
+pub use visual::{
+    BaselineComparison, ImageLocator, MatchMode, RegionLocator, Shape, TextHit, VisualLocator,
+};

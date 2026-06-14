@@ -1138,6 +1138,39 @@ impl Locator {
         Ok(self.session.find_image(png_bytes)?.within(screen))
     }
 
+    /// Perceptual diff of this element's current pixels against a
+    /// committed reference PNG, returning a
+    /// [`BaselineComparison`](crate::visual::BaselineComparison) score.
+    /// Captures the element crop via [`Self::screenshot`] (auto-waiting
+    /// for bounds and translating them to screen pixels), then compares.
+    ///
+    /// A **lookup, not an assertion**: a visual mismatch is reported via
+    /// [`BaselineComparison::matched`](crate::visual::BaselineComparison::matched)
+    /// / `score`, never as an `Err`. It errors only when the crop can't
+    /// be captured or decoded, or when the reference's dimensions differ
+    /// from the crop. The caller supplies the reference bytes (read from
+    /// wherever it commits them), chooses a tolerance, and decides
+    /// pass/fail — waydriver is not a test framework.
+    ///
+    /// Use `//Window` (or any toplevel selector) to diff the whole
+    /// window. Requires the `visual` Cargo feature.
+    #[cfg(feature = "visual")]
+    pub async fn compare_to_baseline(
+        &self,
+        baseline_png: &[u8],
+        tolerance: f64,
+    ) -> Result<crate::visual::BaselineComparison> {
+        let actual = self.screenshot().await?;
+        let baseline = baseline_png.to_vec();
+        // Per-pixel CIEDE2000 over a full crop is CPU-bound; keep it off
+        // the async runtime.
+        tokio::task::spawn_blocking(move || {
+            crate::visual::compare_to_baseline(&actual, &baseline, tolerance)
+        })
+        .await
+        .map_err(|e| Error::visual(format!("baseline-compare task panicked: {e}")))?
+    }
+
     /// Find all visually-distinct enclosing regions around `inner`,
     /// scoped to this locator's AT-SPI bounds. A region is a
     /// contiguous block of pixels whose colour is within tolerance
