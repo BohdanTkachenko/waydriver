@@ -172,6 +172,7 @@ with `.nth(i)` or a more specific XPath.
 | `move_pointer`    | Move the pointer by a relative offset in logical pixels               |
 | `pointer_click`   | Press and release a pointer button (defaults to left click)           |
 | `take_screenshot` | Capture a PNG via the keepalive ScreenCast stream and return its path |
+| `compare_element_to_baseline` | Crop an element and diff it against a committed reference PNG (perceptual CIEDE2000) — returns a diff *score* (not a pass/fail verdict) and writes a red-highlighted diff image on mismatch |
 
 Selectors use XPath 1.0 against a snapshot of the AT-SPI tree serialized to XML, with role names normalized to PascalCase (e.g. `push button` → `Button`). Example XPaths: `//Button[@name='OK']`, `//Text[@name='search']`, `//MenuItem[contains(@name, 'Mode')]`, `(//Button)[last()]`.
 

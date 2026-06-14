@@ -51,6 +51,7 @@
 //! `set_text`, `focus`, or any `is_<state>` predicate — those require
 //! AT-SPI handles, and faking them visually would mask real bugs.
 
+mod baseline;
 mod color;
 mod engine;
 mod models;
@@ -80,6 +81,7 @@ pub(crate) async fn cold_start_click(session: &Arc<Session>, cx: f64, cy: f64) -
     session.cold_start_click(cx, cy, PointerButton::Left).await
 }
 
+pub use baseline::{compare_to_baseline, diff_to_baseline, BaselineComparison};
 pub(crate) use engine::{ensure_engine, EngineResult};
 pub use region::{RegionLocator, Shape};
 pub use template::ImageLocator;

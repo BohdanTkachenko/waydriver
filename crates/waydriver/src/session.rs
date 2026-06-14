@@ -1311,6 +1311,33 @@ impl Session {
         crate::visual::ImageLocator::new(self.clone(), png_bytes, None)
     }
 
+    /// Perceptual diff of two PNG buffers — a captured crop against a
+    /// committed reference — returning a [`BaselineComparison`] score.
+    ///
+    /// This is a **data primitive, not an assertion**: it never errors
+    /// on a visual mismatch (that's reported via
+    /// [`BaselineComparison::matched`] / `score`); it errors only on a
+    /// decode failure or a dimension mismatch. Storing reference images,
+    /// choosing a tolerance, and deciding pass/fail are the caller's
+    /// job — waydriver is not a test framework.
+    ///
+    /// See [`crate::visual::compare_to_baseline`] for the scoring model.
+    /// The work is CPU-bound and synchronous; wrap it in
+    /// `tokio::task::spawn_blocking` when comparing large crops from an
+    /// async context. [`crate::Locator::compare_to_baseline`] is the
+    /// element-scoped counterpart that captures the crop for you.
+    ///
+    /// Requires the `visual` Cargo feature.
+    #[cfg(feature = "visual")]
+    pub fn compare_to_baseline(
+        &self,
+        actual_png: &[u8],
+        baseline_png: &[u8],
+        tolerance: f64,
+    ) -> Result<crate::visual::BaselineComparison> {
+        crate::visual::compare_to_baseline(actual_png, baseline_png, tolerance)
+    }
+
     /// Find the visual region containing the screen pixel `(x, y)`.
     ///
     /// Lowest-level entry point in the visual stack — no OCR, no
