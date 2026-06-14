@@ -15,9 +15,20 @@ The shellHook also sets `GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, and prepends `at-spi
 Nix is the supported path, but the repo also builds on a plain non-Nix host (e.g. the Claude Code cloud env on Ubuntu 24.04, or any Debian/Ubuntu/Fedora machine without Nix). Two helpers cover this:
 
 - **`.claude/hooks/session-start.sh`** — a SessionStart hook that apt-installs the same GStreamer / glib / D-Bus / AT-SPI / PipeWire dev and runtime packages the flake/README provide, ensures the `rustfmt` and `clippy` rustup components exist, and pre-fetches the crate cache so `cargo build/fmt/clippy/test` work without Nix. It is guarded by `$CLAUDE_CODE_REMOTE`, so it is a no-op on a local Nix machine. To install the same packages on another distro, see the dependency tables in `README.md`.
-- **`scripts/dev-container.sh`** — drops you into a Fedora 42 shell (libadwaita ≥ 1.6, Mesa at standard paths, matching the Dockerfile/CI) with the full build + runtime stack and your working tree bind-mounted. Use it to build `waydriver-fixture-gtk` and run the native e2e suite, which cannot build on Ubuntu 24.04 (it ships libadwaita 1.5, but the gtk-rs `v1_6` feature needs ≥ 1.6).
+- **`scripts/dev-container.sh`** — drops you into a Fedora 42 shell (libadwaita ≥ 1.6, Mesa at standard paths, matching the Dockerfile/CI) with the full build **and runtime** stack (mutter / pipewire / wireplumber / AT-SPI) and your working tree bind-mounted. It auto-starts `dockerd` in the cloud env, builds the images on first run, and accepts a command to run non-interactively: `scripts/dev-container.sh <cmd…>`.
 
-On a non-Nix host, build/test the rest of the workspace with `--exclude waydriver-fixture-gtk`; the GTK fixture and full e2e path stay container-only, as in CI. The `nix run .#mcp` wrapper is unavailable, so set the runtime env vars (`GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, the `at-spi2-core/libexec` path) yourself when running the raw binary.
+  **Reach for it — don't defer to CI — whenever you touch `waydriver-fixture-gtk` or `waydriver-e2e`.** The fixture cannot compile on Ubuntu 24.04 (system libadwaita is 1.5; the gtk-rs `v1_6` feature needs ≥ 1.6), so `--exclude waydriver-fixture-gtk` (below) leaves those changes **unverified** until you run them here:
+
+  ```sh
+  scripts/dev-container.sh cargo build -p waydriver-fixture-gtk        # compile-check the fixture
+  scripts/dev-container.sh bash -lc \
+    'cargo build -p waydriver-fixture-gtk && dbus-run-session -- \
+     cargo test -p waydriver-e2e -- --ignored --test-threads=1'        # native e2e suite
+  ```
+
+  Crucially, **this is the only place the `waydriver-e2e` `--ignored` suite runs.** CI's `e2e` job builds the Docker image and runs *only* `fixture_via_docker` (the MCP e2e in `crates/waydriver-mcp/tests/e2e.rs`) — it does **not** run `crates/waydriver-e2e`. A change to the fixture or the library e2e tests is untested until you run it in this container.
+
+On a non-Nix host, the *rest* of the workspace builds/tests with `cargo … --workspace --exclude waydriver-fixture-gtk` — that exclusion keeps the everyday edit-compile loop fast on Ubuntu; it is **not** a license to skip fixture/e2e verification, which you do in the Fedora container above. The `nix run .#mcp` wrapper is unavailable, so set the runtime env vars (`GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, the `at-spi2-core/libexec` path) yourself when running the raw binary.
 
 ## Build and test
 
