@@ -1,7 +1,10 @@
 //! Self-contained OCR perf + small-text-upscale probe (no compositor / app /
 //! AT-SPI). Answers the two questions behind the `visual`-feature bug report:
 //!
-//! 1. How slow is one full-frame (1280×800) ocrs pass? (report: ~190 s/call)
+//! 1. How slow is one full-frame (1280×800) ocrs pass? (report: ~190 s/call on
+//!    an unoptimized debug build; with the workspace root's rten/ocrs
+//!    opt-level=3 dev override now in place — issue #24 — a debug `cargo test`
+//!    measures single-digit seconds/call instead.)
 //! 2. Does upscaling a small-text crop before OCR recover text that's missed
 //!    at native size? (report: ~11 px row titles read as 0)
 //!

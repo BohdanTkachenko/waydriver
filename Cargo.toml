@@ -69,3 +69,26 @@ gtk4 = "0.10"
 # `v1_6` enables AdwDialog (the modern dialog primitive), SwitchRow, and ButtonRow.
 # Bump this the same time the flake's libadwaita version bumps.
 libadwaita = { version = "0.8", features = ["v1_6"] }
+
+# OCR performance (issue #24). The opt-in `visual` feature runs inference on
+# `rten`, which is ~30x slower built unoptimized — minutes per full-frame OCR
+# pass at the dev profile's opt-level 0 instead of seconds. Optimize just the
+# rten/ocrs stack even in dev/test builds so `find_by_text` is usable under
+# `cargo test`; our own crates (and the rest of the dependency graph) stay at
+# opt-level 0 so incremental builds of our code stay fast. These crates compile
+# only when the `visual` feature is enabled, so plain builds pay nothing extra.
+# Keep this list in sync with rten's crate split when upgrading. (Downstream
+# consumers want the broader `[profile.dev.package."*"] opt-level = 3`, which a
+# library can't ship for them — see the warning in src/visual/engine.rs.)
+[profile.dev.package]
+ocrs = { opt-level = 3 }
+rten = { opt-level = 3 }
+rten-base = { opt-level = 3 }
+rten-gemm = { opt-level = 3 }
+rten-imageproc = { opt-level = 3 }
+rten-model-file = { opt-level = 3 }
+rten-onnx = { opt-level = 3 }
+rten-shape-inference = { opt-level = 3 }
+rten-simd = { opt-level = 3 }
+rten-tensor = { opt-level = 3 }
+rten-vecmath = { opt-level = 3 }
