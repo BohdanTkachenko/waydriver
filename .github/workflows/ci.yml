@@ -13,6 +13,7 @@ jobs:
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,6 +25,7 @@ jobs:
   clippy:
     name: cargo clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Match the runtime/builder image in Dockerfile: Ubuntu 24.04 ships
     # libadwaita 1.5, but we depend on the v1_6 feature (AdwButtonRow).
     container: fedora:42
@@ -48,6 +50,7 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     container: fedora:42
     steps:
       - name: Install container prerequisites and system dependencies
@@ -68,6 +71,7 @@ jobs:
   e2e:
     name: docker e2e
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -99,6 +103,7 @@ jobs:
   examples:
     name: docker examples
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Set up Docker Buildx
