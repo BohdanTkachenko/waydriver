@@ -3,5 +3,7 @@
 /target
 /result
 /docs/book
+/docs/mermaid.min.js
+/docs/mermaid-init.js
 /app.log
 test_*.sh

@@ -7,6 +7,11 @@ on:
       - "docs/**"
       - "crates/waydriver/CHANGELOG.md"
       - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "crates/waydriver/CHANGELOG.md"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 # Allow the GITHUB_TOKEN to deploy to GitHub Pages.
@@ -15,10 +20,9 @@ permissions:
   pages: write
   id-token: write
 
-# Allow one concurrent deployment; don't cancel an in-progress run so a
-# publish always finishes.
+# Serialize deploys to main; PRs run on their own ref and don't contend.
 concurrency:
-  group: pages
+  group: docs-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -33,20 +37,31 @@ jobs:
         with:
           tool: mdbook,mdbook-mermaid
 
+      # Regenerate the Mermaid JS assets at build time so they aren't vendored
+      # in the repo. Idempotent against the committed book.toml config.
+      - name: Generate Mermaid assets
+        run: mdbook-mermaid install docs
+
+      # Builds the book and fails the job on render errors, missing chapters,
+      # or unresolvable {{#include}} directives — the PR "docs not broken" gate.
       - name: Build
         run: mdbook build docs
 
       - name: Set custom domain (CNAME)
+        if: github.event_name != 'pull_request'
         run: echo 'waydriver.io' > docs/book/CNAME
 
       - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs/book
 
+  # Deploy only for main / manual runs — never for pull requests.
   deploy:
     name: Deploy to GitHub Pages
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
