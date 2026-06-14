@@ -32,7 +32,7 @@ use crate::cli::{
     resolve_xdg_isolation,
 };
 use crate::mcp_error::waydriver_to_mcp;
-use crate::params::{SessionIdParams, StartSessionParams};
+use crate::params::{SessionIdParams, SetSettingParams, StartSessionParams};
 use crate::report::{append_event, now_ms, render_index_html};
 use crate::session::ManagedSession;
 use crate::UiTestServer;
@@ -295,6 +295,43 @@ impl UiTestServer {
         self.sessions.write().await.insert(id, managed);
 
         Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        description = "Change a GSettings key on an already-running session, live. Rewrites the \
+                       session's isolated keyfile in place; GIO's keyfile backend notifies the \
+                       app, which re-emits its GSettings `changed` signal and re-applies the value \
+                       without a restart — cursor theme, font scaling (text-scaling-factor), \
+                       color-scheme, and the like update on the fly. Where the `gsettings` array \
+                       on `start_session` only seeds a key *before* launch, this flips it *after*, \
+                       exercising the app's live change-handler. `value` is GVariant text form \
+                       (numbers bare, strings single-quoted, arrays bracketed). The app applies it \
+                       asynchronously — assert on the resulting UI change (via `query` plus a \
+                       wait) or on `wait_for_stdout_line`. Requires the session to use GSettings \
+                       isolation (the default)."
+    )]
+    pub(crate) async fn set_setting(
+        &self,
+        Parameters(params): Parameters<SetSettingParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let schema = params.schema.clone();
+        let key = params.key.clone();
+        let value = params.value.clone();
+        self.run_action(
+            &params.session_id,
+            "set_setting",
+            serde_json::json!({
+                "schema": params.schema,
+                "key": params.key,
+                "value": params.value,
+            }),
+            |s| async move {
+                s.set_setting(&schema, &key, &value)
+                    .await
+                    .map(|_| format!("Set {schema} {key} = {value}"))
+            },
+        )
+        .await
     }
 
     #[tool(description = "List all active test sessions")]

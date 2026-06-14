@@ -26,8 +26,8 @@ use waydriver::keysym::parse_chord;
 use crate::params::{
     ClickByTextParams, ClickParams, ClickTextRegionParams, DoubleClickParams, DragToParams,
     FillParams, FocusParams, HoverParams, ImageMatchParams, MovePointerAbsoluteParams,
-    MovePointerParams, PointerClickParams, PressKeyParams, RightClickParams, SelectOptionByParam,
-    SelectOptionParams, SetTextParams, TypeTextParams,
+    MovePointerParams, PointerClickParams, PressKeyParams, RightClickParams, ScrollParams,
+    SelectOptionByParam, SelectOptionParams, SetTextParams, TypeTextParams,
 };
 use crate::UiTestServer;
 
@@ -309,6 +309,41 @@ impl UiTestServer {
                     .select_option(selector)
                     .await
                     .map(|_| format!("Selected {by}={value:?} on {xpath}"))
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Scroll a located area by mouse-wheel detents. Parks the pointer over the \
+                       centre of the element selected by `xpath`, then emits `steps` wheel \
+                       notches along `axis` (\"vertical\" default, or \"horizontal\"). Positive \
+                       `steps` scroll down / right, negative up / left. Drive a scroll area or \
+                       list with it and pair with `read_value` on the scroll bar to confirm the \
+                       offset moved; over-scroll (more detents than the content is long) to park \
+                       at an edge. For keyboard scrollback (e.g. a terminal's Shift+Page_Up) use \
+                       `press_key` instead — this sends real wheel input over the widget."
+    )]
+    pub(crate) async fn scroll(
+        &self,
+        Parameters(params): Parameters<ScrollParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let xpath = params.xpath.clone();
+        let axis = params.axis;
+        let steps = params.steps;
+        self.run_action(
+            &params.session_id,
+            "scroll",
+            serde_json::json!({
+                "xpath": params.xpath,
+                "axis": params.axis,
+                "steps": params.steps,
+            }),
+            |s| async move {
+                s.locate(&xpath)
+                    .scroll(axis.to_waydriver(), steps)
+                    .await
+                    .map(|_| format!("Scrolled {xpath} by {steps} {axis:?} detent(s)"))
             },
         )
         .await

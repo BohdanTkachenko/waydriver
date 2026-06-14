@@ -13,7 +13,7 @@ use rmcp::{tool, tool_router, ErrorData as McpError};
 
 use crate::params::{
     FindTextParams, FindTextRegionsParams, ImageMatchParams, ListTextParams, QueryParams,
-    ReadTextParams, SessionIdParams, WaitForStdoutLineParams,
+    ReadTextParams, ReadValueParams, SessionIdParams, WaitForStdoutLineParams,
 };
 use crate::report::render_matches;
 use crate::UiTestServer;
@@ -95,6 +95,38 @@ impl UiTestServer {
             "read_text",
             serde_json::json!({ "xpath": params.xpath }),
             |s| async move { s.locate(&xpath).text().await },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Read the AT-SPI Value of an element selected by XPath: its current \
+                       position plus the range it moves within. The headline use is reading a \
+                       scrolled view's offset — which AT-SPI exposes nowhere else — by locating \
+                       the scroll bar inside the scrolled window; also works for any slider, \
+                       progress bar, or spin button. Returns JSON \
+                       `{current, minimum, maximum, minimum_increment}`. Target must implement \
+                       the Value AT-SPI interface."
+    )]
+    pub(crate) async fn read_value(
+        &self,
+        Parameters(params): Parameters<ReadValueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let xpath = params.xpath.clone();
+        self.run_action(
+            &params.session_id,
+            "read_value",
+            serde_json::json!({ "xpath": params.xpath }),
+            |s| async move {
+                let v = s.locate(&xpath).value().await?;
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "current": v.current,
+                    "minimum": v.minimum,
+                    "maximum": v.maximum,
+                    "minimum_increment": v.minimum_increment,
+                }))
+                .map_err(|e| waydriver::Error::process_with("serialize read_value result", e))
+            },
         )
         .await
     }

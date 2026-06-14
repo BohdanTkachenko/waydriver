@@ -157,6 +157,7 @@ with `.nth(i)` or a more specific XPath.
 | `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir`, `resolution`, `scale`, `isolate_settings`, `gsettings`, `record_video`, `video_bitrate` overrides per session) |
 | `list_sessions`   | List active session ids, app names, and Wayland displays              |
 | `kill_session`    | Tear down a session and clean up all child processes                  |
+| `set_setting`     | Change a GSettings key on the running session live — rewrites the isolated keyfile in place so the app re-applies it via its `changed` handler (cursor, fonts, color-scheme, …) without a restart |
 | `dump_tree`       | Dump the AT-SPI accessibility tree as XML — each node carries a `_ref` you can target with `query`/`click`/etc. |
 | `query`           | Evaluate an XPath over the tree; returns every match's role, name, attributes, and states |
 | `click` / `double_click` / `right_click` | Invoke an element's primary / secondary / tertiary AT-SPI `Action`. Auto-waits for visibility + enablement. |
@@ -167,6 +168,8 @@ with `.nth(i)` or a more specific XPath.
 | `fill`            | Focus + clear + type — fallback for widgets without `EditableText` (e.g. `GtkTextView`/`GtkEntry`). Tries AT-SPI `Component::grab_focus` first; widgets whose bridge doesn't expose Component (the documented GTK4 case) fall back to a pointer click at the widget's centre to drive focus through the input layer, the same way a user would. Set `assume_focused: true` to skip the whole focus step when the target is already focused. Supports `caret_nav`/`select_all` clear modes. |
 | `select_option`   | Pick an entry from a Selection-interface container (combo box, list, …) by label or by index |
 | `read_text`       | Read an element's text via the `Text` interface                       |
+| `read_value`      | Read an element's AT-SPI `Value` (current/min/max) — a scrolled view's offset, or a slider/progress/spin value |
+| `scroll`          | Scroll a located area by wheel detents along an axis (parks the pointer over it first); pair with `read_value` to confirm the offset moved |
 | `type_text`       | Type a string into the currently focused element through the input backend |
 | `press_key`       | Press a named key or chord (`Return`, `Ctrl+A`, `Shift+Tab`, `Escape`, …) |
 | `move_pointer`    | Move the pointer by a relative offset in logical pixels               |

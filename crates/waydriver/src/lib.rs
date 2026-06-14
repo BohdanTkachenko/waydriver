@@ -28,7 +28,7 @@ pub mod session;
 #[cfg(feature = "visual")]
 pub mod visual;
 
-pub use atspi::{CachedAccessible, Rect};
+pub use atspi::{CachedAccessible, Rect, ValueInfo};
 pub use backend::{
     CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream, PointerAxis, PointerButton,
     StreamToken,

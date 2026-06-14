@@ -437,6 +437,12 @@ pub struct Session {
     /// [`set_default_timeout`] can mutate it behind an `Arc<Session>`
     /// without requiring interior-mutability gymnastics on every field.
     default_timeout_ns: AtomicU64,
+    /// Whether this session runs against the isolated per-session GSettings
+    /// keyfile store, copied from [`SessionConfig::gsettings_isolated`] at
+    /// start. [`set_setting`](Self::set_setting) requires it: a live keyfile
+    /// write only reaches the app through GIO's keyfile backend, never the
+    /// host's shared dconf.
+    gsettings_isolated: bool,
     /// Cooperative cancellation signal. Long-running auto-wait loops in
     /// [`Locator`] race this against their backoff sleep so a caller
     /// (typically `kill_session` in the MCP layer) can bail out of a
@@ -686,6 +692,7 @@ impl Session {
             app_path,
             a11y_connection: Some(a11y_connection),
             default_timeout_ns: AtomicU64::new(resolve_default_timeout().as_nanos() as u64),
+            gsettings_isolated: cfg.gsettings_isolated,
             cancellation,
             app,
             keepalive_stream: Some(keepalive_stream),
@@ -904,6 +911,42 @@ impl Session {
         self.input
             .pointer_axis_discrete(axis, steps, &self.cancellation)
             .await
+    }
+
+    /// Change a GSettings key on the **already-running** app, live.
+    ///
+    /// Rewrites the session's isolated keyfile in place (read-modify-write,
+    /// preserving every other key — including the compositor's seeds). GIO's
+    /// keyfile backend watches that file, so the app re-emits its GSettings
+    /// `changed` signal and re-applies the value without a restart: cursor
+    /// theme, font scaling, color scheme, bell, scrollback, and the like
+    /// update live. Where seeding via [`SessionConfig`] only sets a key
+    /// *before* launch, this flips it *after*, exercising the app's live
+    /// change-handler. `value` is GVariant text form — the same syntax
+    /// `gsettings set` and the launch seeds use (numbers bare, strings
+    /// single-quoted, arrays bracketed).
+    ///
+    /// The app observes the change **asynchronously**: there's no
+    /// acknowledgement that it has re-applied. Drive the assertion off the
+    /// resulting effect — a [`Locator`](crate::Locator) auto-wait on the
+    /// changed UI, or [`wait_for_stdout_line`](Self::wait_for_stdout_line) when
+    /// the app logs its handler.
+    ///
+    /// Requires GSettings isolation ([`SessionConfig::gsettings_isolated`], the
+    /// default). Without it the session reads the host's dconf, which this
+    /// write deliberately never touches — so it returns [`Error::Process`]
+    /// rather than silently no-op. Also returns [`Error::Process`] if the
+    /// keyfile rewrite fails.
+    pub async fn set_setting(&self, schema: &str, key: &str, value: &str) -> Result<()> {
+        if !self.gsettings_isolated {
+            return Err(Error::process(
+                "set_setting requires gsettings isolation; start with \
+                 SessionConfig.gsettings_isolated = true",
+            ));
+        }
+        let entry = crate::gsettings::GSettingEntry::new(schema, key, value);
+        crate::gsettings::live_write(self.compositor.runtime_dir(), &entry)
+            .map_err(|e| Error::process_with("set_setting: rewrite keyfile", e))
     }
 
     /// Pointer "click" using the cold-start warmup recipe shared by the
@@ -1441,6 +1484,10 @@ impl Session {
             app_path: String::new(),
             a11y_connection: None,
             default_timeout_ns: AtomicU64::new(FALLBACK_DEFAULT_TIMEOUT.as_nanos() as u64),
+            // Mock sessions have no real isolated keyfile store, so live
+            // `set_setting` is unavailable (it returns the isolation-required
+            // error); tests that need it construct a real session.
+            gsettings_isolated: false,
             cancellation: CancellationToken::new(),
             app,
             keepalive_stream: None,
@@ -2598,6 +2645,21 @@ mod tests {
             Box::new(StubCapture),
             Box::new(StubCompositor),
         )
+    }
+
+    #[tokio::test]
+    async fn set_setting_errors_without_gsettings_isolation() {
+        // make_test_session builds a non-isolated mock session, so set_setting
+        // must refuse up front rather than attempt a keyfile write.
+        let s = make_test_session();
+        let err = s
+            .set_setting("org.gnome.desktop.interface", "text-scaling-factor", "1.5")
+            .await
+            .expect_err("set_setting must error when the session isn't gsettings-isolated");
+        assert!(
+            matches!(err, Error::Process { ref message, .. } if message.contains("isolation")),
+            "expected an isolation-required Process error, got: {err:?}"
+        );
     }
 
     #[tokio::test]

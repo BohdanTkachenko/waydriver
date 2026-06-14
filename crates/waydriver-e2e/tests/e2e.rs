@@ -2946,3 +2946,85 @@ async fn capture_restores_runtime_env_and_still_produces_media() -> anyhow::Resu
     CompositorRuntime::stop(&mut compositor).await?;
     Ok(())
 }
+
+/// (#29 b — drive) `Locator::scroll` moves a scroll area's offset. Wheeling
+/// down over the `scroll-area` ScrolledWindow must push its vertical adjustment
+/// past 0 — the fixture emits `scrolled scroll-area value=<n>` as ground truth
+/// — and over-scrolling back up must clamp it to 0.0 (parked at the top).
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn scroll_drives_scroll_area_offset() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Scroll down a few detents; the fixture reports the resulting offset.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//*[@name='scroll-area']")
+        .scroll(waydriver::PointerAxis::Vertical, 5)
+        .await?;
+    let line = session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("scrolled scroll-area value="),
+            Duration::from_secs(5),
+        )
+        .await?;
+    let moved: f64 = line
+        .rsplit("value=")
+        .next()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("couldn't parse scroll offset from {line:?}"))?;
+    assert!(
+        moved > 0.0,
+        "scrolling down should push the offset past 0, got {moved}"
+    );
+
+    // Over-scroll back up well past the top; the offset clamps and parks at 0.0.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//*[@name='scroll-area']")
+        .scroll(waydriver::PointerAxis::Vertical, -20)
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("scrolled scroll-area value=0.0"),
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// (#29 b — readback) `Locator::value` reads an element's AT-SPI `Value`
+/// interface, the half of the scroll/value capability that AT-SPI otherwise
+/// hides. The fixture's `value-slider` is a Scale fixed to 0..100 at an initial
+/// 25, so the snapshot must report exactly that range and position.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn value_reads_slider_range() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let v = session.locate("//*[@name='value-slider']").value().await?;
+    assert!(
+        (v.current - 25.0).abs() < 0.01,
+        "slider current should read its initial 25, got {}",
+        v.current
+    );
+    assert!(
+        (v.minimum - 0.0).abs() < 0.01,
+        "slider minimum should be 0, got {}",
+        v.minimum
+    );
+    assert!(
+        (v.maximum - 100.0).abs() < 0.01,
+        "slider maximum should be 100, got {}",
+        v.maximum
+    );
+
+    kill(session).await?;
+    Ok(())
+}

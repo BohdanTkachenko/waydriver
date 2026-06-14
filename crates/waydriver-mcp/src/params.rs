@@ -114,6 +114,20 @@ impl GSettingParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetSettingParams {
+    /// Session ID
+    pub session_id: String,
+    /// Dotted schema id, e.g. "org.gnome.desktop.interface".
+    pub schema: String,
+    /// Key within the schema, e.g. "text-scaling-factor".
+    pub key: String,
+    /// New value in GVariant text form (same syntax `gsettings set` takes):
+    /// numbers bare ("1.5"), strings single-quoted ("'prefer-dark'"), arrays
+    /// bracketed ("['scale-monitor-framebuffer']").
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionIdParams {
     /// Session ID returned by start_session
     pub session_id: String,
@@ -299,6 +313,15 @@ pub struct ReadTextParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadValueParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector; must resolve to exactly one element supporting the
+    /// AT-SPI Value interface (scroll bar, slider, progress bar, spin button).
+    pub xpath: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TypeTextParams {
     /// Session ID
     pub session_id: String,
@@ -340,6 +363,50 @@ pub struct MovePointerAbsoluteParams {
     pub x: f64,
     /// Absolute screen Y in logical pixels
     pub y: f64,
+}
+
+/// Axis a `scroll` wheel event travels along.
+///
+/// Wire form is snake_case so an unknown discriminator is rejected at
+/// serde-deserialise time instead of inside the tool body.
+#[derive(
+    Debug, Default, Deserialize, Serialize, schemars::JsonSchema, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollAxisParam {
+    /// Up/down, like a vertical mouse wheel — the common case for scroll
+    /// areas and lists.
+    #[default]
+    Vertical,
+    /// Left/right, like a tilt-wheel or trackpad sideways scroll.
+    Horizontal,
+}
+
+impl ScrollAxisParam {
+    /// Translate the wire-level enum into the library-level
+    /// [`waydriver::PointerAxis`].
+    pub fn to_waydriver(self) -> waydriver::PointerAxis {
+        match self {
+            ScrollAxisParam::Vertical => waydriver::PointerAxis::Vertical,
+            ScrollAxisParam::Horizontal => waydriver::PointerAxis::Horizontal,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScrollParams {
+    /// Session ID
+    pub session_id: String,
+    /// XPath selector for the area to scroll; must resolve to exactly one
+    /// element with AT-SPI bounds. The pointer is parked over its centre
+    /// before the wheel event is emitted.
+    pub xpath: String,
+    /// Axis to scroll along: "vertical" (default) or "horizontal".
+    #[serde(default)]
+    pub axis: ScrollAxisParam,
+    /// Number of wheel detents. Positive scrolls down / right, negative up /
+    /// left; one detent ≈ one notch of a physical wheel.
+    pub steps: i32,
 }
 
 /// How OCR-recognised words are matched against the search text.
