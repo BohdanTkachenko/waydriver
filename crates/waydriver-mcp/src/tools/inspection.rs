@@ -33,6 +33,30 @@ fn bbox_json(r: &waydriver::Rect) -> serde_json::Value {
     })
 }
 
+fn notification_json(n: &waydriver::CapturedNotification) -> serde_json::Value {
+    serde_json::json!({
+        "seq": n.seq,
+        "app_name": n.app_name,
+        "replaces_id": n.replaces_id,
+        "app_icon": n.app_icon,
+        "summary": n.summary,
+        "body": n.body,
+        "actions": n.actions,
+        "hints": n.hints,
+        "expire_timeout": n.expire_timeout,
+        "id": n.id,
+    })
+}
+
+fn open_uri_json(o: &waydriver::CapturedOpenUri) -> serde_json::Value {
+    serde_json::json!({
+        "seq": o.seq,
+        "parent_window": o.parent_window,
+        "uri": o.uri,
+        "options": o.options,
+    })
+}
+
 #[tool_router(router = inspection_router, vis = "pub(crate)")]
 impl UiTestServer {
     #[tool(
@@ -365,6 +389,54 @@ impl UiTestServer {
                 let needle = contains.clone();
                 s.wait_for_stdout_line(after, |line| line.contains(&needle), timeout)
                     .await
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Read the external effects the app has emitted onto the session bus — \
+                       desktop notifications and portal open-URI requests — captured by mock \
+                       D-Bus sinks. These have no AT-SPI projection (they leave the process to a \
+                       daemon), so this is the only way to assert on them. Returns JSON \
+                       `{capture_enabled, notifications: [{seq, app_name, summary, body, actions, \
+                       hints, expire_timeout, replaces_id, app_icon, id}], open_uri_requests: \
+                       [{seq, uri, parent_window, options}]}`. \
+                       Requires the session to have been started with \
+                       `capture_external_effects: true` (else `capture_enabled` is false and the \
+                       arrays are empty). The app posts these asynchronously, so trigger the \
+                       action, then poll this (or pair with `wait_for_stdout_line` on a log line \
+                       the app emits) — entries accumulate for the session's lifetime."
+    )]
+    pub(crate) async fn get_captured_effects(
+        &self,
+        Parameters(params): Parameters<SessionIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_action(
+            &params.session_id,
+            "get_captured_effects",
+            serde_json::json!({}),
+            |s| async move {
+                let payload = if s.external_effects_enabled() {
+                    let notifications: Vec<_> =
+                        s.notifications()?.iter().map(notification_json).collect();
+                    let open_uri_requests: Vec<_> =
+                        s.open_uri_requests()?.iter().map(open_uri_json).collect();
+                    serde_json::json!({
+                        "capture_enabled": true,
+                        "notifications": notifications,
+                        "open_uri_requests": open_uri_requests,
+                    })
+                } else {
+                    serde_json::json!({
+                        "capture_enabled": false,
+                        "notifications": [],
+                        "open_uri_requests": [],
+                    })
+                };
+                serde_json::to_string_pretty(&payload).map_err(|e| {
+                    waydriver::Error::process_with("serialize get_captured_effects result", e)
+                })
             },
         )
         .await

@@ -17,6 +17,8 @@
 //! router. Read-only inspection lives in [`super::inspection`] and
 //! screen capture in [`super::capture`].
 
+use std::time::Duration;
+
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router, ErrorData as McpError};
@@ -25,9 +27,10 @@ use waydriver::keysym::parse_chord;
 
 use crate::params::{
     ClickByTextParams, ClickParams, ClickTextRegionParams, DoubleClickParams, DragToParams,
-    FillParams, FocusParams, HoverParams, ImageMatchParams, MovePointerAbsoluteParams,
-    MovePointerParams, PointerClickParams, PressKeyParams, RightClickParams, ScrollParams,
-    SelectOptionByParam, SelectOptionParams, SetTextParams, TypeTextParams,
+    FillParams, FocusParams, HoverParams, ImageMatchParams, LaunchSecondaryParams,
+    MovePointerAbsoluteParams, MovePointerParams, PointerClickParams, PressKeyParams,
+    RightClickParams, ScrollParams, SelectOptionByParam, SelectOptionParams, SetTextParams,
+    TypeTextParams,
 };
 use crate::UiTestServer;
 
@@ -628,6 +631,40 @@ impl UiTestServer {
                 s.pointer_button(button)
                     .await
                     .map(|_| format!("Pointer button {button_code:#x} clicked"))
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Launch a second instance of the session's app with the given args, in the \
+                       same environment as the primary. For a single-instance GApplication, the \
+                       second invocation detects the running primary on the session bus and \
+                       forwards its command line to it (instead of opening a new window), then \
+                       exits. Returns the secondary process's own exit code and output (usually \
+                       empty). Observe what the *primary* did with the forwarded args via \
+                       `wait_for_stdout_line` or `query`. `timeout_secs` bounds how long to wait \
+                       for the secondary to exit (default 15)."
+    )]
+    pub(crate) async fn launch_secondary_instance(
+        &self,
+        Parameters(params): Parameters<LaunchSecondaryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = params.args.clone();
+        let timeout = params.timeout_secs.map(Duration::from_secs);
+        self.run_action(
+            &params.session_id,
+            "launch_secondary_instance",
+            serde_json::json!({ "args": params.args, "timeout_secs": params.timeout_secs }),
+            |s| async move {
+                let outcome = match timeout {
+                    Some(t) => s.launch_secondary_with_timeout(args, t).await?,
+                    None => s.launch_secondary(args).await?,
+                };
+                Ok(format!(
+                    "Secondary instance exited (code={:?}).\nstdout:\n{}\nstderr:\n{}",
+                    outcome.exit_code, outcome.stdout, outcome.stderr
+                ))
             },
         )
         .await

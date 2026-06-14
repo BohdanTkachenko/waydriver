@@ -37,6 +37,9 @@ pub struct UiTestServer {
     /// pass its own `setup_timeout_secs`. Guarantees the call returns (with an
     /// error + teardown) instead of hanging when setup or recording stalls.
     pub(crate) default_setup_timeout: Duration,
+    /// Default for external-effect capture (mock notification + portal sinks)
+    /// when a start_session call doesn't pass its own `capture_external_effects`.
+    pub(crate) default_capture_external_effects: bool,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -170,6 +173,7 @@ impl UiTestServer {
         default_record_video: bool,
         default_video_bitrate: u32,
         default_setup_timeout: Duration,
+        default_capture_external_effects: bool,
     ) -> Self {
         let tool_router = Self::lifecycle_router()
             + Self::inspection_router()
@@ -185,6 +189,7 @@ impl UiTestServer {
             default_record_video,
             default_video_bitrate,
             default_setup_timeout,
+            default_capture_external_effects,
             tool_router,
         }
     }
@@ -280,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
         cli.record_video,
         cli.video_bitrate,
         Duration::from_secs(cli.setup_timeout_secs),
+        cli.capture_external_effects,
     )
     .serve(stdio())
     .await
@@ -322,6 +328,7 @@ mod tests {
             false,
             2_000_000,
             Duration::from_secs(90),
+            false,
         )
     }
 
@@ -893,6 +900,7 @@ mod tests {
             false,
             2_000_000,
             Duration::from_secs(90),
+            false,
         );
         insert_test_session_with(&s, "test-1", "calculator", "wayland-test-1", false).await;
 
@@ -916,6 +924,7 @@ mod tests {
             false,
             2_000_000,
             Duration::from_secs(90),
+            false,
         );
         assert_eq!(s.report_dir, PathBuf::from("/tmp/custom-out"));
     }
@@ -1035,6 +1044,7 @@ mod tests {
             false,
             2_000_000,
             Duration::from_secs(90),
+            false,
         );
         insert_test_session(&s, "abc", "calc", "wayland-abc").await;
         let sessions = s.sessions.read().await;
@@ -1173,6 +1183,7 @@ mod tests {
             false,
             2_000_000,
             Duration::from_secs(90),
+            false,
         );
         tokio::fs::create_dir_all(tmp.path().join("sid"))
             .await
@@ -1214,6 +1225,7 @@ mod tests {
             false,
             2_000_000,
             Duration::from_secs(90),
+            false,
         );
         tokio::fs::create_dir_all(tmp.path().join("sid"))
             .await
@@ -1315,6 +1327,7 @@ mod tests {
             false,
             2_000_000,
             Duration::from_secs(90),
+            false,
         );
         insert_test_session(&s, "sid", "app", "wayland-x").await;
 

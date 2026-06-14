@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
             gsettings_isolated: true,
             xdg_isolated: true,
             extra_env: Vec::new(),
+            capture_external_effects: false,
         },
     )
     .await?;

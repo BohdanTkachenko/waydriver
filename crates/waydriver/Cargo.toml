@@ -52,6 +52,10 @@ imageproc = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# `tests/external_sinks.rs` drives the mock D-Bus sinks as a real bus client.
+# zbus/tokio/tokio-util are already normal deps (available to integration tests);
+# futures-util is the only extra — it awaits the portal Response signal stream.
+futures-util.workspace = true
 
 [package.metadata.docs.rs]
 # Document only this crate, not the entire dependency tree. shipyard hosts

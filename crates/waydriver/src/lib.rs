@@ -23,6 +23,9 @@ pub mod keysym;
 pub mod locator;
 /// Test session lifecycle management.
 pub mod session;
+/// Mock D-Bus services that capture an app's external effects (desktop
+/// notifications, portal open-URI) for assertion.
+pub mod sink;
 /// OCR-backed visual locator for widgets that don't surface in AT-SPI.
 /// Opt-in via the `visual` Cargo feature.
 #[cfg(feature = "visual")]
@@ -36,7 +39,10 @@ pub use backend::{
 pub use error::{Error, Result};
 pub use gsettings::{GSettingEntry, GSettingsConfig};
 pub use locator::{FillMode, Locator, SelectBy};
-pub use session::{Session, SessionConfig, VisualRegionTuning, VisualTextTuning};
+pub use session::{
+    SecondaryInstance, Session, SessionConfig, VisualRegionTuning, VisualTextTuning,
+};
+pub use sink::{CapturedNotification, CapturedOpenUri, ExternalSinks};
 #[cfg(feature = "visual")]
 pub use visual::{
     BaselineComparison, ImageLocator, MatchMode, RegionLocator, Shape, TextHit, VisualLocator,

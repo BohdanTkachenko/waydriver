@@ -138,6 +138,21 @@ pub struct SessionConfig {
     /// `std::env::set_var` (which is unsound with concurrent sessions and
     /// leaks into everything else the harness spawns).
     pub extra_env: Vec<(String, String)>,
+
+    /// When `true`, stand up mock D-Bus services on the app's session bus that
+    /// capture "external effects" the app emits there — desktop notifications
+    /// (`org.freedesktop.Notifications`) and portal open-URI requests
+    /// (`org.freedesktop.portal.Desktop` `OpenURI`) — so a test can assert on
+    /// them via [`Session::notifications`] / [`Session::open_uri_requests`] (and
+    /// the `wait_for_*` variants).
+    ///
+    /// Opt-in (default `false`): the sinks own well-known names, which is only
+    /// safe when nothing else owns them. On the per-session / container bus
+    /// that's always the case; on a shared host bus where a real notification
+    /// daemon or portal already runs, the name claim no-ops with a warning and
+    /// capture for that interface stays empty. Setup is best-effort — a failure
+    /// never aborts an otherwise-ready session. See [`crate::sink`].
+    pub capture_external_effects: bool,
 }
 
 /// Which colour-distance metric the visual locator uses when
@@ -425,6 +440,32 @@ struct AppStdout {
     notify: Notify,
 }
 
+/// Everything needed to relaunch the session's app as a *secondary* instance in
+/// the same environment (same Wayland display, D-Bus bus, XDG dirs) so a
+/// single-instance `GApplication` forwards the secondary's command line to the
+/// already-running primary. Captured at [`Session::start`].
+struct SecondaryLaunchSpec {
+    command: String,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
+}
+
+/// Result of [`Session::launch_secondary`]: the secondary process's exit code
+/// (`None` if it was killed by a signal) plus whatever it printed before
+/// exiting. The *primary* instance's reaction to the forwarded command line is
+/// observed separately, via [`Session::wait_for_stdout_line`].
+#[derive(Debug, Clone)]
+pub struct SecondaryInstance {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// How long [`Session::launch_secondary`] waits for the secondary to exit. A
+/// single-instance app forwards its command line and exits near-instantly; this
+/// only bounds a misbehaving binary.
+const SECONDARY_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// A running UI test session: a compositor, input + capture backends, the
 /// target application process, and an AT-SPI connection to drive it.
 ///
@@ -438,6 +479,17 @@ pub struct Session {
     pub app_bus_name: String,
     pub app_path: String,
     pub a11y_connection: Option<zbus::Connection>,
+    /// Mock D-Bus sinks capturing the app's external effects (notifications,
+    /// portal open-URI). `Some` only when [`SessionConfig::capture_external_effects`]
+    /// was set and setup succeeded. This is a connection to the *app* (host /
+    /// per-session) bus, independent of the compositor's private bus, so it is
+    /// **not** part of the load-bearing shutdown ordering below — `kill` drops
+    /// it up front to release the owned names.
+    external_sinks: Option<crate::sink::ExternalSinks>,
+    /// Captured spec for relaunching the app as a secondary instance in the
+    /// same environment, used by [`Session::launch_secondary`] to exercise
+    /// single-instance `GApplication` command-line forwarding.
+    secondary_spec: SecondaryLaunchSpec,
     /// Default timeout (in nanoseconds) applied to auto-wait on Locator
     /// actions and explicit `wait_for_*` calls. Stored as AtomicU64 so
     /// [`set_default_timeout`] can mutate it behind an `Arc<Session>`
@@ -555,12 +607,20 @@ impl Session {
         tracing::info!(id, "starting session");
 
         let dbus_address = get_host_session_bus()?;
-        let mut app = spawn_app(
+        // Build the app env once and reuse it for the captured secondary-launch
+        // spec, so a secondary instance lands on the same bus / display / dirs.
+        let app_env = app_env_pairs(
             &cfg,
             compositor.wayland_display(),
             compositor.runtime_dir(),
             &dbus_address,
-        )?;
+        );
+        let secondary_spec = SecondaryLaunchSpec {
+            command: cfg.command.clone(),
+            env: app_env.clone(),
+            cwd: cfg.cwd.clone(),
+        };
+        let mut app = spawn_app(&cfg, &app_env)?;
         tracing::debug!(id, app_name = %cfg.app_name, "app spawned");
 
         let stdout = Arc::new(AppStdout::default());
@@ -605,6 +665,25 @@ impl Session {
         let a11y_connection = atspi_client::connect_a11y(&dbus_address).await?;
         let (app_bus_name, app_path) = wait_for_app(&a11y_connection, &cfg.app_name).await?;
         tracing::info!(id, app_name = %cfg.app_name, %app_bus_name, "session ready");
+
+        // Optionally stand up the mock external-effect sinks on the app's
+        // session bus. Best-effort: a failure here (bad address, registration)
+        // must not fail an otherwise-ready session — capture simply stays off.
+        let external_sinks = if cfg.capture_external_effects {
+            match crate::sink::ExternalSinks::start(&dbus_address).await {
+                Ok(sinks) => Some(sinks),
+                Err(e) => {
+                    tracing::warn!(
+                        id,
+                        error = %e,
+                        "external-effect capture setup failed; continuing without it"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Start a keepalive ScreenCast stream. In headless mutter the
         // compositor only delivers Wayland frame callbacks while it is
@@ -697,6 +776,8 @@ impl Session {
             app_bus_name,
             app_path,
             a11y_connection: Some(a11y_connection),
+            external_sinks,
+            secondary_spec,
             default_timeout_ns: AtomicU64::new(resolve_default_timeout().as_nanos() as u64),
             gsettings_isolated: cfg.gsettings_isolated,
             cancellation,
@@ -750,6 +831,11 @@ impl Session {
         // futures are dropped, which for tokio process / D-Bus
         // primitives means cancellation rather than detached work.
         let inner = async move {
+            // Release the mock-sink bus names/objects up front. They live on the
+            // app's session bus, independent of the compositor's private bus, so
+            // this has no ordering relationship to the steps below.
+            let _ = self.external_sinks.take();
+
             if let Some(handle) = self.stdout_reader.take() {
                 // Cooperative path runs first via the token; the
                 // abort here is a hard fallback for the case where
@@ -977,6 +1063,146 @@ impl Session {
         let entry = crate::gsettings::GSettingEntry::new(schema, key, value);
         crate::gsettings::live_write(self.compositor.runtime_dir(), &entry)
             .map_err(|e| Error::process_with("set_setting: rewrite keyfile", e))
+    }
+
+    // ── External-effect capture (notifications / portal open-URI) ──────────
+
+    /// Whether external-effect capture is active for this session — i.e.
+    /// [`SessionConfig::capture_external_effects`] was set and the mock sinks
+    /// were started. The readback methods below error when this is `false`.
+    pub fn external_effects_enabled(&self) -> bool {
+        self.external_sinks.is_some()
+    }
+
+    fn sinks(&self) -> Result<&crate::sink::ExternalSinks> {
+        self.external_sinks.as_ref().ok_or_else(|| {
+            Error::process(
+                "external-effect capture is not enabled for this session; start it with \
+                 SessionConfig.capture_external_effects = true",
+            )
+        })
+    }
+
+    /// Snapshot of every desktop notification (`org.freedesktop.Notifications.Notify`)
+    /// the app has posted so far. Requires [`SessionConfig::capture_external_effects`].
+    pub fn notifications(&self) -> Result<Vec<crate::sink::CapturedNotification>> {
+        Ok(self.sinks()?.notifications())
+    }
+
+    /// Snapshot of every portal open-URI request the app has made so far.
+    /// Requires [`SessionConfig::capture_external_effects`].
+    pub fn open_uri_requests(&self) -> Result<Vec<crate::sink::CapturedOpenUri>> {
+        Ok(self.sinks()?.open_uri_requests())
+    }
+
+    /// Current notification-log length — a high-water mark to pass as `after`
+    /// to [`wait_for_notification`](Self::wait_for_notification) so a wait only
+    /// matches notifications posted after this point.
+    pub fn notification_cursor(&self) -> Result<usize> {
+        Ok(self.sinks()?.notification_count())
+    }
+
+    /// Current open-URI-log length — a high-water mark for
+    /// [`wait_for_open_uri`](Self::wait_for_open_uri).
+    pub fn open_uri_cursor(&self) -> Result<usize> {
+        Ok(self.sinks()?.open_uri_count())
+    }
+
+    /// Wait for a captured notification at or after index `after` matching
+    /// `pred`. Returns it on success, [`Error::Timeout`] if none arrives in
+    /// time, or [`Error::Cancelled`] if the session is killed while waiting.
+    pub async fn wait_for_notification<F>(
+        &self,
+        after: usize,
+        pred: F,
+        timeout: Duration,
+    ) -> Result<crate::sink::CapturedNotification>
+    where
+        F: Fn(&crate::sink::CapturedNotification) -> bool,
+    {
+        self.sinks()?
+            .wait_for_notification(after, pred, timeout, &self.cancellation)
+            .await
+    }
+
+    /// Wait for a captured open-URI request at or after index `after` matching
+    /// `pred`. Same outcome semantics as
+    /// [`wait_for_notification`](Self::wait_for_notification).
+    pub async fn wait_for_open_uri<F>(
+        &self,
+        after: usize,
+        pred: F,
+        timeout: Duration,
+    ) -> Result<crate::sink::CapturedOpenUri>
+    where
+        F: Fn(&crate::sink::CapturedOpenUri) -> bool,
+    {
+        self.sinks()?
+            .wait_for_open_uri(after, pred, timeout, &self.cancellation)
+            .await
+    }
+
+    // ── Single-instance CLI forwarding ────────────────────────────────────
+
+    /// Relaunch the session's app as a **secondary instance** with `args`, in
+    /// the same environment as the primary (same Wayland display, D-Bus bus, XDG
+    /// dirs). For a single-instance `GApplication`, the secondary detects the
+    /// already-running primary on the session bus and **forwards** its command
+    /// line to it instead of opening a new window, then exits.
+    ///
+    /// Returns the secondary process's own exit/output (usually exit 0, empty
+    /// output). Observe what the *primary* did with the forwarded command line
+    /// via [`wait_for_stdout_line`](Self::wait_for_stdout_line) (or the AT-SPI
+    /// tree) — that's where the effect lands.
+    ///
+    /// Bounded by an internal timeout; a secondary that doesn't exit (e.g. it
+    /// became the primary because none was running) surfaces as
+    /// [`Error::Timeout`].
+    pub async fn launch_secondary(&self, args: Vec<String>) -> Result<SecondaryInstance> {
+        self.launch_secondary_with_timeout(args, SECONDARY_LAUNCH_TIMEOUT)
+            .await
+    }
+
+    /// [`launch_secondary`](Self::launch_secondary) with an explicit exit
+    /// timeout.
+    pub async fn launch_secondary_with_timeout(
+        &self,
+        args: Vec<String>,
+        timeout: Duration,
+    ) -> Result<SecondaryInstance> {
+        if self.cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let spec = &self.secondary_spec;
+        let mut cmd = Command::new(&spec.command);
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for (key, value) in &spec.env {
+            cmd.env(key, value);
+        }
+        if let Some(dir) = &spec.cwd {
+            cmd.current_dir(dir);
+        }
+        set_pdeathsig(&mut cmd);
+
+        let output = tokio::time::timeout(timeout, cmd.output())
+            .await
+            .map_err(|_| {
+                Error::Timeout(format!(
+                    "secondary instance '{}' did not exit within {timeout:?}",
+                    spec.command
+                ))
+            })?
+            .map_err(|e| Error::process_with(format!("launch secondary '{}'", spec.command), e))?;
+
+        Ok(SecondaryInstance {
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
     }
 
     /// Pointer "click" using the cold-start warmup recipe shared by the
@@ -1588,6 +1814,15 @@ impl Session {
             app_bus_name: String::new(),
             app_path: String::new(),
             a11y_connection: None,
+            // Mock sessions have no real session bus, so external-effect
+            // capture is unavailable (the readback methods return the
+            // capture-disabled error).
+            external_sinks: None,
+            secondary_spec: SecondaryLaunchSpec {
+                command: "sleep".to_string(),
+                env: Vec::new(),
+                cwd: None,
+            },
             default_timeout_ns: AtomicU64::new(FALLBACK_DEFAULT_TIMEOUT.as_nanos() as u64),
             // Mock sessions have no real isolated keyfile store, so live
             // `set_setting` is unavailable (it returns the isolation-required
@@ -1688,27 +1923,31 @@ fn isolated_xdg_env(runtime_dir: &Path) -> [(&'static str, PathBuf); 3] {
     ]
 }
 
-fn spawn_app(
+/// Build the environment the target app is launched with, as owned key/value
+/// pairs. Shared by [`spawn_app`] and the [`SecondaryLaunchSpec`] captured for
+/// [`Session::launch_secondary`], so a secondary instance lands on the exact
+/// same Wayland display, D-Bus bus, XDG dirs, and GSettings backend as the
+/// primary — which is what lets a single-instance `GApplication` recognize it
+/// and forward its command line.
+///
+/// Has the side effect of creating the isolated config / state / data / cache
+/// directories (idempotent), matching the original inline behavior.
+fn app_env_pairs(
     cfg: &SessionConfig,
     wayland_display: &str,
     runtime_dir: &Path,
     dbus_address: &str,
-) -> Result<Child> {
-    let mut cmd = Command::new(&cfg.command);
-    cmd.args(&cfg.args)
-        .env("WAYLAND_DISPLAY", wayland_display)
-        .env("DBUS_SESSION_BUS_ADDRESS", dbus_address)
-        .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env("NO_AT_BRIDGE", "0")
-        .env("GTK_A11Y", "atspi")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // Kill the app if its `Child` is dropped without an explicit
-        // kill — e.g. when `Session::start` is aborted mid-construction
-        // (a setup timeout / client cancellation in the MCP layer) before
-        // the child is owned by a `Session` whose `Drop` would SIGKILL it.
-        // Harmless on the normal path, where `kill()` runs first.
-        .kill_on_drop(true);
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vec![
+        ("WAYLAND_DISPLAY".into(), wayland_display.to_string()),
+        ("DBUS_SESSION_BUS_ADDRESS".into(), dbus_address.to_string()),
+        (
+            "XDG_RUNTIME_DIR".into(),
+            runtime_dir.to_string_lossy().into_owned(),
+        ),
+        ("NO_AT_BRIDGE".into(), "0".into()),
+        ("GTK_A11Y".into(), "atspi".into()),
+    ];
 
     // When isolation is on, point the app at the session's private keyfile
     // GSettings store (see `crate::gsettings`) so it starts from default
@@ -1720,8 +1959,14 @@ fn spawn_app(
     if cfg.gsettings_isolated {
         let config_dir = crate::gsettings::config_dir(runtime_dir);
         let _ = std::fs::create_dir_all(&config_dir);
-        cmd.env("XDG_CONFIG_HOME", &config_dir)
-            .env("GSETTINGS_BACKEND", crate::gsettings::KEYFILE_BACKEND);
+        env.push((
+            "XDG_CONFIG_HOME".into(),
+            config_dir.to_string_lossy().into_owned(),
+        ));
+        env.push((
+            "GSETTINGS_BACKEND".into(),
+            crate::gsettings::KEYFILE_BACKEND.to_string(),
+        ));
     }
     if cfg.xdg_isolated {
         // Private state/data/cache base dirs. Config-only isolation lets
@@ -1731,11 +1976,28 @@ fn spawn_app(
         // file) poison every later session.
         for (key, dir) in isolated_xdg_env(runtime_dir) {
             let _ = std::fs::create_dir_all(&dir);
-            cmd.env(key, &dir);
+            env.push((key.to_string(), dir.to_string_lossy().into_owned()));
         }
     }
     // Caller-supplied env last, so it can override anything above.
     for (key, value) in &cfg.extra_env {
+        env.push((key.clone(), value.clone()));
+    }
+    env
+}
+
+fn spawn_app(cfg: &SessionConfig, env: &[(String, String)]) -> Result<Child> {
+    let mut cmd = Command::new(&cfg.command);
+    cmd.args(&cfg.args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // Kill the app if its `Child` is dropped without an explicit
+        // kill — e.g. when `Session::start` is aborted mid-construction
+        // (a setup timeout / client cancellation in the MCP layer) before
+        // the child is owned by a `Session` whose `Drop` would SIGKILL it.
+        // Harmless on the normal path, where `kill()` runs first.
+        .kill_on_drop(true);
+    for (key, value) in env {
         cmd.env(key, value);
     }
     if let Some(dir) = &cfg.cwd {
@@ -1900,6 +2162,66 @@ mod tests {
             result.contains("/run/user/"),
             "expected /run/user/ path, got: {result}"
         );
+    }
+
+    fn minimal_cfg() -> SessionConfig {
+        SessionConfig {
+            command: "true".into(),
+            args: vec![],
+            cwd: None,
+            app_name: "x".into(),
+            video_output: None,
+            video_bitrate: None,
+            video_fps: None,
+            prewarm_visual: false,
+            visual_region_tuning: Default::default(),
+            visual_text_tuning: Default::default(),
+            visual_click_tuning: Default::default(),
+            gsettings_isolated: true,
+            xdg_isolated: true,
+            extra_env: vec![("CUSTOM".into(), "1".into())],
+            capture_external_effects: false,
+        }
+    }
+
+    #[test]
+    fn app_env_pairs_includes_core_isolation_and_extra_env() {
+        let cfg = minimal_cfg();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = app_env_pairs(&cfg, "wayland-9", dir.path(), "unix:path=/tmp/bus");
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("WAYLAND_DISPLAY"), Some("wayland-9"));
+        assert_eq!(get("DBUS_SESSION_BUS_ADDRESS"), Some("unix:path=/tmp/bus"));
+        assert_eq!(get("GTK_A11Y"), Some("atspi"));
+        // gsettings isolation on → keyfile backend + private config home.
+        assert!(get("XDG_CONFIG_HOME").is_some());
+        assert_eq!(
+            get("GSETTINGS_BACKEND"),
+            Some(crate::gsettings::KEYFILE_BACKEND)
+        );
+        // xdg isolation on → private state dir.
+        assert!(get("XDG_STATE_HOME").is_some());
+        // Caller-supplied env is carried through (applied last).
+        assert_eq!(get("CUSTOM"), Some("1"));
+    }
+
+    #[test]
+    fn app_env_pairs_skips_isolation_dirs_when_disabled() {
+        let mut cfg = minimal_cfg();
+        cfg.gsettings_isolated = false;
+        cfg.xdg_isolated = false;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = app_env_pairs(&cfg, "wayland-9", dir.path(), "unix:path=/tmp/bus");
+        let has = |k: &str| env.iter().any(|(key, _)| key == k);
+        assert!(!has("GSETTINGS_BACKEND"));
+        assert!(!has("XDG_CONFIG_HOME"));
+        assert!(!has("XDG_STATE_HOME"));
+        // Core env is still present.
+        assert!(has("WAYLAND_DISPLAY"));
     }
 
     #[test]
