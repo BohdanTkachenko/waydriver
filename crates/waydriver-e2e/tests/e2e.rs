@@ -1084,6 +1084,67 @@ async fn lazy_a11y_hidden_accessibles_readable_after_focus_walk() -> anyhow::Res
         "focus_walk should realize the page2 switch into the cache; newly realized: {newly_realized:?}"
     );
 
+    // Fix 1: the row exposes no *direct* name — only its title Label does — so a
+    // non-Label cache entry named "lazy-switch" proves the name was backfilled
+    // from the LABELLED_BY relation, giving deterministic identity without OCR.
+    let labelled = after
+        .iter()
+        .find(|c| c.name.as_deref() == Some("lazy-switch") && c.role != "Label");
+    assert!(
+        labelled.is_some(),
+        "LABELLED_BY should backfill a non-Label row name 'lazy-switch'; entries named lazy-switch: {:?}",
+        after
+            .iter()
+            .filter(|c| c.name.as_deref() == Some("lazy-switch"))
+            .map(|c| (c.role.clone(), c.ref_.1.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Fix 2 (with Fix 1): fire a row by its cached `(bus, path)` ref, with no tree
+/// XPath. The AdwActionRow carries no direct name, so Fix 1's LABELLED_BY
+/// backfill is what makes it findable by name in the cache; it also exposes an
+/// AT-SPI Action that emits on activation, so `activate_ref` drives the side
+/// effect straight from the cache reference.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn lazy_a11y_activate_ref_fires_row_by_cache_ref() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("activate-ref").await?;
+
+    // The action row lives in the main window, so it's already realized into the
+    // cache — no focus_walk needed. Find it by its LABELLED_BY-resolved name
+    // (Fix 1), scoping to the activatable row: its title Label shares the name
+    // but isn't the target. Clone the ref so no borrow of `cached` is held
+    // across the activation call below.
+    let cached = session.cached_accessibles().await?;
+    let row_ref = cached
+        .iter()
+        .find(|c| c.name.as_deref() == Some("adw-action-row") && c.role == "ListItem")
+        .map(|c| c.ref_.clone());
+    let (bus, path) = row_ref.unwrap_or_else(|| {
+        let named: Vec<_> = cached
+            .iter()
+            .filter(|c| c.name.as_deref() == Some("adw-action-row"))
+            .map(|c| (c.role.as_str(), c.ref_.1.as_str()))
+            .collect();
+        panic!("Fix 1: action row should be identifiable by LABELLED_BY name; entries named adw-action-row: {named:?}")
+    });
+
+    // Fix 2: activate by the cache ref alone — no Locator, no XPath resolution.
+    let cursor = session.stdout_cursor();
+    session.activate_ref(&bus, &path).await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("activated adw-action-row"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
     kill(session).await?;
     Ok(())
 }

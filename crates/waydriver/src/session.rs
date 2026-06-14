@@ -1140,10 +1140,12 @@ impl Session {
     /// them (role, name, states, `(bus, path)` reference).
     ///
     /// Returns an empty list when the cache holds nothing beyond the tree —
-    /// the healthy case. Note the limits established for these widgets:
-    /// their `Component` bounds are unreliable and they expose no `Action`,
-    /// so use this for discovery/assertions, and actuate via keyboard
-    /// (focus + Space/Enter) or the OCR visual locator.
+    /// the healthy case. Entry names resolve through `LABELLED_BY` (a
+    /// libadwaita row's title `Label`), so a recovered row is identifiable by
+    /// name without OCR. Their `Component` bounds remain unreliable; fire a
+    /// recovered row by its `(bus, path)` ref with
+    /// [`activate_ref`](Self::activate_ref) when it exposes an `Action`,
+    /// otherwise actuate via keyboard (focus + Space/Enter).
     pub async fn hidden_accessibles(&self) -> Result<Vec<atspi_client::CachedAccessible>> {
         let a11y = self
             .a11y_connection
@@ -1160,6 +1162,52 @@ impl Session {
             .into_iter()
             .filter(|c| !tree_paths.contains(&c.ref_.1))
             .collect())
+    }
+
+    /// Activate a cache-only accessible by its `(bus, path)` reference — the
+    /// `ref_` carried by
+    /// [`CachedAccessible`](crate::atspi::CachedAccessible). Unlike
+    /// [`Locator::activate`](crate::Locator::activate) this needs no
+    /// tree-addressable node, so it fires lazily-realized rows recovered via
+    /// [`hidden_accessibles`](Self::hidden_accessibles) that never enter the
+    /// `GetChildren` tree:
+    ///
+    /// ```no_run
+    /// # async fn demo(session: &waydriver::Session) -> waydriver::Result<()> {
+    /// session.focus_walk(8).await?;
+    /// for row in session.hidden_accessibles().await? {
+    ///     if row.name.as_deref() == Some("Enable telemetry") {
+    ///         session.activate_ref(&row.ref_.0, &row.ref_.1).await?;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Invokes the widget's default action (`Action.do_action(0)`). As with
+    /// the Locator path, AT-SPI actions update GTK's model without a
+    /// compositor redraw — pair with an input event when asserting on a
+    /// repaint. Errors when the element declines activation or exposes no
+    /// `Action` interface (e.g. the outer `AdwSwitchRow` accessible — actuate
+    /// those via keyboard focus + Space/Enter or a real pointer click).
+    pub async fn activate_ref(&self, bus: &str, path: &str) -> Result<()> {
+        let a11y = self
+            .a11y_connection
+            .as_ref()
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
+        // A cache-only ref has no XPath; this label only feeds diagnostics
+        // (error messages and stale-ref classification), not a tree lookup.
+        let xpath = format!("<cache-ref {path}>");
+        match atspi_client::try_do_action_on(a11y, &xpath, bus, path).await? {
+            atspi_client::ActionOutcome::Performed => Ok(()),
+            atspi_client::ActionOutcome::Refused => Err(Error::atspi(format!(
+                "activate_ref: do_action(0) returned false on {bus}{path} — element declined activation"
+            ))),
+            atspi_client::ActionOutcome::NotSupported => Err(Error::atspi(format!(
+                "activate_ref: {bus}{path} does not expose the AT-SPI Action interface — \
+                 actuate via keyboard (focus + Space/Enter) or a real pointer click instead"
+            ))),
+        }
     }
 }
 
