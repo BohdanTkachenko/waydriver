@@ -6,222 +6,53 @@
 [![Documentation](https://img.shields.io/badge/docs-waydriver.io-blue)](https://waydriver.io)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A Rust library for headless GUI application testing on Wayland. Launches apps in isolated compositor sessions, interacts with them via AT-SPI accessibility APIs, and captures screenshots and WebM video via PipeWire.
+**Headless GUI application testing on Wayland.** WayDriver launches GTK apps in isolated, headless compositor sessions, drives them through the AT-SPI accessibility tree, and captures screenshots and WebM video via PipeWire — no physical display required.
 
-📖 **Full documentation: [waydriver.io](https://waydriver.io)**
+It comes in two forms:
 
-The repo also contains `waydriver-mcp`, a standalone MCP server binary built on top of the library that lets AI assistants drive GTK4 apps directly — see [MCP server](#mcp-server) below.
+- **[`waydriver`](https://crates.io/crates/waydriver)** — a Rust library for writing headless GUI tests.
+- **`waydriver-mcp`** — a standalone [Model Context Protocol](https://modelcontextprotocol.io) server that lets AI assistants (Claude Code, Claude Desktop, …) drive GTK4 apps directly.
+
+> 📖 **Full documentation — guides, API reference, and architecture notes — lives at [waydriver.io](https://waydriver.io).**
 
 ## Demo
 
-The clip below is the full output of [`crates/waydriver-examples/examples/gnome_calculator.rs`](crates/waydriver-examples/examples/gnome_calculator.rs), runnable with `cargo run -p waydriver-examples --example gnome_calculator`. Read the source for the API surface in context — it covers a session lifecycle, AT-SPI button clicks, keyboard chord dispatch (`Shift+9`/`Shift+0` for parens), a typed unit conversion, and per-step result verification via XPath locators. The recording is captured by waydriver itself via PipeWire.
+The clip below is the full output of the [`gnome_calculator` example](crates/waydriver-examples/examples/gnome_calculator.rs) (`cargo run -p waydriver-examples --example gnome_calculator`): a session lifecycle, AT-SPI button clicks, keyboard chords, a typed unit conversion, and per-step verification via XPath locators — recorded by WayDriver itself via PipeWire.
 
 <video src="https://github.com/user-attachments/assets/96480250-0e78-4cd7-8228-d5e0620b4ca1" controls width="640"></video>
 
-## How it works
+## Features
 
-Each test session creates an isolated environment with a headless compositor, input injection, and screen capture:
+- **Headless** — runs a real Mutter compositor with no monitor attached; ideal for CI.
+- **Precise** — target widgets with XPath 1.0 over the AT-SPI tree; actions auto-wait for visibility and enablement.
+- **Real input** — keyboard and pointer events through the full Wayland pipeline (Mutter RemoteDesktop), plus direct AT-SPI actions.
+- **Capture** — PNG screenshots and full-session VP8/WebM recordings via PipeWire.
+- **AI-ready** — `waydriver-mcp` exposes the whole surface over MCP for AI assistants.
+- **Isolated** — every session gets its own compositor, private D-Bus, and app settings, so tests never touch your real desktop.
 
-```mermaid
-graph TD
-    subgraph Session["Per-session processes"]
-        dbus["dbus-daemon (private)"]
-        dbus --- mutter["Mutter --headless --wayland"]
-        mutter --- screencast["ScreenCast API (screenshots)"]
-        mutter --- remotedesktop["RemoteDesktop API (input)"]
-        dbus --- pipewire["PipeWire (frame capture)"]
-        dbus --- wireplumber["WirePlumber (PipeWire graph manager)"]
+## Quick start
 
-        app["Your app (on Mutter's Wayland display)"]
-        app --- atspi["AT-SPI (accessibility tree, actions)"]
-    end
-```
-
-The library is backend-agnostic. Three traits define the interface:
-
-- **`CompositorRuntime`** — lifecycle of a headless compositor (start, stop, expose Wayland display)
-- **`InputBackend`** — keyboard and pointer injection
-- **`CaptureBackend`** — screen capture (start/stop PipeWire streams, grab PNG frames)
-
-Concrete implementations are separate crates. The trait-based design allows backends to be added as sibling crates without changing the core.
-
-## Backend support
-
-| Feature                        | Mutter                      | KWin | Sway |
-| ------------------------------ | --------------------------- | ---- | ---- |
-| Headless compositor            | Yes                         | —    | —    |
-| Keyboard input                 | Yes (RemoteDesktop)         | —    | —    |
-| Pointer input                  | Yes (RemoteDesktop)         | —    | —    |
-| Screenshots                    | Yes (ScreenCast + PipeWire) | —    | —    |
-| Video recording (WebM/VP8)     | Yes (ScreenCast + PipeWire) | —    | —    |
-| AT-SPI (UI inspection, clicks) | Yes                         | —    | —    |
-
-Currently only Mutter is implemented (`waydriver-compositor-mutter`, `waydriver-input-mutter`, `waydriver-capture-mutter`). Each compositor has its own APIs (Mutter uses `org.gnome.Mutter.*` D-Bus interfaces, KWin has `org.kde.KWin.*`, Sway uses wlroots Wayland protocols), so each would need its own set of backend crates.
-
-## Crate structure
-
-| Crate                         | Purpose                                                                                      |
-| ----------------------------- | -------------------------------------------------------------------------------------------- |
-| `waydriver`                   | Trait definitions, `Session`, AT-SPI client, keysym helpers, shared GStreamer capture helper |
-| `waydriver-compositor-mutter` | `CompositorRuntime` impl — manages Mutter, PipeWire, WirePlumber, private D-Bus              |
-| `waydriver-input-mutter`      | `InputBackend` impl — keyboard/pointer via Mutter RemoteDesktop                              |
-| `waydriver-capture-mutter`    | `CaptureBackend` impl — screenshots via Mutter ScreenCast + PipeWire                         |
-| `waydriver-mcp`               | Binary — MCP JSON-RPC server over stdio that exposes the library to AI assistants            |
-
-## Usage
-
-```rust
-use std::sync::Arc;
-use waydriver::{Session, SessionConfig, CompositorRuntime};
-use waydriver_compositor_mutter::MutterCompositor;
-use waydriver_input_mutter::MutterInput;
-use waydriver_capture_mutter::MutterCapture;
-
-let mut compositor = MutterCompositor::new();
-compositor.start(None).await?;
-// `state()` is `Option`; immediately after a successful `start()` it is
-// always `Some` — `expect` documents that invariant locally.
-let state = compositor.state().expect("state available after start");
-let input = MutterInput::new(state.clone());
-let capture = MutterCapture::new(state);
-
-let session = Arc::new(Session::start(
-    Box::new(compositor),
-    Box::new(input),
-    Box::new(capture),
-    SessionConfig {
-        command: "your-gtk-app".into(),
-        args: vec![],
-        cwd: None,
-        app_name: "your-gtk-app".into(),
-        // Record the entire session to a WebM file. Set to `None` to skip.
-        video_output: Some("/tmp/session.webm".into()),
-        video_bitrate: None, // defaults to waydriver::capture::DEFAULT_VIDEO_BITRATE (2 Mbps)
-        video_fps: None,     // defaults to waydriver::capture::DEFAULT_VIDEO_FPS (15)
-    },
-).await?);
-
-// Take a screenshot (returns PNG bytes).
-let png = session.take_screenshot().await?;
-
-// Target widgets with XPath selectors over the AT-SPI tree. Actions
-// auto-wait for the element to be visible + enabled before firing.
-session.locate("//Button[@name='primary-button']").click().await?;
-session.locate("//Text[@name='search']").set_text("hello").await?;
-
-// Keyboard input with modifier chords.
-session.press_chord("Ctrl+Shift+S").await?;
-
-// Explicit waits when auto-wait isn't enough — e.g. an item appearing
-// after some async work.
-session.locate("//Label[@name='status']")
-    .wait_for_text(|t| t == "ready")
-    .await?;
-
-// Inspect the tree while debugging selectors.
-let xml = session.dump_tree().await?;
-println!("{xml}");
-
-Arc::try_unwrap(session).unwrap().kill().await?;
-```
-
-### Locator API
-
-`Session::locate(xpath)` returns a lazy `Locator` — each action re-snapshots
-the AT-SPI tree and re-resolves the selector, so you don't have to worry
-about stale element handles. Common methods:
-
-| Method                                     | What it does                                     |
-| ------------------------------------------ | ------------------------------------------------ |
-| `click()` / `double_click()` / `right_click()` | Invoke the AT-SPI `Action` interface (primary, secondary, tertiary actions) |
-| `hover()` / `drag_to(target)` / `drag_to_coords(x, y)` | Pointer-driven hover and drag — lands on real Wayland input events for repaint. `drag_to_coords` releases at raw screen coordinates, so the drop can land off-window (e.g. libadwaita tab drag-out) |
-| `focus()` / `scroll_into_view()`           | `Component::grab_focus` and `scroll_to`/`scroll_to_point` |
-| `set_text(s)` / `fill(s)`                  | Direct `EditableText` write vs. focus-and-type fallback for widgets without `EditableText` (e.g. `GtkTextView`) |
-| `select_option(by)`                        | Pick a child of a Selection-interface container by label or index |
-| `text()`                                   | Read via the `Text` interface                    |
-| `count()` / `all()` / `inspect_all()`      | Multi-match: count, list of locators, full metadata in one snapshot |
-| `name()` / `role()` / `attribute(k)` / `attributes()` / `bounds()` | Accessible name, role, AT-SPI attributes, screen-relative bounds |
-| `is_showing()` / `is_enabled()`            | State predicates                                 |
-| `wait_for_visible()` / `_hidden()` / `_enabled()` / `_count(n)` / `_text(pred)` | Block until state or predicate holds |
-| `wait_for(pred)` / `wait_until(pred)` / `wait_until_async(pred)` | General-purpose predicate auto-waits  |
-| `with_timeout(d)`                          | Per-call override of the auto-wait timeout        |
-| `nth(i)` / `first()` / `last()` / `parent()` / `locate(sub_xpath)` | Compose sub-locators |
-
-Single-target actions (`click`, `focus`, `set_text`, `text`, ...) error with
-`AmbiguousSelector` if the selector matches more than one element. Narrow
-with `.nth(i)` or a more specific XPath.
-
-## MCP server
-
-`waydriver-mcp` is a standalone binary that exposes the library over the [Model Context Protocol](https://modelcontextprotocol.io), letting AI assistants (Claude Desktop, Claude Code, etc.) drive GTK4 apps in isolated headless sessions. It speaks JSON-RPC over stdio and constructs the Mutter backends internally — clients only see the high-level tools below.
-
-| Tool              | Purpose                                                               |
-| ----------------- | --------------------------------------------------------------------- |
-| `start_session`   | Spawn a headless Mutter session and launch a command inside it (optional `report_dir`, `resolution`, `scale`, `isolate_settings`, `gsettings`, `record_video`, `video_bitrate`, `capture_external_effects` overrides per session) |
-| `list_sessions`   | List active session ids, app names, and Wayland displays              |
-| `kill_session`    | Tear down a session and clean up all child processes                  |
-| `set_setting`     | Change a GSettings key on the running session live — rewrites the isolated keyfile in place so the app re-applies it via its `changed` handler (cursor, fonts, color-scheme, …) without a restart |
-| `dump_tree`       | Dump the AT-SPI accessibility tree as XML — each node carries a `_ref` you can target with `query`/`click`/etc. |
-| `query`           | Evaluate an XPath over the tree; returns every match's role, name, attributes, and states |
-| `click` / `double_click` / `right_click` | Invoke an element's primary / secondary / tertiary AT-SPI `Action`. Auto-waits for visibility + enablement. |
-| `hover`           | Move the pointer to an element's center — drives a real Wayland motion event so hover-state UI repaints |
-| `drag_to`         | Press, move across an element's center, release — full Wayland drag gesture |
-| `drag_to_coords`  | Like `drag_to`, but release at raw screen-absolute `(x, y)` — drop onto empty space or off the source window (libadwaita tab drag-out and other "drop onto nothing" DnD) |
-| `focus`           | Give keyboard focus to an element via AT-SPI `Component::grab_focus`  |
-| `set_text`        | Replace an editable element's contents via `EditableText` (fast, requires the interface) |
-| `fill`            | Focus + clear + type — fallback for widgets without `EditableText` (e.g. `GtkTextView`/`GtkEntry`). Tries AT-SPI `Component::grab_focus` first; widgets whose bridge doesn't expose Component (the documented GTK4 case) fall back to a pointer click at the widget's centre to drive focus through the input layer, the same way a user would. Set `assume_focused: true` to skip the whole focus step when the target is already focused. Supports `caret_nav`/`select_all` clear modes. |
-| `select_option`   | Pick an entry from a Selection-interface container (combo box, list, …) by label or by index |
-| `read_text`       | Read an element's text via the `Text` interface                       |
-| `read_value`      | Read an element's AT-SPI `Value` (current/min/max) — a scrolled view's offset, or a slider/progress/spin value |
-| `scroll`          | Scroll a located area by wheel detents along an axis (parks the pointer over it first); pair with `read_value` to confirm the offset moved |
-| `type_text`       | Type a string into the currently focused element through the input backend |
-| `press_key`       | Press a named key or chord (`Return`, `Ctrl+A`, `Shift+Tab`, `Escape`, …) |
-| `move_pointer`    | Move the pointer by a relative offset in logical pixels               |
-| `pointer_click`   | Press and release a pointer button (defaults to left click)           |
-| `take_screenshot` | Capture a PNG via the keepalive ScreenCast stream and return its path |
-| `compare_element_to_baseline` | Crop an element and diff it against a committed reference PNG (perceptual CIEDE2000) — returns a diff *score* (not a pass/fail verdict) and writes a red-highlighted diff image on mismatch |
-| `get_captured_effects` | Read the desktop notifications and portal open-URI requests the app emitted onto the session bus (mock D-Bus sinks). Requires `capture_external_effects: true` on `start_session`; effects have no AT-SPI projection, so this is the only way to assert on them |
-| `launch_secondary_instance` | Relaunch the app with extra args in the same session env — a single-instance `GApplication` forwards the command line to the running primary; observe the primary's reaction via `wait_for_stdout_line`/`query` |
-
-Selectors use XPath 1.0 against a snapshot of the AT-SPI tree serialized to XML, with role names normalized to PascalCase (e.g. `push button` → `Button`). Example XPaths: `//Button[@name='OK']`, `//Text[@name='search']`, `//MenuItem[contains(@name, 'Mode')]`, `(//Button)[last()]`.
-
-Each session produces output under a configurable **report directory**. Screenshots are written as `{report_dir}/{session_id}/{session_id}-{n}.png` — each session gets its own subdirectory and `n` increments per `take_screenshot` call. The base `report_dir` defaults to `/tmp/waydriver` and can be overridden with the `--report-dir <PATH>` CLI flag or the `WAYDRIVER_REPORT_DIR` environment variable. Individual `start_session` calls may also pass a `report_dir` argument to override the server default for that session.
-
-Alongside the screenshots, each session writes:
-
-- **`{session_id}.webm`** — full-session VP8/WebM recording of the display at 15 fps, finalized with a seekhead on `kill_session`. On by default; disable per-server with `--record-video false` / `WAYDRIVER_RECORD_VIDEO=false`, or per-session with `start_session`'s `record_video: false`. Bitrate via `--video-bitrate <bits/sec>` / `WAYDRIVER_VIDEO_BITRATE` (default `2_000_000`) or per-session `video_bitrate`.
-- **`events.jsonl`** — append-only audit log of every session-scoped tool call (action, params, ok/err status, timestamp) at `{report_dir}/{session_id}/events.jsonl`.
-- **`events.js`** — atomic rewrite of the same data as `window.__events_update([...])` for consumption by the viewer.
-- **`index.html`** — styled viewer (Tailwind via the Play CDN) that embeds the recording in a `<video>` tag when present. Reloads `events.js` every 2 s via a `<script src>` swap (which works over `file://` unlike `fetch`), append-only rendering so expanded `<details>` stay expanded across refreshes. Written once at session start.
-
-`start_session`'s response includes a `file://` URL to the session viewer — open it directly from the filesystem in any browser. No HTTP server, no ports, no network access required. Multiple `waydriver-mcp` instances (different Claude Code tabs / projects) can run side by side without conflict.
-
-### Why Docker?
-
-waydriver-mcp needs ~8 system services at runtime (mutter, pipewire, wireplumber, dbus, AT-SPI, gstreamer). Installing these manually is fragile and distro-specific. Docker solves four problems:
-
-- **Security** — the MCP server spawns arbitrary processes, interacts with them via D-Bus, and captures their screen. Running this on your host session gives it access to everything your user can do. Inside a container, it only sees what you explicitly mount — no access to your files, browser sessions, or credentials. Add `--network none` to block network access entirely (the report viewer is purely static `file://`, so it works without any network)
-- **Zero-setup distribution** — `docker pull` and you're running, no system packages to install
-- **D-Bus isolation** — each container gets its own dbus-daemon, so apps with singleton D-Bus activation don't interfere across concurrent test sessions
-- **ABI compatibility** — apps built inside the container are guaranteed to link against the same libraries the MCP runtime uses
-
-### Running with Docker (recommended)
-
-Prebuilt images are published to [GitHub Container Registry](https://github.com/BohdanTkachenko/waydriver/pkgs/container/waydriver-mcp) for each release:
-
-| Image                                           | Purpose                                                                        |
-| ----------------------------------------------- | ------------------------------------------------------------------------------ |
-| `ghcr.io/bohdantkachenko/waydriver-mcp`         | Runtime — MCP server with all system deps                                      |
-| `ghcr.io/bohdantkachenko/waydriver-mcp-builder` | Build env — Fedora 42 + Rust + gcc/g++ + meson + cmake + GTK4/GLib dev headers |
+### Write a test in Rust
 
 ```sh
-docker pull ghcr.io/bohdantkachenko/waydriver-mcp:latest
-docker pull ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest
+cargo add waydriver waydriver-compositor-mutter waydriver-input-mutter waydriver-capture-mutter
 ```
 
-Use the builder image to compile your app in a Fedora environment that matches the runtime. The resulting binary is ABI-compatible with the runtime image. See [Testing your app](#testing-your-app-with-waydriver-mcp) below for language-specific build examples.
+Once you have a running session, drive the app with XPath locators:
 
-MCP client config (e.g. `.mcp.json` for Claude Code):
+```rust
+// Actions auto-wait for the element to be visible + enabled before firing.
+session.locate("//Button[@name='primary-button']").click().await?;
+session.locate("//Text[@name='search']").set_text("hello").await?;
+session.press_chord("Ctrl+Shift+S").await?;
+let png = session.take_screenshot().await?;
+```
+
+→ [Getting Started](https://waydriver.io/getting-started.html) walks through system requirements and a complete, runnable example. The full action surface is in the [Locator API](https://waydriver.io/guide/locators.html) reference.
+
+### Drive an app from an AI assistant (MCP)
+
+Prebuilt images are published to GHCR. Point your MCP client (e.g. `.mcp.json` for Claude Code) at the runtime image:
 
 ```json
 {
@@ -234,243 +65,16 @@ MCP client config (e.g. `.mcp.json` for Claude Code):
 }
 ```
 
-- `$PWD:/workspace:ro` — mounts the project directory so the MCP can launch your app binaries from `/workspace/`
-- `/tmp/waydriver:/tmp/waydriver` — makes session reports (screenshots, WebM recordings, `events.jsonl`, `index.html`) accessible on the host at `/tmp/waydriver/`. **The mount uses the same path on both sides** so the `file://` URL that `start_session` returns is openable as-is on the host
-- `--network none` — safe to fully isolate: the report viewer is pure static HTML + JS loaded from your local filesystem
+→ The [MCP Server guide](https://waydriver.io/guide/mcp-server.html) covers the full tool reference, building your app in the matching container, and per-session options.
 
-For NixOS users, also mount the Nix store so Nix-built binaries work inside the container:
+## Backend support
 
-```json
-{
-  "mcpServers": {
-    "waydriver-mcp": {
-      "command": "sh",
-      "args": ["-c", "docker run --rm -i --network none -v /nix/store:/nix/store:ro -v \"$PWD:/workspace:ro\" -v /tmp/waydriver:/tmp/waydriver ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
-    }
-  }
-}
-```
+WayDriver is backend-agnostic — three traits (`CompositorRuntime`, `InputBackend`, `CaptureBackend`) define the interface. Today the **GNOME/Mutter** backend is implemented; KWin and Sway can be added as sibling crates without touching the core. See [Architecture](https://waydriver.io/architecture.html) for how it fits together.
 
-Or build from source:
+## Contributing
 
-```sh
-docker build -t waydriver-mcp .
-```
+Contributions are welcome. Development setup, build/test commands, and the architecture deep-dive live in [`AGENTS.md`](AGENTS.md) and the [Contributing guide](https://waydriver.io/contributing.html).
 
-### Testing your app with waydriver-mcp
+## License
 
-The MCP server is persistent — it stays up for the entire AI assistant session. You rebuild your app independently, and each `start_session` call picks up the latest binary from the volume. No MCP restart needed between iterations.
-
-**Rust apps** — build with the builder image, volume-mount the binary:
-
-```sh
-docker run --rm -v "$PWD:/src:ro" -v "$PWD/build:/out" \
-  ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest \
-  sh -c "cp -r /src /tmp/build && cd /tmp/build && cargo build --release && cp target/release/myapp /out/"
-```
-
-```json
-{
-  "mcpServers": {
-    "waydriver-mcp": {
-      "command": "docker",
-      "args": ["run", "--rm", "-i",
-        "-v", "/path/to/myapp/build:/workspace:ro",
-        "ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
-    }
-  }
-}
-```
-
-Then call `start_session` with `command: "/workspace/myapp"`.
-
-**C/C++ apps** — the builder image includes gcc, g++, meson, ninja-build, cmake, and GTK4/GLib dev headers:
-
-```sh
-docker run --rm -v "$PWD:/src:ro" -v "$PWD/build:/out" \
-  ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest \
-  sh -c "cp -r /src /tmp/build && cd /tmp/build && meson setup _build && meson compile -C _build && cp _build/myapp /out/"
-```
-
-For extra deps (e.g. `libadwaita-devel`), extend the builder:
-
-```dockerfile
-FROM ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest
-RUN dnf install -y libadwaita-devel
-```
-
-**Node/Python apps** — extend the runtime image to add the interpreter, use a named volume for deps:
-
-```dockerfile
-FROM ghcr.io/bohdantkachenko/waydriver-mcp:latest
-RUN dnf install -y nodejs && dnf clean all
-```
-
-Install deps into a named volume (re-run only when lockfile changes):
-
-```sh
-docker volume create myapp-nodemods
-docker run --rm \
-  -v "$PWD/package.json:/app/package.json:ro" \
-  -v "$PWD/package-lock.json:/app/package-lock.json:ro" \
-  -v "myapp-nodemods:/app/node_modules" \
-  -w /app \
-  ghcr.io/bohdantkachenko/waydriver-mcp-builder:latest \
-  sh -c "dnf install -y nodejs npm && npm ci --omit=dev"
-```
-
-Mount source + deps — edit source freely, MCP picks up changes on next `start_session`:
-
-```json
-"args": ["run", "--rm", "-i",
-  "-v", "/path/to/myapp/src:/app/src:ro",
-  "-v", "myapp-nodemods:/app/node_modules:ro",
-  "myapp-mcp:latest"]
-```
-
-**NixOS users** — mount `/nix/store` so Nix-built binaries just work:
-
-```json
-"args": ["run", "--rm", "-i",
-  "-v", "/nix/store:/nix/store:ro",
-  "-v", "/path/to/myapp:/workspace:ro",
-  "ghcr.io/bohdantkachenko/waydriver-mcp:latest"]
-```
-
-### Running with Nix
-
-For local development without Docker, the Nix app wraps the binary with the required runtime env vars:
-
-```sh
-nix run .#mcp
-```
-
-Sessions are kept in an in-memory `HashMap` keyed by id, so multiple apps can run concurrently within one server process.
-
-## Requirements
-
-All dependencies are provided by the Nix flake (`nix develop`). If not using Nix, you need the following system packages.
-
-### Build dependencies
-
-| Debian/Ubuntu                      | Fedora                          | Arch               |
-| ---------------------------------- | ------------------------------- | ------------------ |
-| `pkg-config`                       | `pkg-config`                    | `pkg-config`       |
-| `libglib2.0-dev`                   | `glib2-devel`                   | `glib2`            |
-| `libgstreamer1.0-dev`              | `gstreamer1-devel`              | `gstreamer`        |
-| `libgstreamer-plugins-base1.0-dev` | `gstreamer1-plugins-base-devel` | `gst-plugins-base` |
-
-### Runtime dependencies
-
-| Debian/Ubuntu               | Fedora                        | Arch                  |
-| --------------------------- | ----------------------------- | --------------------- |
-| `mutter`                    | `mutter`                      | `mutter`              |
-| `pipewire`                  | `pipewire`                    | `pipewire`            |
-| `wireplumber`               | `wireplumber`                 | `wireplumber`         |
-| `gstreamer1.0-plugins-base` | `gstreamer1-plugins-base`     | `gst-plugins-base`    |
-| `gstreamer1.0-plugins-good` | `gstreamer1-plugins-good`     | `gst-plugins-good`    |
-| `gstreamer1.0-pipewire`     | `gstreamer1-plugins-pipewire` | `gst-plugin-pipewire` |
-| `at-spi2-core`              | `at-spi2-core`                | `at-spi2-core`        |
-| `dbus`                      | `dbus`                        | `dbus`                |
-
-**Quick install:**
-
-```sh
-# Debian/Ubuntu
-sudo apt install pkg-config libglib2.0-dev libgstreamer1.0-dev \
-  libgstreamer-plugins-base1.0-dev mutter pipewire wireplumber \
-  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-  gstreamer1.0-pipewire at-spi2-core dbus
-
-# Fedora
-sudo dnf install pkg-config glib2-devel gstreamer1-devel \
-  gstreamer1-plugins-base-devel mutter pipewire wireplumber \
-  gstreamer1-plugins-base gstreamer1-plugins-good \
-  gstreamer1-plugins-pipewire at-spi2-core dbus
-
-# Arch
-sudo pacman -S pkg-config glib2 gstreamer gst-plugins-base \
-  gst-plugins-good gst-plugin-pipewire mutter pipewire \
-  wireplumber at-spi2-core dbus
-```
-
-### Developing without Nix
-
-Contributors who don't use Nix can build and test the workspace directly once the packages above are installed. Two repo helpers automate this:
-
-- **`.claude/hooks/session-start.sh`** installs the build + runtime packages above, ensures the `rustfmt`/`clippy` rustup components, and warms the crate cache. It is gated on `$CLAUDE_CODE_REMOTE`, so it only runs in the Claude Code cloud env; on another machine, run the apt/dnf/pacman command for your distro instead.
-- **`scripts/dev-container.sh`** drops you into a Fedora 42 shell (matching the Dockerfile/CI) with your working tree bind-mounted, for building `waydriver-fixture-gtk` and running the native e2e suite. These need libadwaita ≥ 1.6, so they can't build on Ubuntu 24.04 (which ships 1.5).
-
-On a non-Nix host, build and test the rest of the workspace with `--exclude waydriver-fixture-gtk`, and set `GST_PLUGIN_PATH`, `XDG_DATA_DIRS`, and the `at-spi2-core/libexec` path yourself when running the raw binary (the `nix run .#mcp` wrapper that injects these is Nix-only). See `AGENTS.md` for details.
-
-## Architecture notes
-
-### Keepalive ScreenCast stream
-
-In headless mode, Mutter only composites (and delivers Wayland frame callbacks) when a ScreenCast consumer is pulling frames. Without an active stream, GTK4 apps render their first frame but never repaint — the frame clock never ticks.
-
-`Session::start` opens a persistent ScreenCast stream that stays alive for the session's lifetime. This keeps Mutter compositing continuously so frame callbacks flow and GTK4 apps repaint normally.
-
-### Input: RemoteDesktop vs AT-SPI
-
-Two input paths are available, with different trade-offs:
-
-- **RemoteDesktop keyboard/pointer** (`press_keysym`, `pointer_button`) — events go through the full Wayland input pipeline (Mutter -> Wayland protocol -> GDK -> GTK event loop). GTK4 processes them normally and repaints. Use this for interactions that need to produce visible changes.
-
-- **AT-SPI actions** (`Locator::click()` / `focus()` / `set_text()`) — directly invoke widget signal handlers through the accessibility tree, targeted by XPath. Accurate and precise, but they update GTK4's internal model without triggering compositor redraws. Useful for reading the accessibility tree and programmatic activation, but screenshots taken after AT-SPI-only interactions may show stale frames.
-
-### App isolation
-
-Apps are launched with `GSETTINGS_BACKEND=keyfile` and `XDG_CONFIG_HOME` pointing to the per-session runtime directory. This bypasses the host dconf daemon entirely, so each session starts with default app state and never reads or writes the user's settings.
-
-### Dual D-Bus
-
-GTK4's built-in AT-SPI backend only registers on the host session bus — it ignores custom `DBUS_SESSION_BUS_ADDRESS`. So each session uses two D-Bus connections:
-
-- **Host session bus**: AT-SPI communication with the app
-- **Private D-Bus**: Mutter's ScreenCast and RemoteDesktop APIs (isolated from the host compositor)
-
-```mermaid
-graph LR
-    subgraph Host
-        host_dbus["Host session bus"]
-    end
-
-    subgraph Session["Per-session"]
-        private_dbus["Private D-Bus"]
-        mutter["Mutter"]
-        app["Your app"]
-        waydriver["WayDriver"]
-    end
-
-    waydriver -- "AT-SPI" --> host_dbus
-    app -- "AT-SPI register" --> host_dbus
-    waydriver -- "ScreenCast\nRemoteDesktop" --> private_dbus
-    mutter -- "org.gnome.Mutter.*" --> private_dbus
-```
-
-### External-effect sinks
-
-Some app behaviours leave the process entirely — a desktop notification, a "open this URL" portal request — so they have no AT-SPI projection to query. With `capture_external_effects` enabled, waydriver mocks the daemons that would receive those calls on the app's session bus (`org.freedesktop.Notifications` and `org.freedesktop.portal.Desktop`'s `OpenURI`), records each call, and exposes them via `get_captured_effects` / `Session::notifications()` / `open_uri_requests()`. It's opt-in because the sinks own well-known names — safe on the per-session/container bus, a no-op (with a warning) on a shared host bus that already runs a real daemon.
-
-**Clipboard / PRIMARY-selection readback is not available**: Mutter 46.2 exposes no clipboard D-Bus interface and implements neither `wlr-data-control` nor `ext-data-control-v1`, so there's no out-of-band way to read the selection. The working stopgap is to paste into the app (`Ctrl+V` / middle-click) and read the result back through the AT-SPI `Text` interface (`read_text` / `Locator::text`).
-
-### Screenshot and recording pipeline
-
-```mermaid
-graph LR
-    screencast["Mutter ScreenCast API"]
-    monitor["RecordMonitor\n(virtual monitor)"]
-    pw_keep["PipeWire stream\n(keepalive — screenshots)"]
-    pw_rec["PipeWire stream\n(dedicated — recording)"]
-    gst_shot["On-demand GStreamer pipeline\n(pngenc snapshot=true)"]
-    gst_rec["Long-lived GStreamer pipeline\n(vp8enc + webmmux)"]
-    png["PNG bytes"]
-    webm["WebM file"]
-
-    screencast --> monitor
-    monitor --> pw_keep --> gst_shot --> png
-    monitor --> pw_rec --> gst_rec --> webm
-```
-
-Screenshots and recording use **separate** ScreenCast streams. `take_screenshot` spins up a transient pngenc pipeline on the keepalive stream on each call; recording runs a single `vp8enc ! webmmux ! filesink` pipeline for the session's lifetime on its own dedicated stream, flushed with EOS on `Session::kill` so the WebM is seekable. They must not share a node: mutter's screencast node only emits frames on screen damage (`framerate=0/1`), and a continuous recorder consumer would starve a later-attaching screenshot consumer of the initial frame on a static app — so the recorder gets its own stream and the screenshot path stays the keepalive node's first/triggering consumer. Both use the GStreamer Rust bindings (`gstreamer` + `gstreamer-app` crates) and only `gst-plugins-good` (no `-bad`/`-ugly`).
+Licensed under the [Apache License 2.0](LICENSE).
