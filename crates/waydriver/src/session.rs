@@ -837,6 +837,30 @@ impl Session {
         target_result
     }
 
+    /// Press a key and hold it down until a matching [`key_up`](Self::key_up)
+    /// fires. Unlike [`press_keysym`](Self::press_keysym) (which presses *and*
+    /// releases) this leaves the key held, so a caller can bracket another
+    /// input event with a modifier — hold `Ctrl`, scroll the wheel, then
+    /// release `Ctrl` for Ctrl+scroll-to-zoom; hold `Shift` across a click for
+    /// range-select; and similar held-modifier pointer gestures.
+    ///
+    /// The caller owns the release: a key left down by `key_down` stays held
+    /// in the compositor until a matching `key_up`. When the whole press is a
+    /// modifier-name chord around a single keystroke, prefer
+    /// [`press_chord`](Self::press_chord), which releases for you (and unwinds
+    /// even on error). `keysym` is an X11 keysym; modifier keysyms come from
+    /// [`crate::keysym::modifier_name_to_keysym`] (e.g. `"Ctrl"` → `0xffe3`).
+    pub async fn key_down(&self, keysym: u32) -> Result<()> {
+        self.input.key_down(keysym, &self.cancellation).await
+    }
+
+    /// Release a key previously pressed with [`key_down`](Self::key_down).
+    /// Safe to call on a key that isn't held — the backend tolerates a stray
+    /// release rather than erroring.
+    pub async fn key_up(&self, keysym: u32) -> Result<()> {
+        self.input.key_up(keysym, &self.cancellation).await
+    }
+
     /// Move the pointer by a relative offset in logical pixels.
     pub async fn pointer_motion_relative(&self, dx: f64, dy: f64) -> Result<()> {
         self.input
@@ -2143,6 +2167,146 @@ mod tests {
                 Event::Down(shift),
                 Event::Press(a),
                 Event::Up(shift),
+                Event::Up(ctrl),
+            ]
+        );
+    }
+
+    /// The held-modifier pointer-gesture primitive from the original report:
+    /// `key_down` / `key_up` must be able to *bracket* another input event so
+    /// the app sees e.g. Ctrl+scroll-to-zoom rather than a plain scroll. This
+    /// drives the issue's exact recipe — hold Ctrl, wheel up, release Ctrl —
+    /// and asserts the wheel event lands *between* the press and the release,
+    /// which `press_chord` (press + release as one atom) can't express.
+    #[tokio::test]
+    async fn key_down_up_brackets_wheel_scroll_with_held_modifier() {
+        use crate::backend::{
+            CaptureBackend, CompositorRuntime, InputBackend, PipeWireStream, PointerAxis,
+        };
+        use async_trait::async_trait;
+        use std::path::{Path, PathBuf};
+        use std::sync::Mutex;
+
+        /// Records keyboard holds and wheel events in dispatch order so the
+        /// test can assert the scroll is sandwiched by the held modifier.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Event {
+            Down(u32),
+            Up(u32),
+            Axis(PointerAxis, i32),
+        }
+
+        struct RecordingInput(Arc<Mutex<Vec<Event>>>);
+        #[async_trait]
+        impl InputBackend for RecordingInput {
+            async fn press_keysym(&self, _: u32, _: &CancellationToken) -> Result<()> {
+                Ok(())
+            }
+            async fn key_down(&self, k: u32, _: &CancellationToken) -> Result<()> {
+                self.0.lock().unwrap().push(Event::Down(k));
+                Ok(())
+            }
+            async fn key_up(&self, k: u32, _: &CancellationToken) -> Result<()> {
+                self.0.lock().unwrap().push(Event::Up(k));
+                Ok(())
+            }
+            async fn pointer_motion_relative(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_motion_absolute(
+                &self,
+                _: f64,
+                _: f64,
+                _: &CancellationToken,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_down(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_button_up(
+                &self,
+                _: crate::backend::PointerButton,
+                _: &CancellationToken,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn pointer_axis_discrete(
+                &self,
+                axis: PointerAxis,
+                steps: i32,
+                _: &CancellationToken,
+            ) -> Result<()> {
+                self.0.lock().unwrap().push(Event::Axis(axis, steps));
+                Ok(())
+            }
+        }
+
+        struct StubCompositor;
+        #[async_trait]
+        impl CompositorRuntime for StubCompositor {
+            async fn start(&mut self, _: Option<&str>, _: Option<f64>) -> Result<()> {
+                Ok(())
+            }
+            async fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn id(&self) -> &str {
+                "s"
+            }
+            fn wayland_display(&self) -> &str {
+                "d"
+            }
+            fn runtime_dir(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        struct StubCapture;
+        #[async_trait]
+        impl CaptureBackend for StubCapture {
+            async fn start_stream(&self) -> Result<PipeWireStream> {
+                unimplemented!()
+            }
+            async fn stop_stream(&self, _: PipeWireStream) -> Result<()> {
+                Ok(())
+            }
+            fn pipewire_socket(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+        let s = Session::new_for_test(
+            "t".into(),
+            "a".into(),
+            Box::new(RecordingInput(events.clone())),
+            Box::new(StubCapture),
+            Box::new(StubCompositor),
+        );
+
+        // The issue's recipe: hold Ctrl, wheel up one detent, release Ctrl.
+        let ctrl = crate::keysym::modifier_name_to_keysym("Ctrl").unwrap();
+        s.key_down(ctrl).await.unwrap();
+        s.pointer_axis_discrete(PointerAxis::Vertical, -1)
+            .await
+            .unwrap();
+        s.key_up(ctrl).await.unwrap();
+
+        let got: Vec<Event> = std::mem::take(&mut *events.lock().unwrap());
+        assert_eq!(
+            got,
+            vec![
+                Event::Down(ctrl),
+                Event::Axis(PointerAxis::Vertical, -1),
                 Event::Up(ctrl),
             ]
         );
