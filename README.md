@@ -19,7 +19,7 @@ It comes in two forms:
 
 The clip below is the full output of the [`gnome_calculator` example](crates/waydriver-examples/examples/gnome_calculator.rs) (`cargo run -p waydriver-examples --example gnome_calculator`): a session lifecycle, AT-SPI button clicks, keyboard chords, a typed unit conversion, and per-step verification via XPath locators — recorded by WayDriver itself via PipeWire.
 
-<video src="https://github.com/user-attachments/assets/96480250-0e78-4cd7-8228-d5e0620b4ca1" controls width="640"></video>
+<video src="https://github.com/BohdanTkachenko/waydriver/raw/main/docs/src/assets/demo.webm" controls width="640"></video>
 
 ## Features
 
