@@ -13,7 +13,7 @@ The repo also contains `waydriver-mcp`, a standalone [Model Context Protocol](ht
 
 The clip below is the full output of [`crates/waydriver-examples/examples/gnome_calculator.rs`](https://github.com/BohdanTkachenko/waydriver/blob/main/crates/waydriver-examples/examples/gnome_calculator.rs), runnable with `cargo run -p waydriver-examples --example gnome_calculator`. Read the source for the API surface in context — it covers a session lifecycle, AT-SPI button clicks, keyboard chord dispatch (`Shift+9`/`Shift+0` for parens), a typed unit conversion, and per-step result verification via XPath locators. The recording is captured by waydriver itself via PipeWire.
 
-<video src="https://github.com/user-attachments/assets/96480250-0e78-4cd7-8228-d5e0620b4ca1" controls width="640"></video>
+<video src="./assets/demo.webm" controls width="640">Your browser can't play this video — <a href="https://github.com/BohdanTkachenko/waydriver/raw/main/docs/src/assets/demo.webm">download it here</a>.</video>
 
 ## How it works
 
