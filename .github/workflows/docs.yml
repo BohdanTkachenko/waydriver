@@ -42,8 +42,13 @@ jobs:
       - name: Generate Mermaid assets
         run: mdbook-mermaid install docs
 
-      # Builds the book and fails the job on render errors, missing chapters,
-      # or unresolvable {{#include}} directives — the PR "docs not broken" gate.
+      # Rebuild the changelog chapter from the canonical CHANGELOG so a deploy
+      # right after a release-plz merge picks up the new version immediately.
+      - name: Generate changelog page
+        run: ./scripts/gen-changelog-page.sh
+
+      # Builds the book and fails the job on render errors or missing chapters
+      # — the PR "docs not broken" gate.
       - name: Build
         run: mdbook build docs
 
