@@ -16,6 +16,11 @@
 //! per-node reads and the child recursion out with bounded concurrency, so this
 //! is also the before/after for that change (and for any future tuning).
 //!
+//! It also reports the **cache-design** numbers issue #11 needs for its
+//! event-driven cache: the resident snapshot footprint (the XML an event-gated
+//! cache would retain) projected to a worst-case node count, and a cache-hit
+//! re-serve timed against the full walk (the cost of a reconcile miss).
+//!
 //! Gated `#[ignore]` (it spawns a `dbus-daemon` and runs for several seconds).
 //! Run it and read the printed table with:
 //!
@@ -339,6 +344,28 @@ async fn run_scenario(
     println!(
         "        snapshot   : {:.1} KiB XML",
         xml.len() as f64 / 1024.0
+    );
+
+    // Cache-design (issue #11) numbers. An event-gated cache retains the last
+    // snapshot — the XML string the locator's `evaluate_xpath` consumes — and
+    // re-serves it until a mutation event marks it stale. So the snapshot size
+    // *is* the resident cache cost, and the full `walk` above *is* the cost of a
+    // cache miss (a reconcile re-walk). A cache *hit* just hands back the
+    // retained string; time that clone to contrast the two.
+    let cache_bytes = xml.len();
+    let bytes_per_node = cache_bytes as f64 / n as f64;
+    let t_hit = Instant::now();
+    let hit_clone = std::hint::black_box(xml.clone());
+    let hit = t_hit.elapsed();
+    drop(hit_clone);
+    println!(
+        "        cache mem  : {:.1} KiB resident ({bytes_per_node:.0} B/node; ~{:.1} MiB at 50k nodes)",
+        cache_bytes as f64 / 1024.0,
+        bytes_per_node * 50_000.0 / (1024.0 * 1024.0),
+    );
+    println!(
+        "        cache hit  : {hit:.2?} re-serve vs walk {best:.2?} reconcile ({:.0}x cheaper)",
+        best.as_secs_f64() / hit.as_secs_f64().max(1e-9),
     );
     println!("        xpath //*  : {xpath_all:.2?} ({} hits)", all.len());
     println!("        xpath find : {xpath_one:.2?} (1 hit, `{target_xpath}`)");

@@ -3389,3 +3389,260 @@ async fn fixture_forwards_secondary_command_line() -> anyhow::Result<()> {
     kill(session).await?;
     Ok(())
 }
+
+/// Shared event tallies for [`atspi_event_cache_measurement`]'s background
+/// collector. Counters are atomic so the collector task and the driving test
+/// touch them lock-free; `paths` records the distinct object paths an event
+/// referenced since the last clear, and `dirty` mirrors the single bit a
+/// global-dirty cache would keep.
+#[derive(Default)]
+struct EventTally {
+    total: std::sync::atomic::AtomicU64,
+    children_insert: std::sync::atomic::AtomicU64,
+    children_delete: std::sync::atomic::AtomicU64,
+    state_changed: std::sync::atomic::AtomicU64,
+    property_change: std::sync::atomic::AtomicU64,
+    text_changed: std::sync::atomic::AtomicU64,
+    other: std::sync::atomic::AtomicU64,
+    dirty: std::sync::atomic::AtomicBool,
+    paths: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// Issue #11 measurement: characterize AT-SPI mutation-event behavior so the
+/// event-driven-cache design's open questions can be answered with numbers from
+/// the real GTK bridge (not the synthetic mock the walk bench uses). A
+/// background task subscribes to the mutation events a cache would mirror
+/// (children-changed, state-changed, property-change, text-changed); the test
+/// then:
+///
+///   * sits idle and counts events             -> Q3 "overhead when nothing changes"
+///   * drives known mutations, each marked by   -> Q1 "are events reliable?"
+///     a `fixture-event:` stdout line as the        Q2 "consistency window vs a walk"
+///     app-side ground truth
+///   * runs an action->auto-wait cadence with a -> the money metric: how often a
+///     simulated dirty-flag cache                   global-dirty cache would serve a
+///                                                  warm snapshot vs. re-walk
+///
+/// Diagnostic only (no behavioural asserts); read the RESULT block on stderr.
+#[tokio::test]
+#[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
+async fn atspi_event_cache_measurement() -> anyhow::Result<()> {
+    use atspi::events::object::{
+        ChildrenChangedEvent, PropertyChangeEvent, StateChangedEvent, TextChangedEvent,
+    };
+    use atspi::{AccessibilityConnection, Event, ObjectEvents, Operation};
+    use futures_lite::StreamExt;
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::time::Instant;
+
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // --- Background event collector on its own a11y connection ---------------
+    let tally = Arc::new(EventTally::default());
+    let collector = {
+        let t = tally.clone();
+        tokio::spawn(async move {
+            let a11y = match AccessibilityConnection::new().await {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("collector: a11y connect failed: {e}");
+                    return;
+                }
+            };
+            // Register the mutation events an incremental cache would rely on.
+            let _ = a11y.register_event::<ChildrenChangedEvent>().await;
+            let _ = a11y.register_event::<StateChangedEvent>().await;
+            let _ = a11y.register_event::<PropertyChangeEvent>().await;
+            let _ = a11y.register_event::<TextChangedEvent>().await;
+            let mut stream = std::pin::pin!(a11y.event_stream());
+            while let Some(ev) = stream.next().await {
+                let Ok(Event::Object(obj)) = ev else { continue };
+                let path = match &obj {
+                    ObjectEvents::ChildrenChanged(e) => {
+                        if e.operation == Operation::Insert {
+                            t.children_insert.fetch_add(1, SeqCst);
+                        } else {
+                            t.children_delete.fetch_add(1, SeqCst);
+                        }
+                        Some(e.item.path_as_str().to_string())
+                    }
+                    ObjectEvents::StateChanged(e) => {
+                        t.state_changed.fetch_add(1, SeqCst);
+                        Some(e.item.path_as_str().to_string())
+                    }
+                    ObjectEvents::PropertyChange(e) => {
+                        t.property_change.fetch_add(1, SeqCst);
+                        Some(e.item.path_as_str().to_string())
+                    }
+                    ObjectEvents::TextChanged(e) => {
+                        t.text_changed.fetch_add(1, SeqCst);
+                        Some(e.item.path_as_str().to_string())
+                    }
+                    _ => {
+                        t.other.fetch_add(1, SeqCst);
+                        None
+                    }
+                };
+                t.total.fetch_add(1, SeqCst);
+                t.dirty.store(true, SeqCst);
+                if let (Some(p), Ok(mut g)) = (path, t.paths.lock()) {
+                    g.insert(p);
+                }
+            }
+        })
+    };
+
+    // Let registration settle and drain any startup churn.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    eprintln!("=== RESULT: AT-SPI event-cache measurement (issue #11) ===");
+
+    // === Q3: idle event volume =============================================
+    let idle_before = tally.total.load(SeqCst);
+    let idle_secs = 3u64;
+    tokio::time::sleep(Duration::from_secs(idle_secs)).await;
+    let idle_events = tally.total.load(SeqCst) - idle_before;
+    eprintln!(
+        "Q3 idle  : {idle_events} events over {idle_secs}s while the UI was static \
+         ({:.1}/s) — a global-dirty cache stays warm between actions only if this is ~0",
+        idle_events as f64 / idle_secs as f64
+    );
+
+    // === Q1 + Q2: per-mutation reliability + consistency window ============
+    // (click selector, stdout-marker substring = app-side ground truth, label).
+    let mutations: &[(&str, &str, &str)] = &[
+        (
+            "//Checkbox[@name='agree-check']",
+            "checked agree-check",
+            "state-changed (check toggle)",
+        ),
+        (
+            "//Button[@name='open-dialog']",
+            "dialog-opened sample-dialog",
+            "children-changed insert (dialog open)",
+        ),
+        (
+            "//Button[@name='dialog-close']",
+            "dialog-closed sample-dialog",
+            "children-changed delete (dialog close)",
+        ),
+    ];
+
+    for (selector, marker, label) in mutations {
+        // Baseline tree; clear the per-mutation event window.
+        let baseline: HashSet<String> = match session.locate("//*").inspect_all().await {
+            Ok(v) => v.into_iter().map(|e| e.ref_.1).collect(),
+            Err(_) => HashSet::new(),
+        };
+        if let Ok(mut g) = tally.paths.lock() {
+            g.clear();
+        }
+        let total_before = tally.total.load(SeqCst);
+        tally.dirty.store(false, SeqCst);
+
+        let cursor = session.stdout_cursor();
+        let t_drive = Instant::now();
+        if let Err(e) = session.locate(selector).click().await {
+            eprintln!("  [{label}] drive failed ({e}); skipping");
+            continue;
+        }
+        // App-side ground truth: the fixture flushed its event line.
+        let app_ok = session
+            .wait_for_stdout_line(cursor, |l| l.contains(marker), Duration::from_secs(3))
+            .await
+            .is_ok();
+        let d_app = t_drive.elapsed();
+
+        // Bounded wait for the first AT-SPI event after the drive.
+        let mut d_event: Option<Duration> = None;
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            if tally.total.load(SeqCst) > total_before {
+                d_event = Some(t_drive.elapsed());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Settle so late events (subtree realization) are counted.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let events_seen = tally.total.load(SeqCst) - total_before;
+        let after: HashSet<String> = match session.locate("//*").inspect_all().await {
+            Ok(v) => v.into_iter().map(|e| e.ref_.1).collect(),
+            Err(_) => baseline.clone(),
+        };
+        let added = after.difference(&baseline).count();
+        let removed = baseline.difference(&after).count();
+        let event_paths = tally.paths.lock().map(|g| g.len()).unwrap_or(0);
+
+        let consistency = match d_event {
+            Some(de) => format!(
+                "event@{:.0}ms app@{:.0}ms window={:+.0}ms",
+                de.as_secs_f64() * 1e3,
+                d_app.as_secs_f64() * 1e3,
+                (de.as_secs_f64() - d_app.as_secs_f64()) * 1e3
+            ),
+            None => "NO EVENT within 1.5s".to_string(),
+        };
+        eprintln!(
+            "  [{label}]\n      reliability: {events_seen} events, {event_paths} distinct paths; \
+             walk delta +{added}/-{removed} nodes; app_marker={app_ok}\n      consistency: {consistency}"
+        );
+    }
+
+    // === Money metric: warm-cache hit rate over an action->auto-wait cadence
+    // Model a global-dirty cache: a snapshot is a HIT when no mutation event has
+    // arrived since the last reconcile, else a MISS (re-walk, which clears
+    // dirty). A real Locator re-snapshots many times per auto-wait; the win is
+    // the polls after the first where the tree is unchanged. Each round performs
+    // a real mutation (so the cache MUST reconcile), then polls on a 50ms cadence
+    // like `poll_with_retry`, counting hits vs misses against the live flag.
+    let rounds = 6u32;
+    let polls_per_wait = 8u32;
+    let poll_gap = Duration::from_millis(50);
+    let mut hits = 0u64;
+    let mut misses = 0u64;
+    for _ in 0..rounds {
+        let _ = session
+            .locate("//Checkbox[@name='agree-check']")
+            .click()
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await; // let its event land
+        for _ in 0..polls_per_wait {
+            if tally.dirty.swap(false, SeqCst) {
+                misses += 1; // dirty -> reconcile re-walk
+            } else {
+                hits += 1; // clean -> serve warm snapshot
+            }
+            tokio::time::sleep(poll_gap).await;
+        }
+    }
+    let total_snaps = hits + misses;
+    let hit_pct = if total_snaps > 0 {
+        hits as f64 * 100.0 / total_snaps as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "money    : over {rounds} action->wait rounds, {total_snaps} snapshots: \
+         {hits} warm-cache hits / {misses} reconciles ({hit_pct:.0}% served from cache) — \
+         each hit avoids a full tree walk"
+    );
+    eprintln!(
+        "classes  : children +{}/-{} state {} property {} text {} other {} (total {})",
+        tally.children_insert.load(SeqCst),
+        tally.children_delete.load(SeqCst),
+        tally.state_changed.load(SeqCst),
+        tally.property_change.load(SeqCst),
+        tally.text_changed.load(SeqCst),
+        tally.other.load(SeqCst),
+        tally.total.load(SeqCst),
+    );
+    eprintln!("=== end RESULT ===");
+
+    collector.abort();
+    kill(session).await?;
+    Ok(())
+}
