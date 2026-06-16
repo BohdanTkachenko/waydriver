@@ -11,12 +11,18 @@ RUN mkdir -p /models \
 # testing against waydriver-mcp.
 FROM fedora:42 AS builder-base
 
+# gtk4-devel-tools provides gtk4-demo and gtk4-widget-factory — the real
+# shipping GTK apps the AT-SPI event-cache measurement (waydriver-e2e's
+# atspi_event_cache_real_app_measurement) drives. Lives here so the dev
+# container inherits them; the production runtime images derive from
+# runtime-base instead, so they stay slim.
 RUN dnf install -y \
     gcc g++ make pkg-config meson ninja-build cmake \
     dbus-devel at-spi2-core-devel \
     gstreamer1-devel gstreamer1-plugins-base-devel \
     pipewire-devel \
     gtk4-devel glib2-devel libadwaita-devel \
+    gtk4-devel-tools \
     && dnf clean all
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
