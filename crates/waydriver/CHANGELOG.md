@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.3.4](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.3.3...waydriver-v0.3.4) - 2026-06-16
+
+### Added
+
+- *(atspi)* read cache-only row values via text_ref/value_ref/selected_text_ref
+
+### Other
+
+- *(atspi)* measure event-cache behavior and specify the design ([#11](https://github.com/BohdanTkachenko/waydriver/pull/11))
+- restore the GitHub-native video URL in the README
+- *(atspi)* parallelize the tree-walk snapshot ([#11](https://github.com/BohdanTkachenko/waydriver/pull/11))
+- add a download-link fallback to the README demo video
+- serve the demo video from the repo instead of a dead GitHub URL
+- slim README to a landing page, defer detail to waydriver.io
+- add mdBook documentation site with GitHub Pages deploy
+- *(atspi)* benchmark tree-walk cost on a large synthetic tree ([#11](https://github.com/BohdanTkachenko/waydriver/pull/11))
+
 ## [0.3.3](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.3.2...waydriver-v0.3.3) - 2026-06-14
 
 ### Added
