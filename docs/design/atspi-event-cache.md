@@ -39,7 +39,7 @@ changed, by subscribing to AT-SPI mutation events.
 
 ## Measurement methodology
 
-Two harnesses, both committed alongside this doc:
+Three harnesses, all committed alongside this doc:
 
 1. **Synthetic footprint/cost** — `crates/waydriver/tests/atspi_tree_walk_bench.rs`
    (the #45 bench, extended). Mock AT-SPI server on a private `dbus-daemon`, no
@@ -59,6 +59,18 @@ Two harnesses, both committed alongside this doc:
    scripts/dev-container.sh bash -lc \
      'cargo build -p waydriver-fixture-gtk && dbus-run-session -- \
       cargo test -p waydriver-e2e --test e2e atspi_event_cache_measurement \
+      -- --ignored --nocapture --test-threads=1'
+   ```
+3. **Real-app behavior** — `crates/waydriver-e2e/tests/e2e.rs::atspi_event_cache_real_app_measurement`.
+   The same event collector, but pointed at **real shipping GTK reference apps**
+   (`gtk4-widget-factory`, `gtk4-demo`) rather than our fixture, to rule out the
+   fixture being unrepresentatively simple. Real apps emit no `fixture-event:`
+   markers, so the walk is the ground truth and focus is driven with `Tab` (safe
+   in any app). Needs `gtk4-devel-tools`; runs in the dev-container:
+   ```sh
+   scripts/dev-container.sh bash -lc \
+     'dnf install -y gtk4-devel-tools && dbus-run-session -- \
+      cargo test -p waydriver-e2e --test e2e atspi_event_cache_real_app_measurement \
       -- --ignored --nocapture --test-threads=1'
    ```
 
@@ -140,7 +152,9 @@ resident cost:
 
 Per-node bytes are stable, so the linear projection holds. A subtree-incremental
 cache would additionally retain the parsed node map (same order of magnitude).
-Either way the footprint is trivial for CI.
+Either way the footprint is trivial for CI. (Real GTK widgets measure ~230
+B/node — see *Real-app validation* — which lifts the 50k-node worst case to
+~11 MiB, still trivial.)
 
 ## The money metric
 
@@ -155,6 +169,31 @@ round, every other poll warm), achieved because GTK is idle-silent (Q3) so the
 cache survives each auto-wait window intact. Each hit re-serves the retained
 snapshot in tens of microseconds instead of an O(N) walk (the synthetic bench
 timed the re-serve at 58–103 µs).
+
+## Real-app validation (gtk4-widget-factory, gtk4-demo)
+
+To rule out the fixture being unrepresentatively cooperative, the same event
+collector was pointed at two real shipping GTK reference apps. Focus was driven
+with `Tab` (10 drives) and the walk was the ground truth:
+
+| app | nodes | snapshot | B/node | idle | focus→event | warm-cache hits |
+|---|---|---|---|---|---|---|
+| gtk4-widget-factory | 277 | 62.8 KiB | 232 | **0 / 3 s** | **10 / 10** | **83%** (50/60) |
+| gtk4-demo | 92 | 20.3 KiB | 226 | **0 / 3 s** | **10 / 10** | **83%** (50/60) |
+
+The cache's load-bearing assumptions hold on real apps exactly as on the
+fixture: **idle-silent** (no events at rest → the cache stays warm), **reliable**
+(every focus mutation produced an event), and a **global-dirty hit rate at the
+cadence ceiling** (~5/6). Two corrections worth carrying forward:
+
+- **Real widgets cost ~2× the synthetic per node** (~230 B vs 113–125 B —
+  richer states/relations/labels), lifting the worst case to **~11 MiB at 50k
+  nodes** — still trivial for CI.
+- These apps' **default windows are modest** (277 / 92 nodes), *smaller* than
+  the synthetic benches. A genuinely large real tree and heavy event churn live
+  *inside* gtk4-demo's demos (Fishbowl = continuous add/remove; Lists/Words =
+  thousands of `GtkColumnView` rows); driving into those is the next increment
+  (see gaps).
 
 ## Recommended architecture
 
@@ -210,10 +249,14 @@ Key decisions:
 
 - **Qt event reliability unmeasured** — no Qt fixture exists. Blocker for
   default-on; not a blocker for opt-in (walk remains source of truth).
-- **No real large-app fixture** (Files / Builder / a big `GtkListView`). The
-  synthetic bench covers cost/memory scaling and the diagnostic covers event
-  semantics, but dropped-event behavior *under heavy real event load* and true
-  worst-case memory want a representative fixture. Useful precursor for the
+- **Large real tree + heavy churn not yet measured.** Real apps *are* now
+  covered (gtk4-widget-factory, gtk4-demo — see *Real-app validation*), which
+  confirms idle-silence, reliability, and the hit rate generalize beyond the
+  fixture. But those apps' default windows are modest (≤277 nodes); the
+  genuinely large tree and heavy event churn live *inside* gtk4-demo's demos.
+  Driving into **Fishbowl** (continuous add/remove → dropped-event behavior
+  under load) and **Lists/Words** (thousands of `GtkColumnView` rows → true
+  worst-case memory) is the next increment, and a useful precursor for the
   subtree-incremental follow-up.
 - **Subtree-incremental invalidation** deferred to a measured follow-up.
 
