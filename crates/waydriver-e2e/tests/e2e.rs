@@ -3427,11 +3427,6 @@ struct EventTally {
 #[tokio::test]
 #[ignore = "diagnostic probe; run manually with --ignored --nocapture"]
 async fn atspi_event_cache_measurement() -> anyhow::Result<()> {
-    use atspi::events::object::{
-        ChildrenChangedEvent, PropertyChangeEvent, StateChangedEvent, TextChangedEvent,
-    };
-    use atspi::{AccessibilityConnection, Event, ObjectEvents, Operation};
-    use futures_lite::StreamExt;
     use std::collections::HashSet;
     use std::sync::atomic::Ordering::SeqCst;
     use std::time::Instant;
@@ -3441,58 +3436,7 @@ async fn atspi_event_cache_measurement() -> anyhow::Result<()> {
 
     // --- Background event collector on its own a11y connection ---------------
     let tally = Arc::new(EventTally::default());
-    let collector = {
-        let t = tally.clone();
-        tokio::spawn(async move {
-            let a11y = match AccessibilityConnection::new().await {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("collector: a11y connect failed: {e}");
-                    return;
-                }
-            };
-            // Register the mutation events an incremental cache would rely on.
-            let _ = a11y.register_event::<ChildrenChangedEvent>().await;
-            let _ = a11y.register_event::<StateChangedEvent>().await;
-            let _ = a11y.register_event::<PropertyChangeEvent>().await;
-            let _ = a11y.register_event::<TextChangedEvent>().await;
-            let mut stream = std::pin::pin!(a11y.event_stream());
-            while let Some(ev) = stream.next().await {
-                let Ok(Event::Object(obj)) = ev else { continue };
-                let path = match &obj {
-                    ObjectEvents::ChildrenChanged(e) => {
-                        if e.operation == Operation::Insert {
-                            t.children_insert.fetch_add(1, SeqCst);
-                        } else {
-                            t.children_delete.fetch_add(1, SeqCst);
-                        }
-                        Some(e.item.path_as_str().to_string())
-                    }
-                    ObjectEvents::StateChanged(e) => {
-                        t.state_changed.fetch_add(1, SeqCst);
-                        Some(e.item.path_as_str().to_string())
-                    }
-                    ObjectEvents::PropertyChange(e) => {
-                        t.property_change.fetch_add(1, SeqCst);
-                        Some(e.item.path_as_str().to_string())
-                    }
-                    ObjectEvents::TextChanged(e) => {
-                        t.text_changed.fetch_add(1, SeqCst);
-                        Some(e.item.path_as_str().to_string())
-                    }
-                    _ => {
-                        t.other.fetch_add(1, SeqCst);
-                        None
-                    }
-                };
-                t.total.fetch_add(1, SeqCst);
-                t.dirty.store(true, SeqCst);
-                if let (Some(p), Ok(mut g)) = (path, t.paths.lock()) {
-                    g.insert(p);
-                }
-            }
-        })
-    };
+    let collector = spawn_event_collector(tally.clone());
 
     // Let registration settle and drain any startup churn.
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -3644,5 +3588,297 @@ async fn atspi_event_cache_measurement() -> anyhow::Result<()> {
 
     collector.abort();
     kill(session).await?;
+    Ok(())
+}
+
+/// Spawn a background task that subscribes to the AT-SPI mutation events an
+/// incremental cache would mirror and accumulates them into `tally`. Shared by
+/// the fixture and real-app cache measurements. The task owns its own a11y
+/// connection; abort the returned handle to stop it.
+fn spawn_event_collector(tally: Arc<EventTally>) -> tokio::task::JoinHandle<()> {
+    use atspi::events::object::{
+        ChildrenChangedEvent, PropertyChangeEvent, StateChangedEvent, TextChangedEvent,
+    };
+    use atspi::{AccessibilityConnection, Event, ObjectEvents, Operation};
+    use futures_lite::StreamExt;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    tokio::spawn(async move {
+        let t = tally;
+        let a11y = match AccessibilityConnection::new().await {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("collector: a11y connect failed: {e}");
+                return;
+            }
+        };
+        let _ = a11y.register_event::<ChildrenChangedEvent>().await;
+        let _ = a11y.register_event::<StateChangedEvent>().await;
+        let _ = a11y.register_event::<PropertyChangeEvent>().await;
+        let _ = a11y.register_event::<TextChangedEvent>().await;
+        let mut stream = std::pin::pin!(a11y.event_stream());
+        while let Some(ev) = stream.next().await {
+            let Ok(Event::Object(obj)) = ev else { continue };
+            let path = match &obj {
+                ObjectEvents::ChildrenChanged(e) => {
+                    if e.operation == Operation::Insert {
+                        t.children_insert.fetch_add(1, SeqCst);
+                    } else {
+                        t.children_delete.fetch_add(1, SeqCst);
+                    }
+                    Some(e.item.path_as_str().to_string())
+                }
+                ObjectEvents::StateChanged(e) => {
+                    t.state_changed.fetch_add(1, SeqCst);
+                    Some(e.item.path_as_str().to_string())
+                }
+                ObjectEvents::PropertyChange(e) => {
+                    t.property_change.fetch_add(1, SeqCst);
+                    Some(e.item.path_as_str().to_string())
+                }
+                ObjectEvents::TextChanged(e) => {
+                    t.text_changed.fetch_add(1, SeqCst);
+                    Some(e.item.path_as_str().to_string())
+                }
+                _ => {
+                    t.other.fetch_add(1, SeqCst);
+                    None
+                }
+            };
+            t.total.fetch_add(1, SeqCst);
+            t.dirty.store(true, SeqCst);
+            if let (Some(p), Ok(mut g)) = (path, t.paths.lock()) {
+                g.insert(p);
+            }
+        }
+    })
+}
+
+/// Resolve a binary on `PATH`, returning its absolute path, or `None` if it is
+/// not installed (so the real-app measurement can skip it gracefully).
+fn which(bin: &str) -> Option<String> {
+    // Scan PATH directly rather than shelling out to `which` — Fedora's minimal
+    // images (including this dev-container) no longer ship the `which` binary.
+    if bin.contains('/') {
+        return std::path::Path::new(bin).is_file().then(|| bin.to_string());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(bin))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Launch an arbitrary GTK app (not just the fixture) under a fresh headless
+/// mutter session and return the ready [`Session`]. Mirrors
+/// [`start_fixture_session`] but takes the app's command / args / a11y name, so
+/// the cache measurement can drive real reference apps. AT-SPI-only: no OCR
+/// prewarm and no external-effect capture.
+async fn start_app_session(
+    command: String,
+    args: Vec<String>,
+    app_name: String,
+) -> anyhow::Result<(Arc<Session>, Arc<MutterState>)> {
+    let mut compositor = MutterCompositor::new();
+    compositor.start(None, None).await?;
+    let state = compositor
+        .state()
+        .expect("MutterCompositor::state must be Some immediately after start() succeeded");
+    let input = MutterInput::new(state.clone());
+    let capture = MutterCapture::new(state.clone());
+    let session = Session::start(
+        Box::new(compositor),
+        Box::new(input),
+        Box::new(capture),
+        SessionConfig {
+            command,
+            args,
+            cwd: None,
+            app_name,
+            video_output: None,
+            video_bitrate: None,
+            video_fps: None,
+            prewarm_visual: false,
+            visual_region_tuning: Default::default(),
+            visual_text_tuning: Default::default(),
+            visual_click_tuning: Default::default(),
+            gsettings_isolated: true,
+            xdg_isolated: true,
+            extra_env: Vec::new(),
+            capture_external_effects: false,
+        },
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    Ok((Arc::new(session), state))
+}
+
+/// Issue #11 measurement against REAL GTK reference apps (gtk4-widget-factory,
+/// gtk4-demo) rather than our purpose-built fixture, to confirm the cache
+/// design's numbers hold at real tree scale and real event churn. Needs
+/// `gtk4-devel-tools` in the env; each app is skipped gracefully if absent.
+/// Ground truth is the walk (real apps emit no `fixture-event:` markers): focus
+/// is driven with Tab (safe in any app — never opens a modal) to produce clean
+/// state-changed mutations. Diagnostic; read the RESULT block on stderr.
+#[tokio::test]
+#[ignore = "diagnostic probe; needs gtk4-demo + gtk4-widget-factory; run in the Fedora dev-container"]
+async fn atspi_event_cache_real_app_measurement() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::time::Instant;
+
+    init_tracing();
+
+    // (binary, args, a11y-name guess, label). `app_name` matches leniently
+    // (normalized, bidirectional substring); a miss dumps the live registry.
+    let targets: &[(&str, &[&str], &str, &str)] = &[
+        (
+            "gtk4-widget-factory",
+            &[],
+            "Widget Factory",
+            "widget-factory",
+        ),
+        // "demo" matches both "GTK Demo" and "gtk4-demo" under the registry's
+        // bidirectional substring rule ("gtk4" ≠ "gtk" defeats a tighter guess).
+        ("gtk4-demo", &[], "demo", "gtk4-demo"),
+    ];
+
+    eprintln!("=== RESULT: AT-SPI event-cache measurement — REAL apps (issue #11) ===");
+    for (bin, args, app_name, label) in targets {
+        let Some(path) = which(bin) else {
+            eprintln!("[{label}] '{bin}' not installed — skipping (dnf install gtk4-devel-tools)");
+            continue;
+        };
+        let args_owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+
+        // Retry once: the first mutter launch after a cold container can miss
+        // the wayland-socket deadline; a second attempt runs warm.
+        let mut started = None;
+        for attempt in 0..2 {
+            match start_app_session(path.clone(), args_owned.clone(), (*app_name).to_string()).await
+            {
+                Ok(s) => {
+                    started = Some(s);
+                    break;
+                }
+                Err(e) => eprintln!("[{label}] start attempt {attempt} failed: {e}"),
+            }
+        }
+        let Some((session, _state)) = started else {
+            eprintln!("[{label}] could not start session — skipping");
+            continue;
+        };
+
+        let tally = Arc::new(EventTally::default());
+        let collector = spawn_event_collector(tally.clone());
+        tokio::time::sleep(Duration::from_millis(1200)).await; // settle + registration
+
+        // --- Tree scale + cache footprint (Q5 at real scale) ----------------
+        let xml = match session.a11y_connection.as_ref() {
+            Some(conn) => {
+                waydriver::atspi::snapshot_tree(conn, &session.app_bus_name, &session.app_path)
+                    .await
+                    .unwrap_or_default()
+            }
+            None => String::new(),
+        };
+        let nodes = session.locate("//*").count().await.unwrap_or(0);
+        let per_node = if nodes > 0 {
+            xml.len() as f64 / nodes as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[{label}] scale: {nodes} nodes, snapshot {:.1} KiB ({per_node:.0} B/node) — real-scale cache footprint",
+            xml.len() as f64 / 1024.0
+        );
+
+        // Short structure peek so the design notes can describe the real tree.
+        if let Ok(tree) = session.dump_tree().await {
+            let head: String = tree.lines().take(10).collect::<Vec<_>>().join("\n");
+            eprintln!("[{label}] tree head:\n{head}");
+        }
+
+        // --- Idle cost (Q3 at real scale): does a real app emit at rest? -----
+        let idle_before = tally.total.load(SeqCst);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let idle = tally.total.load(SeqCst) - idle_before;
+        eprintln!(
+            "[{label}] idle: {idle} events / 3s ({:.1}/s) while untouched",
+            idle as f64 / 3.0
+        );
+
+        // --- Reliability + consistency + money metric under safe driving ----
+        // Tab moves focus without opening modals -> clean state-changed events;
+        // between drives the tree is static, so the global-dirty poll loop
+        // measures the warm-hit rate exactly as on the fixture.
+        let drives = 10u32;
+        let mut drove_with_event = 0u32;
+        let mut windows_ms: Vec<f64> = Vec::new();
+        let mut hits = 0u64;
+        let mut misses = 0u64;
+        for _ in 0..drives {
+            let before = tally.total.load(SeqCst);
+            tally.dirty.store(false, SeqCst);
+            let t = Instant::now();
+            let _ = session.press_chord("Tab").await;
+            let deadline = Instant::now() + Duration::from_millis(800);
+            let mut first: Option<f64> = None;
+            while Instant::now() < deadline {
+                if tally.total.load(SeqCst) > before {
+                    first = Some(t.elapsed().as_secs_f64() * 1e3);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await; // settle
+            if tally.total.load(SeqCst) > before {
+                drove_with_event += 1;
+            }
+            if let Some(ms) = first {
+                windows_ms.push(ms);
+            }
+            for _ in 0..6 {
+                if tally.dirty.swap(false, SeqCst) {
+                    misses += 1;
+                } else {
+                    hits += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
+        let mean_window = if windows_ms.is_empty() {
+            f64::NAN
+        } else {
+            windows_ms.iter().sum::<f64>() / windows_ms.len() as f64
+        };
+        let total_snaps = hits + misses;
+        let hit_pct = if total_snaps > 0 {
+            hits as f64 * 100.0 / total_snaps as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[{label}] reliability: {drove_with_event}/{drives} focus drives produced an event; \
+             consistency: first event ~{mean_window:.0}ms after the drive"
+        );
+        eprintln!(
+            "[{label}] money: {total_snaps} snapshots over the cadence, {hits} warm hits / \
+             {misses} reconciles ({hit_pct:.0}% cached)"
+        );
+        eprintln!(
+            "[{label}] classes: children +{}/-{} state {} property {} text {} other {} (total {})",
+            tally.children_insert.load(SeqCst),
+            tally.children_delete.load(SeqCst),
+            tally.state_changed.load(SeqCst),
+            tally.property_change.load(SeqCst),
+            tally.text_changed.load(SeqCst),
+            tally.other.load(SeqCst),
+            tally.total.load(SeqCst),
+        );
+
+        collector.abort();
+        kill(session).await?;
+    }
+    eprintln!("=== end RESULT ===");
     Ok(())
 }
