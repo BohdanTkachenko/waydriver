@@ -66,10 +66,12 @@ Three harnesses, all committed alongside this doc:
    (`gtk4-widget-factory`, `gtk4-demo`) rather than our fixture, to rule out the
    fixture being unrepresentatively simple. Real apps emit no `fixture-event:`
    markers, so the walk is the ground truth and focus is driven with `Tab` (safe
-   in any app). Needs `gtk4-devel-tools`; runs in the dev-container:
+   in any app). The dev image bundles `gtk4-devel-tools` (the demo binaries), so
+   it just runs (pass `--rebuild` if you have a stale image); the test skips any
+   app that is absent:
    ```sh
    scripts/dev-container.sh bash -lc \
-     'dnf install -y gtk4-devel-tools && dbus-run-session -- \
+     'dbus-run-session -- \
       cargo test -p waydriver-e2e --test e2e atspi_event_cache_real_app_measurement \
       -- --ignored --nocapture --test-threads=1'
    ```
