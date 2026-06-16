@@ -134,6 +134,7 @@ fixture-event: dialog-opened sample-dialog
 fixture-event: dialog-closed sample-dialog
 fixture-event: text-changed adw-entry-row text="hi"
 fixture-event: selected adw-combo-row index=1
+fixture-event: changed adw-spin-row value=2.00
 fixture-event: toggled adw-switch-row active=true
 fixture-event: activated adw-action-row
 fixture-event: dialog-opened adw-sample-dialog
@@ -228,8 +229,9 @@ only shows up when wrapped by libadwaita.
 | Widget type            | Accessible name      | Feature exercised                                 |
 |------------------------|----------------------|---------------------------------------------------|
 | `adw::PreferencesGroup`| `adw-prefs-group`    | Adw container; group role + title                 |
-| `adw::EntryRow`        | `adw-entry-row`      | Adw's replacement for GtkEntry inside forms       |
-| `adw::ComboRow`        | `adw-combo-row`      | Adw combobox (different a11y from GTK)            |
+| `adw::EntryRow`        | `adw-entry-row`      | Adw's replacement for GtkEntry inside forms; preset text `preset-title`, read back via `text_ref` on the cache ref |
+| `adw::ComboRow`        | `adw-combo-row`      | Adw combobox (different a11y from GTK); preselects `Bravo`. Exposes the choice as an inline display `Label` (no AT-SPI `Selection` interface) |
+| `adw::SpinRow`         | `adw-spin-row`       | Adw numeric row; realizes **cache-only** (tree-invisible). `Value` interface preset to `1.00` (range 0–10), read via `value_ref` on the cache ref |
 | `adw::SwitchRow`       | `adw-switch-row`     | Row-hosted GtkSwitch; nested toggle a11y          |
 | `adw::ActionRow`       | `adw-action-row`     | Ubiquitous list-row pattern                       |
 | `adw::ButtonRow`       | `adw-button-row`     | Row-hosted action button (1.6+); nested button a11y |

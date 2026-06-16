@@ -5,9 +5,9 @@
 //!
 //! - **gtk4** — raw `gtk::Button` / `gtk::Entry` / `gtk::PopoverMenu` / etc.
 //!   Tests what bare GTK4 exposes to AT-SPI.
-//! - **libadwaita** — `adw::EntryRow`, `adw::ComboRow`, `adw::SwitchRow`,
-//!   `adw::ActionRow`, `adw::ButtonRow`, `adw::Dialog`. Tests the widget
-//!   classes real-world GNOME apps use.
+//! - **libadwaita** — `adw::EntryRow`, `adw::ComboRow`, `adw::SpinRow`,
+//!   `adw::SwitchRow`, `adw::ActionRow`, `adw::ButtonRow`, `adw::Dialog`.
+//!   Tests the widget classes real-world GNOME apps use.
 //! - **dnd** — drag-and-drop source + target, for exercising pointer-based
 //!   drag flows.
 //! - **lazy-a11y** — minimal repros for two libadwaita lazy-realization
@@ -674,16 +674,40 @@ fn build_adw_preferences_group() -> adw::PreferencesGroup {
     group.set_title("adw-prefs-group");
 
     let entry_row = adw::EntryRow::builder().title("adw-entry-row").build();
+    // Preset text so the row "shows" a known value a test can read back via
+    // `Session::text_ref` from the cache ref (issue #53). Set before wiring the
+    // changed handler so this initial value doesn't emit a spurious event.
+    entry_row.set_text("preset-title");
     entry_row.connect_changed(|r| emit(&format!("text-changed adw-entry-row text={:?}", r.text())));
     group.add(&entry_row);
 
     let combo_row = adw::ComboRow::builder().title("adw-combo-row").build();
     let model = StringList::new(&["Alpha", "Bravo", "Charlie"]);
     combo_row.set_model(Some(&model));
+    // Preselect a non-default option (index 1 = "Bravo"). Note AdwComboRow
+    // exposes its choice only as an inline display Label child (role `label`,
+    // name = the option text) — it implements no working AT-SPI `Selection`
+    // interface while closed, so the value is read via that label, not
+    // `Session::selected_text_ref`. Set before wiring the handler to avoid a
+    // startup event.
+    combo_row.set_selected(1);
     combo_row.connect_selected_notify(|r| {
         emit(&format!("selected adw-combo-row index={}", r.selected()));
     });
     group.add(&combo_row);
+
+    // AdwSpinRow exposes the AT-SPI `Value` interface (on its inner spin
+    // button) — preset to 1.00 so a test can read it back via
+    // `Session::value_ref`. Unlike the other rows it realizes cache-only
+    // (tree-invisible), which makes it a faithful stand-in for the issue-#53
+    // "read a value off a row the tree can't see" case. The adjustment carries
+    // the value/range; emit on change for parity with the other rows.
+    let spin_adjustment = gtk4::Adjustment::new(1.0, 0.0, 10.0, 1.0, 1.0, 0.0);
+    spin_adjustment
+        .connect_value_changed(|a| emit(&format!("changed adw-spin-row value={:.2}", a.value())));
+    let spin_row = adw::SpinRow::new(Some(&spin_adjustment), 1.0, 2);
+    spin_row.set_title("adw-spin-row");
+    group.add(&spin_row);
 
     let switch_row = adw::SwitchRow::builder().title("adw-switch-row").build();
     switch_row.connect_active_notify(|r| {

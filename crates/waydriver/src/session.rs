@@ -1472,10 +1472,14 @@ impl Session {
     /// Returns an empty list when the cache holds nothing beyond the tree —
     /// the healthy case. Entry names resolve through `LABELLED_BY` (a
     /// libadwaita row's title `Label`), so a recovered row is identifiable by
-    /// name without OCR. Their `Component` bounds remain unreliable; fire a
-    /// recovered row by its `(bus, path)` ref with
-    /// [`activate_ref`](Self::activate_ref) when it exposes an `Action`,
-    /// otherwise actuate via keyboard (focus + Space/Enter).
+    /// name without OCR. Read a recovered row's *value* by its `(bus, path)`
+    /// ref with [`text_ref`](Self::text_ref) (entry text),
+    /// [`value_ref`](Self::value_ref) (spin/slider value), or
+    /// [`selected_text_ref`](Self::selected_text_ref) (combo selection). Their
+    /// `Component` bounds remain unreliable; fire a recovered row by its
+    /// `(bus, path)` ref with [`activate_ref`](Self::activate_ref) when it
+    /// exposes an `Action`, otherwise actuate via keyboard (focus +
+    /// Space/Enter).
     pub async fn hidden_accessibles(&self) -> Result<Vec<atspi_client::CachedAccessible>> {
         let a11y = self
             .a11y_connection
@@ -1538,6 +1542,126 @@ impl Session {
                  actuate via keyboard (focus + Space/Enter) or a real pointer click instead"
             ))),
         }
+    }
+
+    /// Read the `Text`-interface contents of a cache-only accessible by its
+    /// `(bus, path)` reference — the read-side companion to
+    /// [`activate_ref`](Self::activate_ref), for the value a recovered row
+    /// *shows* rather than the action it fires.
+    ///
+    /// [`Locator::text`](crate::Locator::text) reads the same interface but
+    /// needs a tree-addressable node; this takes the `ref_` carried by a
+    /// [`CachedAccessible`](crate::atspi::CachedAccessible), so it reads the
+    /// text of lazily-realized rows (an `AdwEntryRow`'s entry, a label) that
+    /// never enter the `GetChildren` tree. Resolve the row via
+    /// [`hidden_accessibles`](Self::hidden_accessibles) first:
+    ///
+    /// ```no_run
+    /// # async fn demo(session: &waydriver::Session) -> waydriver::Result<()> {
+    /// session.focus_walk(8).await?;
+    /// for row in session.hidden_accessibles().await? {
+    ///     if row.name.as_deref() == Some("Set Title") {
+    ///         let text = session.text_ref(&row.ref_.0, &row.ref_.1).await?;
+    ///         assert_eq!(text, "My Terminal");
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Errors when `(bus, path)` is stale ([`Error::ElementStale`]) or the
+    /// element doesn't implement the AT-SPI `Text` interface (some rows expose
+    /// their editable text on a child accessible — read that child's ref
+    /// instead).
+    pub async fn text_ref(&self, bus: &str, path: &str) -> Result<String> {
+        let a11y = self
+            .a11y_connection
+            .as_ref()
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
+        // A cache-only ref has no XPath; this label only feeds diagnostics
+        // (error messages and stale-ref classification), not a tree lookup.
+        let xpath = format!("<cache-ref {path}>");
+        atspi_client::read_text_on(a11y, &xpath, bus, path).await
+    }
+
+    /// Read the `Value`-interface state (current position, range, step) of a
+    /// cache-only accessible by its `(bus, path)` reference — the read-side
+    /// companion to [`activate_ref`](Self::activate_ref) for numeric rows
+    /// (`AdwSpinRow`, sliders, progress bars).
+    ///
+    /// [`Locator::value`](crate::Locator::value) reads the same interface but
+    /// needs a tree-addressable node; this takes the `ref_` carried by a
+    /// [`CachedAccessible`](crate::atspi::CachedAccessible), so it reads the
+    /// value of a lazily-realized row that never enters the `GetChildren`
+    /// tree. Resolve the row via
+    /// [`hidden_accessibles`](Self::hidden_accessibles) first:
+    ///
+    /// ```no_run
+    /// # async fn demo(session: &waydriver::Session) -> waydriver::Result<()> {
+    /// session.focus_walk(8).await?;
+    /// for row in session.hidden_accessibles().await? {
+    ///     if row.name.as_deref() == Some("Line Spacing") {
+    ///         let v = session.value_ref(&row.ref_.0, &row.ref_.1).await?;
+    ///         assert_eq!(v.current, 1.0);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Errors when `(bus, path)` is stale ([`Error::ElementStale`]) or the
+    /// element doesn't implement the AT-SPI `Value` interface (an `AdwSpinRow`
+    /// exposes `Value` on its inner spin-button child — read that child's ref
+    /// instead).
+    pub async fn value_ref(&self, bus: &str, path: &str) -> Result<atspi_client::ValueInfo> {
+        let a11y = self
+            .a11y_connection
+            .as_ref()
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
+        let xpath = format!("<cache-ref {path}>");
+        atspi_client::read_value_on(a11y, &xpath, bus, path).await
+    }
+
+    /// Read the visible text of the currently-selected child of a cache-only
+    /// `Selection` container by its `(bus, path)` reference — the read-side
+    /// companion to [`Locator::select_option`](crate::Locator::select_option)
+    /// (which *writes* the selection) for refs that never enter the tree.
+    ///
+    /// The chosen label isn't on the container itself — AT-SPI exposes it on
+    /// the selected child accessible — so this resolves
+    /// `Selection.GetSelectedChild(0)` and reads its name (falling back to the
+    /// child's `Text` interface):
+    ///
+    /// ```no_run
+    /// # async fn demo(session: &waydriver::Session) -> waydriver::Result<()> {
+    /// for row in session.hidden_accessibles().await? {
+    ///     if row.role == "List" {
+    ///         let option = session.selected_text_ref(&row.ref_.0, &row.ref_.1).await?;
+    ///         println!("selected: {option}");
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// **Scope.** Works for containers whose selected child is a realized
+    /// accessible — `GtkListBox`, `GtkListView`, tree/table selections. It does
+    /// **not** read the dropdown-style combos whose option widgets are created
+    /// lazily on popup-open: `GtkDropDown`, `GtkComboBox`, and `AdwComboRow`
+    /// implement no working `Selection` interface while closed, so their choice
+    /// is reachable only as an inline display `Label` child — read that label's
+    /// text with [`text_ref`](Self::text_ref) instead.
+    ///
+    /// Errors when `(bus, path)` is stale ([`Error::ElementStale`]) or the
+    /// element doesn't implement the AT-SPI `Selection` interface (or has
+    /// nothing selected).
+    pub async fn selected_text_ref(&self, bus: &str, path: &str) -> Result<String> {
+        let a11y = self
+            .a11y_connection
+            .as_ref()
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
+        let xpath = format!("<cache-ref {path}>");
+        atspi_client::read_selected_name_on(a11y, &xpath, bus, path).await
     }
 
     /// Lazily connect to the session bus and discover the app's

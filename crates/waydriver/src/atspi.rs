@@ -1559,6 +1559,71 @@ pub async fn read_value_on(
     })
 }
 
+/// Read the visible text of the currently-selected child of a container that
+/// implements the AT-SPI `Selection` interface — the read-side counterpart to
+/// [`select_child_on`].
+///
+/// The selected option's label doesn't live on the container itself: AT-SPI
+/// exposes it on a *child* accessible. `Selection.GetSelectedChild(0)` returns
+/// that child and we read its accessible `name`, falling back to its `Text`
+/// interface when the name is empty (some toolkits put the string there
+/// instead). The selected-child reference carries an empty bus name when it
+/// lives in the same app — the usual case — so we fall back to the container's
+/// own bus, exactly like [`cache_items`] / [`labelled_by_name`] do for
+/// intra-app references.
+///
+/// **Scope.** This is the right read for containers whose selected child is a
+/// realized accessible — `GtkListBox`, `GtkListView`, tree/table selections.
+/// It does **not** cover the dropdown-style combos whose option widgets are
+/// created lazily on popup-open: `GtkDropDown`, `GtkComboBox`, and
+/// `AdwComboRow` expose no working `Selection` interface while closed
+/// (`GetSelectedChild` errors with `UnknownMethod`/`NotSupported`), so their
+/// current choice is reachable only as an inline display `Label` child — read
+/// that label's text via [`read_text_on`] instead.
+///
+/// A `(bus, path)` gone stale between resolution and the call maps to
+/// [`Error::ElementStale`] via [`map_action_err`]; a container that doesn't
+/// implement `Selection`, or has nothing selected (so `GetSelectedChild(0)` is
+/// out of range), surfaces as an [`Error::Atspi`] from the same mapper.
+pub async fn read_selected_name_on(
+    conn: &zbus::Connection,
+    xpath: &str,
+    bus: &str,
+    path: &str,
+) -> Result<String> {
+    let sel = build_selection(conn, bus, path)
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+    let child = sel
+        .get_selected_child(0)
+        .await
+        .map_err(|e| map_action_err(xpath, bus, path, e))?;
+
+    // `get_selected_child` usually returns the child carrying the app's bus
+    // name, but an intra-app reference can arrive with an empty name (not
+    // `None` — `ObjectRef` stores `Some("")`), and building a proxy with an
+    // empty destination fails. Fall back to the container's own bus in both the
+    // empty and null cases.
+    let child_bus = match child.name_as_str() {
+        Some(name) if !name.is_empty() => name,
+        _ => bus,
+    };
+    let child_path = child.path_as_str();
+    let proxy = build_accessible(conn, child_bus, child_path)
+        .await
+        .map_err(|e| map_action_err(xpath, child_bus, child_path, e))?;
+    let name = proxy
+        .name()
+        .await
+        .map_err(|e| map_action_err(xpath, child_bus, child_path, e))?;
+    if !name.is_empty() {
+        return Ok(name);
+    }
+    // No accessible name on the selected child — try its Text interface before
+    // giving up, mirroring the "read its name (or Text)" resolution order.
+    read_text_on(conn, xpath, child_bus, child_path).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
