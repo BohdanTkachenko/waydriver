@@ -338,6 +338,10 @@ async fn fixture_exposes_adw_widgets() -> anyhow::Result<()> {
             "adw-prefs-group",
             "adw-entry-row",
             "adw-combo-row",
+            // NB: adw-spin-row is intentionally absent here — AdwSpinRow
+            // realizes cache-only (tree-invisible), so it's asserted via the
+            // cache in `fixture_adw_spin_row_value_readable_by_cache_ref`, not
+            // through this tree-based inventory check.
             "adw-switch-row",
             "adw-action-row",
             "adw-button-row",
@@ -348,6 +352,127 @@ async fn fixture_exposes_adw_widgets() -> anyhow::Result<()> {
         ],
     )
     .await?;
+    kill(session).await?;
+    Ok(())
+}
+
+/// Issue #53: an `AdwEntryRow`'s text is readable from a cache `(bus, path)`
+/// ref via `Session::text_ref`. The editable text lives on a child accessible
+/// (a `GtkText`, AT-SPI role `Text`), not the row itself; the test finds that
+/// `Text` accessible in the cache and reads back the preset value
+/// ("preset-title") — the "the row shows X" readback the issue is about.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_adw_entry_row_text_readable_by_cache_ref() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    // Realize the rows into the cache; the entry's editable surfaces as a
+    // `Text`-role accessible carrying the LABELLED_BY-resolved row name.
+    session.focus_walk(25).await?;
+    let cached = session.cached_accessibles().await?;
+    let entry = cached
+        .iter()
+        .find(|c| c.role == "Text")
+        .map(|c| c.ref_.clone())
+        .unwrap_or_else(|| {
+            let shape: Vec<_> = cached
+                .iter()
+                .map(|c| (c.role.as_str(), c.name.clone()))
+                .collect();
+            panic!("adw section should expose a Text editable (AdwEntryRow); cache had: {shape:?}")
+        });
+
+    let text = session.text_ref(&entry.0, &entry.1).await?;
+    assert_eq!(
+        text, "preset-title",
+        "AdwEntryRow preset text should be readable via text_ref from a cache ref"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Issue #53: an `AdwSpinRow`'s numeric value is readable from its cache `(bus,
+/// path)` ref via `Session::value_ref`. The Value interface lives on the inner
+/// spin button (AT-SPI role `SpinButton`), so the test finds that accessible in
+/// the cache and reads its preset value (1.00) and range (0..10).
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_adw_spin_row_value_readable_by_cache_ref() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    // The spin row is below the auto-focused entry row, so it only enters the
+    // cache after a focus walk realizes it.
+    session.focus_walk(25).await?;
+    let cached = session.cached_accessibles().await?;
+    let spin = cached
+        .iter()
+        .find(|c| c.role == "SpinButton")
+        .map(|c| c.ref_.clone())
+        .unwrap_or_else(|| {
+            let shape: Vec<_> = cached
+                .iter()
+                .map(|c| (c.role.as_str(), c.name.clone()))
+                .collect();
+            panic!("adw section should expose a SpinButton (AdwSpinRow); cache had: {shape:?}")
+        });
+
+    let v = session.value_ref(&spin.0, &spin.1).await?;
+    assert_eq!(v.current, 1.0, "AdwSpinRow preset value should be 1.0");
+    assert_eq!(v.minimum, 0.0, "AdwSpinRow adjustment lower bound");
+    assert_eq!(v.maximum, 10.0, "AdwSpinRow adjustment upper bound");
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Issue #53: `Session::selected_text_ref` reads a `Selection` container's
+/// current choice from its cache `(bus, path)` ref — the read-side counterpart
+/// to `Locator::select_option`. Drives a `GtkListBox` selection with
+/// `select_option`, then reads it straight back from the cache ref, with no
+/// tree node in between.
+///
+/// (`GtkListBox` is a real AT-SPI `Selection` container, unlike the
+/// dropdown-style combos — `GtkDropDown` / `AdwComboRow` — whose options are
+/// realized only on popup-open and which expose no working `Selection`
+/// interface while closed. See `selected_text_ref`'s docs.)
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_listbox_selection_readable_by_cache_ref() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Deterministically select a known row so the readback can't pass by
+    // coincidence of whatever focus left selected.
+    session
+        .locate("//*[@name='item-list']")
+        .select_option(SelectBy::Label("item-row-1"))
+        .await?;
+
+    // The two GtkListBoxes in this section are `item-list` (3 rows) and
+    // `scroll-area` (40 rows); child_count picks the former unambiguously.
+    let cached = session.cached_accessibles().await?;
+    let list = cached
+        .iter()
+        .find(|c| c.role == "List" && c.child_count == 3)
+        .map(|c| c.ref_.clone())
+        .unwrap_or_else(|| {
+            let shape: Vec<_> = cached
+                .iter()
+                .filter(|c| c.role == "List")
+                .map(|c| (c.role.as_str(), c.child_count))
+                .collect();
+            panic!("gtk4 section should expose item-list (List, 3 rows); lists were: {shape:?}")
+        });
+
+    let selected = session.selected_text_ref(&list.0, &list.1).await?;
+    assert_eq!(
+        selected, "item-row-1",
+        "selected_text_ref should read back the row select_option just selected"
+    );
+
     kill(session).await?;
     Ok(())
 }
