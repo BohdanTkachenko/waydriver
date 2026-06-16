@@ -3807,15 +3807,24 @@ async fn atspi_event_cache_real_app_measurement() -> anyhow::Result<()> {
             idle as f64 / 3.0
         );
 
-        // --- Reliability + consistency + money metric under safe driving ----
+        // --- Reliability, consistency, and before/after timing under driving -
         // Tab moves focus without opening modals -> clean state-changed events;
-        // between drives the tree is static, so the global-dirty poll loop
-        // measures the warm-hit rate exactly as on the fixture.
+        // between drives the tree is static, so the poll loop times the
+        // status-quo full walk against the event-gated cache at the warm-hit
+        // rate (same tree, same cadence — only the cache differs).
         let drives = 10u32;
         let mut drove_with_event = 0u32;
         let mut windows_ms: Vec<f64> = Vec::new();
         let mut hits = 0u64;
         let mut misses = 0u64;
+        // Before/after timing: each poll times the status-quo full walk against
+        // the event-gated cache (re-serve the retained snapshot when no event
+        // landed since the last walk). Same tree, same cadence — only the cache
+        // differs.
+        let mut cached: Option<String> = None;
+        let mut walk_ns_sum: u128 = 0;
+        let mut after_ns_sum: u128 = 0;
+        let mut reserve_ns_sum: u128 = 0;
         for _ in 0..drives {
             let before = tally.total.load(SeqCst);
             tally.dirty.store(false, SeqCst);
@@ -3838,9 +3847,34 @@ async fn atspi_event_cache_real_app_measurement() -> anyhow::Result<()> {
                 windows_ms.push(ms);
             }
             for _ in 0..6 {
-                if tally.dirty.swap(false, SeqCst) {
+                // BEFORE: the production walk waydriver runs on every call today.
+                let tw = Instant::now();
+                let xml = match session.a11y_connection.as_ref() {
+                    Some(conn) => waydriver::atspi::snapshot_tree(
+                        conn,
+                        &session.app_bus_name,
+                        &session.app_path,
+                    )
+                    .await
+                    .unwrap_or_default(),
+                    None => String::new(),
+                };
+                let walk_ns = tw.elapsed().as_nanos();
+                walk_ns_sum += walk_ns;
+                // AFTER: event-gated cache. A miss must walk (reuse the walk we
+                // just timed) and refresh; a hit re-serves the retained String
+                // the locator's evaluate_xpath consumes.
+                if tally.dirty.swap(false, SeqCst) || cached.is_none() {
+                    cached = Some(xml);
+                    after_ns_sum += walk_ns;
                     misses += 1;
                 } else {
+                    let tc = Instant::now();
+                    let served = cached.clone();
+                    std::hint::black_box(&served);
+                    let reserve_ns = tc.elapsed().as_nanos();
+                    reserve_ns_sum += reserve_ns;
+                    after_ns_sum += reserve_ns;
                     hits += 1;
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
@@ -3857,6 +3891,20 @@ async fn atspi_event_cache_real_app_measurement() -> anyhow::Result<()> {
         } else {
             0.0
         };
+        let denom = total_snaps.max(1) as f64;
+        let walk_mean_ms = walk_ns_sum as f64 / denom / 1e6;
+        let after_mean_ms = after_ns_sum as f64 / denom / 1e6;
+        let walk_mean_us = walk_ns_sum as f64 / denom / 1e3;
+        let reserve_mean_us = if hits > 0 {
+            reserve_ns_sum as f64 / hits as f64 / 1e3
+        } else {
+            f64::NAN
+        };
+        let speedup = if after_ns_sum > 0 {
+            walk_ns_sum as f64 / after_ns_sum as f64
+        } else {
+            f64::NAN
+        };
         eprintln!(
             "[{label}] reliability: {drove_with_event}/{drives} focus drives produced an event; \
              consistency: first event ~{mean_window:.0}ms after the drive"
@@ -3864,6 +3912,15 @@ async fn atspi_event_cache_real_app_measurement() -> anyhow::Result<()> {
         eprintln!(
             "[{label}] money: {total_snaps} snapshots over the cadence, {hits} warm hits / \
              {misses} reconciles ({hit_pct:.0}% cached)"
+        );
+        eprintln!(
+            "[{label}] before/after: status-quo walk {walk_mean_ms:.2}ms/call vs event-cache \
+             {after_mean_ms:.2}ms/call amortized = {speedup:.1}x less walk time"
+        );
+        eprintln!(
+            "[{label}] per cached call: {reserve_mean_us:.1}µs re-serve vs {walk_mean_us:.0}µs walk \
+             (~{:.0}x faster)",
+            walk_mean_us / reserve_mean_us
         );
         eprintln!(
             "[{label}] classes: children +{}/-{} state {} property {} text {} other {} (total {})",
