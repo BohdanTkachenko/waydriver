@@ -168,7 +168,10 @@ That is the theoretical maximum for this cadence (one forced reconcile per
 round, every other poll warm), achieved because GTK is idle-silent (Q3) so the
 cache survives each auto-wait window intact. Each hit re-serves the retained
 snapshot in tens of microseconds instead of an O(N) walk (the synthetic bench
-timed the re-serve at 58–103 µs).
+timed the re-serve at 58–103 µs). On **real apps** that gap is enormous: the
+full AT-SPI walk is D-Bus-round-trip-bound, costing **100–330 ms per call** even
+on these apps' small default windows, against a **9–20 µs** cached re-serve —
+timed before/after below.
 
 ## Real-app validation (gtk4-widget-factory, gtk4-demo)
 
@@ -184,7 +187,23 @@ with `Tab` (10 drives) and the walk was the ground truth:
 The cache's load-bearing assumptions hold on real apps exactly as on the
 fixture: **idle-silent** (no events at rest → the cache stays warm), **reliable**
 (every focus mutation produced an event), and a **global-dirty hit rate at the
-cadence ceiling** (~5/6). Two corrections worth carrying forward:
+cadence ceiling** (~5/6).
+
+**Before/after** — the status-quo walk vs the cache, both timed on the real tree
+over the same Tab-driven cadence (the walk is what every `locate()` runs today):
+
+| app | status-quo walk | event-cache (amortized) | per warm call |
+|---|---|---|---|
+| gtk4-widget-factory | 331.8 ms/call | 58.4 ms/call (**5.7×**) | 9.4 µs vs 332 ms (**~35,000×**) |
+| gtk4-demo | 99.7 ms/call | 17.3 ms/call (**5.8×**) | 19.6 µs vs 100 ms (**~5,000×**) |
+
+The walk is **D-Bus-round-trip-bound** (~linear in nodes: 277/92 ≈ 332/100 ≈
+3×), so every `locate()` pays 100–330 ms *today* even on these small windows.
+The amortized **~5.7×** is bounded by this cadence's 83% hit rate — the forced
+reconciles still pay the full walk — while each *warm* call returns 3–4 orders of
+magnitude faster: the concrete payoff the cache buys.
+
+Two corrections worth carrying forward:
 
 - **Real widgets cost ~2× the synthetic per node** (~230 B vs 113–125 B —
   richer states/relations/labels), lifting the worst case to **~11 MiB at 50k
