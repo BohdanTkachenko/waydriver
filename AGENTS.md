@@ -305,6 +305,22 @@ A separate gated integration test, `crates/waydriver/tests/gsettings_live_reload
 
 `crates/waydriver/tests/atspi_tree_walk_bench.rs` (`#[ignore]`) is a **performance benchmark** for the AT-SPI tree walk (issue #11), again without GTK or mutter. It stands up a *mock AT-SPI application* on a private `dbus-daemon` — zbus server interfaces implementing the exact `org.a11y.atspi.Accessible` / `Component` surface `snapshot_node` touches (`GetRoleName`, `Name`, `GetState`, `GetAttributes`, `GetExtents`, `GetChildren`) — serving a synthetic tree of configurable shape/size, then times the real `waydriver::atspi::snapshot_tree` walking it. Two scenarios: a wide `GtkListView`-like list and a balanced deep tree. It asserts the walk reaches every node and that XPath resolves, and prints a per-scenario table (walk time, µs/node, XML size, XPath cost). Because the walk is ~6 *serial* D-Bus round-trips per node, cost scales linearly with node count; the printed per-node latency is environment-bound (routed-bus round-trips are far slower on a constrained CI sandbox than bare metal). The numbers will drop when the walk is parallelized. Run and read the table with `cargo test -p waydriver --test atspi_tree_walk_bench -- --ignored --nocapture`; scale via `WAYDRIVER_BENCH_LIST_ROWS` / `WAYDRIVER_BENCH_FANOUT` / `WAYDRIVER_BENCH_DEPTH` / `WAYDRIVER_BENCH_RUNS`.
 
+The same issue-#11 investigation adds two **event-cache measurements** in `crates/waydriver-e2e/tests/e2e.rs` (both `#[ignore]` diagnostics — read the `=== RESULT ===` block on stderr). `atspi_event_cache_measurement` subscribes to the AT-SPI mutation events an incremental cache would mirror and drives the **fixture** through deterministic mutations (each marked by a `fixture-event:` stdout line as ground truth) to quantify idle event volume, event reliability/latency, and the warm-cache hit rate. `atspi_event_cache_real_app_measurement` points the same collector at the **real** GTK reference apps `gtk4-widget-factory` and `gtk4-demo` (baked into the dev image via `gtk4-devel-tools`, so no manual install; any missing app is skipped), reporting real-scale tree footprint, idle volume, `Tab`-driven reliability, and a **before/after timing** of the status-quo full walk vs. an event-gated cache re-serve. Both run in the dev-container (the real-app one needs no fixture; the fixture one builds it first):
+
+```sh
+# fixture event behavior
+scripts/dev-container.sh bash -lc 'cargo build -p waydriver-fixture-gtk && dbus-run-session -- \
+  cargo test -p waydriver-e2e --test e2e atspi_event_cache_measurement \
+  -- --ignored --nocapture --test-threads=1'
+
+# real-app footprint + before/after timing (gtk4-demo, gtk4-widget-factory)
+scripts/dev-container.sh bash -lc 'dbus-run-session -- \
+  cargo test -p waydriver-e2e --test e2e atspi_event_cache_real_app_measurement \
+  -- --ignored --nocapture --test-threads=1'
+```
+
+The full design write-up, with the measured numbers and the before/after table, lives in `docs/design/atspi-event-cache.md`.
+
 **MCP e2e** (`crates/waydriver-mcp/tests/e2e.rs`) — one Docker-based test:
 - `fixture_via_docker` — spawns `docker run -i waydriver-mcp-e2e:latest` and exercises the full MCP tool surface against the `waydriver-fixture-gtk` binary running inside the container. `#[ignore]` — requires pre-built Docker image. **Runs in CI** via the `e2e` job in `.github/workflows/ci.yml`.
 
