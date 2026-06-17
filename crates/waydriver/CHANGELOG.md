@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.3.5](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.3.4...waydriver-v0.3.5) - 2026-06-17
+
+### Added
+
+- *(atspi)* actuate cache-only activatable rows via click_ref fallback
+- *(atspi)* expose AT-SPI accessible-description (read-only)
+
+### Fixed
+
+- *(atspi)* retry second-window Text/Value reads through transport timeouts
+
+### Other
+
+- *(session)* fix activate_ref doctest receiver type
+
 ## [0.3.4](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.3.3...waydriver-v0.3.4) - 2026-06-16
 
 ### Added
