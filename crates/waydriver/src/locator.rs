@@ -453,11 +453,29 @@ impl Locator {
     /// Unlike other metadata, text isn't captured in the snapshot — each
     /// call makes a live read through the Text proxy after auto-waiting for
     /// the element to exist.
+    ///
+    /// Re-resolves on every poll attempt rather than reading once: a second
+    /// top-level window's Text bridge can lag behind its appearance in the
+    /// snapshot tree, so the first read of `nth(1).text()` may time out at the
+    /// transport level (`dbus: I/O error: timed out`) before the interface is
+    /// registered. `read_text_on` maps that timeout to `ElementStale`, which
+    /// this retry loop swallows until the bridge comes up or the timeout
+    /// budget is spent.
     pub async fn text(&self) -> Result<String> {
-        let info = self.wait_for_existing().await?;
         let a11y = self.a11y()?;
-        let (bus, path) = info.ref_;
-        atspi_client::read_text_on(a11y, &self.xpath, &bus, &path).await
+        let xpath = self.xpath.clone();
+        poll_with_retry(
+            self.effective_timeout(),
+            &xpath,
+            self.session.cancellation_token(),
+            || async {
+                let info = self.resolve_once_info().await?;
+                let (bus, path) = &info.ref_;
+                let text = atspi_client::read_text_on(a11y, &xpath, bus, path).await?;
+                Ok(Some(text))
+            },
+        )
+        .await
     }
 
     /// Current value, range, and step of the matched element via the AT-SPI
@@ -471,11 +489,26 @@ impl Locator {
     /// `minimum`/`maximum` bound the travel. Pair with
     /// [`scroll`](Self::scroll) to drive the offset and assert it moved.
     /// Returns an AT-SPI error when the element doesn't implement `Value`.
+    ///
+    /// Re-resolves per attempt for the same reason as [`text`](Self::text): a
+    /// second top-level window's `Value` bridge can lag behind its appearance
+    /// in the snapshot tree, surfacing as a retriable transport timeout that
+    /// this loop rides out until the interface is ready.
     pub async fn value(&self) -> Result<crate::atspi::ValueInfo> {
-        let info = self.wait_for_existing().await?;
         let a11y = self.a11y()?;
-        let (bus, path) = info.ref_;
-        atspi_client::read_value_on(a11y, &self.xpath, &bus, &path).await
+        let xpath = self.xpath.clone();
+        poll_with_retry(
+            self.effective_timeout(),
+            &xpath,
+            self.session.cancellation_token(),
+            || async {
+                let info = self.resolve_once_info().await?;
+                let (bus, path) = &info.ref_;
+                let value = atspi_client::read_value_on(a11y, &xpath, bus, path).await?;
+                Ok(Some(value))
+            },
+        )
+        .await
     }
 
     // ── Actions (auto-wait for actionability) ──────────────────────────────

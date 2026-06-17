@@ -920,6 +920,28 @@ fn map_action_err(xpath: &str, bus: &str, path: &str, err: zbus::Error) -> Error
             };
         }
     }
+    // A transport-level I/O timeout is indistinguishable from a not-yet-ready
+    // a11y bridge: notably a second top-level window whose Text/Value/etc.
+    // interface hasn't finished registering on the bus by the time we call it,
+    // even though the element is already in the snapshot tree. Unlike a
+    // method-level `NoReply`, this surfaces as a transport `InputOutput`
+    // (`dbus: I/O error: timed out`), so the per-call method timeout never
+    // applies. Classify it as stale so retry-aware callers (`poll_with_retry`)
+    // re-resolve and give the bridge time to come up instead of leaking a
+    // one-shot timeout.
+    if let zbus::Error::InputOutput(io) = &err {
+        if io.kind() == std::io::ErrorKind::TimedOut {
+            tracing::debug!(
+                %xpath, %bus, %path, error = %io,
+                "classified D-Bus transport I/O timeout as ElementStale"
+            );
+            return Error::ElementStale {
+                xpath: xpath.to_string(),
+                bus: bus.to_string(),
+                path: path.to_string(),
+            };
+        }
+    }
     Error::atspi_with("dbus", err)
 }
 
@@ -2143,6 +2165,42 @@ mod tests {
         ));
         assert!(!is_stale_error_name("org.a11y.atspi.Error.SomethingElse"));
         assert!(!is_stale_error_name(""));
+    }
+
+    #[test]
+    fn map_action_err_treats_io_timeout_as_stale() {
+        // A transport-level I/O timeout (a not-yet-ready a11y bridge, e.g. a
+        // second window's Text interface) must map to a retriable ElementStale,
+        // not a terminal Atspi error.
+        let err = zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        )));
+        let mapped = map_action_err(
+            "(//Terminal)[2]",
+            ":1.42",
+            "/org/a11y/atspi/accessible/7",
+            err,
+        );
+        assert!(
+            matches!(mapped, Error::ElementStale { .. }),
+            "got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn map_action_err_keeps_non_timeout_io_terminal() {
+        // A hard transport failure (connection reset) isn't recoverable by
+        // retrying, so it stays a terminal Atspi error.
+        let err = zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        )));
+        let mapped = map_action_err("//Terminal", ":1.7", "/org/a11y/atspi/accessible/3", err);
+        assert!(
+            !matches!(mapped, Error::ElementStale { .. }),
+            "got {mapped:?}"
+        );
     }
 
     // ── Rect / bbox ────────────────────────────────────────────────────────
