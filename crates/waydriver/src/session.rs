@@ -1507,7 +1507,7 @@ impl Session {
     /// `GetChildren` tree:
     ///
     /// ```no_run
-    /// # async fn demo(session: &waydriver::Session) -> waydriver::Result<()> {
+    /// # async fn demo(session: &std::sync::Arc<waydriver::Session>) -> waydriver::Result<()> {
     /// session.focus_walk(8).await?;
     /// for row in session.hidden_accessibles().await? {
     ///     if row.name.as_deref() == Some("Enable telemetry") {
