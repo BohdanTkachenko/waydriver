@@ -1521,10 +1521,15 @@ impl Session {
     /// Invokes the widget's default action (`Action.do_action(0)`). As with
     /// the Locator path, AT-SPI actions update GTK's model without a
     /// compositor redraw — pair with an input event when asserting on a
-    /// repaint. Errors when the element declines activation or exposes no
-    /// `Action` interface (e.g. the outer `AdwSwitchRow` accessible — actuate
-    /// those via keyboard focus + Space/Enter or a real pointer click).
-    pub async fn activate_ref(&self, bus: &str, path: &str) -> Result<()> {
+    /// repaint. When the element exposes no `Action` interface (e.g. an
+    /// activatable `AdwActionRow`, or the outer `AdwSwitchRow` accessible),
+    /// falls back to a synthesized pointer click at the element's centre via
+    /// [`click_ref`](Self::click_ref) — mirroring
+    /// [`Locator::click`](crate::Locator::click) at the ref level, so an
+    /// activatable cache-only row Just Works as long as a real pointer click
+    /// would fire it. Errors only when the element declines a `do_action`, or
+    /// when the click fallback can't resolve the element's bounds.
+    pub async fn activate_ref(self: &Arc<Self>, bus: &str, path: &str) -> Result<()> {
         let a11y = self
             .a11y_connection
             .as_ref()
@@ -1537,11 +1542,78 @@ impl Session {
             atspi_client::ActionOutcome::Refused => Err(Error::atspi(format!(
                 "activate_ref: do_action(0) returned false on {bus}{path} — element declined activation"
             ))),
-            atspi_client::ActionOutcome::NotSupported => Err(Error::atspi(format!(
-                "activate_ref: {bus}{path} does not expose the AT-SPI Action interface — \
-                 actuate via keyboard (focus + Space/Enter) or a real pointer click instead"
-            ))),
+            atspi_client::ActionOutcome::NotSupported => {
+                tracing::debug!(
+                    %bus, %path,
+                    "activate_ref: no AT-SPI Action interface; falling back to pointer click via Component bounds"
+                );
+                self.click_ref(bus, path).await
+            }
         }
+    }
+
+    /// Synthesize a real pointer click at the centre of a cache-only
+    /// accessible identified by its `(bus, path)` reference — the actuation
+    /// companion to [`activate_ref`](Self::activate_ref) for rows that expose
+    /// no AT-SPI `Action` (an activatable `AdwActionRow` whose row-activation
+    /// opens a dialog).
+    ///
+    /// [`Locator::click`](crate::Locator::click) falls back to a pointer click
+    /// using bounds carried in the snapshot tree, but a cache-only ref
+    /// recovered via [`hidden_accessibles`](Self::hidden_accessibles) is by
+    /// definition absent from that tree, so there's no snapshot bounds to fall
+    /// back on. This fetches the element's window-relative bounds live through
+    /// the AT-SPI `Component` interface — callable on any realized accessible,
+    /// snapshot-resident or not — maps them to screen pixels, and clicks the
+    /// centre with the same cold-start warmup recipe
+    /// [`Locator::click`](crate::Locator::click) uses:
+    ///
+    /// ```no_run
+    /// # async fn demo(session: &std::sync::Arc<waydriver::Session>) -> waydriver::Result<()> {
+    /// session.focus_walk(8).await?;
+    /// for row in session.hidden_accessibles().await? {
+    ///     if row.name.as_deref() == Some("Set keyboard shortcut") {
+    ///         session.click_ref(&row.ref_.0, &row.ref_.1).await?;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Errors when `(bus, path)` is stale, or when the element exposes no
+    /// `Component` bounds (a zero-area rect — the element may not be laid out
+    /// yet).
+    pub async fn click_ref(self: &Arc<Self>, bus: &str, path: &str) -> Result<()> {
+        let a11y = self
+            .a11y_connection
+            .as_ref()
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
+        // Window-relative, not Screen: headless mutter reports (0, 0) for all
+        // screen-relative Component extents, which would defeat the click.
+        // `to_screen_bounds` re-applies the toplevel origin below.
+        let bounds = atspi_client::extents_on(a11y, bus, path, atspi::CoordType::Window)
+            .await
+            .map_err(|e| Error::atspi_with("Component.GetExtents", e))?
+            .ok_or_else(|| {
+                Error::atspi(format!(
+                    "click_ref: {bus}{path} has no Component bounds — element may not be laid out"
+                ))
+            })?;
+        let screen = self.to_screen_bounds(bounds).await?;
+        tracing::debug!(
+            %bus, %path,
+            cx = screen.center_x(), cy = screen.center_y(),
+            "click_ref: synthesizing pointer click at cache-only ref's centre"
+        );
+        // Cold-start warmup (approach motion + settle, then a separate
+        // press/release): on a fresh session the first synthesized click is
+        // dropped without the warmup, so a bare click would silently miss.
+        self.cold_start_click(
+            screen.center_x() as f64,
+            screen.center_y() as f64,
+            crate::backend::PointerButton::Left,
+        )
+        .await
     }
 
     /// Read the `Text`-interface contents of a cache-only accessible by its

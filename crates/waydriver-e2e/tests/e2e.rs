@@ -1390,6 +1390,51 @@ async fn lazy_a11y_activate_ref_fires_row_by_cache_ref() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Issue #56: actuate a cache-only, activatable row that exposes **no** AT-SPI
+/// `Action` interface. `AdwButtonRow` is exactly that case — `do_action` on it
+/// returns `NotSupported` (see `Locator::click`'s docs) — so `activate_ref`
+/// must fall back to a synthesized pointer click at the row's `Component`
+/// bounds rather than hard-erroring. Drives the row by its cache `(bus, path)`
+/// ref alone and asserts its `activated` handler fires.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn activate_ref_falls_back_to_pointer_click_when_no_action() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("adw").await?;
+
+    // Realize the prefs rows into the cache; the button row sits below the
+    // auto-focused entry row, so a focus walk is what brings it in.
+    session.focus_walk(25).await?;
+    let cached = session.cached_accessibles().await?;
+    let (bus, path) = cached
+        .iter()
+        .find(|c| c.name.as_deref() == Some("adw-button-row") && c.role != "Label")
+        .map(|c| c.ref_.clone())
+        .unwrap_or_else(|| {
+            let named: Vec<_> = cached
+                .iter()
+                .filter(|c| c.name.as_deref() == Some("adw-button-row"))
+                .map(|c| (c.role.as_str(), c.ref_.1.as_str()))
+                .collect();
+            panic!("adw section should expose an AdwButtonRow; entries named adw-button-row: {named:?}")
+        });
+
+    // `activate_ref` finds no Action interface and synthesizes a pointer click
+    // at the row's centre via `click_ref` — the issue-#56 fallback.
+    let cursor = session.stdout_cursor();
+    session.activate_ref(&bus, &path).await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("activated adw-button-row"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    kill(session).await?;
+    Ok(())
+}
+
 /// An isolated session must give the app private XDG state/data/cache dirs
 /// under the session runtime dir — not the host's ~/.local/{state,share} —
 /// so persisted app state can't poison later sessions or the host. Reads the
