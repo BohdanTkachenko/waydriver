@@ -437,6 +437,7 @@ struct RawNode {
     /// fallback the old walk used, so the emitted element tag is unchanged).
     raw_role: String,
     name: String,
+    description: String,
     states: StateSet,
     attrs: HashMap<String, String>,
     bounds: Option<Rect>,
@@ -454,9 +455,9 @@ struct RawNode {
 /// bound pathological / cyclic trees.
 const MAX_DEPTH: usize = 20;
 
-/// How many node fetches run concurrently. Each in-flight node issues up to 6
+/// How many node fetches run concurrently. Each in-flight node issues up to 7
 /// D-Bus calls at once, so this bounds outstanding calls on the a11y connection
-/// at 8 × 6 = 48 — well under a session bus daemon's default
+/// at 8 × 7 = 56 — well under a session bus daemon's default
 /// `max_replies_per_connection` of 128, leaving headroom even if a session runs
 /// a couple of snapshots at once (exceeding the cap would make `GetChildren`
 /// fail and silently drop a subtree). The synthetic benchmark saturates by this
@@ -585,6 +586,12 @@ async fn fetch_one(
             .await
             .unwrap_or_else(|e| snapshot_default_on_err(&bus, &path, "name", e))
     };
+    let description_fut = async {
+        proxy
+            .description()
+            .await
+            .unwrap_or_else(|e| snapshot_default_on_err(&bus, &path, "description", e))
+    };
     let states_fut = async {
         proxy
             .get_state()
@@ -631,9 +638,10 @@ async fn fetch_one(
         }
     };
 
-    let (raw_role, name, states, attrs, bounds, (had_children, children)) = tokio::join!(
+    let (raw_role, name, description, states, attrs, bounds, (had_children, children)) = tokio::join!(
         role_fut,
         name_fut,
+        description_fut,
         states_fut,
         attrs_fut,
         bounds_fut,
@@ -646,6 +654,7 @@ async fn fetch_one(
         depth,
         raw_role,
         name,
+        description,
         states,
         attrs,
         bounds,
@@ -682,6 +691,9 @@ fn serialize_node(
     let _ = write!(output, " role=\"{}\"", xml_escape(&node.raw_role));
     if !node.name.is_empty() {
         let _ = write!(output, " name=\"{}\"", xml_escape(&node.name));
+    }
+    if !node.description.is_empty() {
+        let _ = write!(output, " description=\"{}\"", xml_escape(&node.description));
     }
     for (state, attr) in EMITTED_STATES {
         if node.states.contains(*state) {
@@ -733,6 +745,8 @@ pub struct ElementInfo {
     pub role_raw: Option<String>,
     /// Accessible name, if set.
     pub name: Option<String>,
+    /// Accessible description (AT-SPI `accessible-description`), if set.
+    pub description: Option<String>,
     /// Toolkit attributes (excluding the ones waydriver emits itself).
     pub attributes: HashMap<String, String>,
     /// Lowercase names of the AT-SPI states currently set on the element.
@@ -743,7 +757,7 @@ pub struct ElementInfo {
     pub bounds: Option<Rect>,
 }
 
-const SNAPSHOT_BUILTINS: &[&str] = &["_ref", "name", "role", "bbox"];
+const SNAPSHOT_BUILTINS: &[&str] = &["_ref", "name", "description", "role", "bbox"];
 
 fn is_state_attr(key: &str) -> bool {
     EMITTED_STATES.iter().any(|(_, attr)| *attr == key)
@@ -850,6 +864,7 @@ pub fn evaluate_xpath_detailed(xml: &str, xpath: &str) -> Result<Vec<ElementInfo
         let role = elem.name().local_part().to_string();
         let role_raw = elem.attribute_value("role").map(|s| s.to_string());
         let name = elem.attribute_value("name").map(|s| s.to_string());
+        let description = elem.attribute_value("description").map(|s| s.to_string());
         let bounds = elem.attribute_value("bbox").and_then(Rect::parse_bbox);
 
         let mut attributes = HashMap::new();
@@ -873,6 +888,7 @@ pub fn evaluate_xpath_detailed(xml: &str, xpath: &str) -> Result<Vec<ElementInfo
             role,
             role_raw,
             name,
+            description,
             attributes,
             states,
             bounds,
@@ -1139,6 +1155,10 @@ pub struct CachedAccessible {
     /// title `Label`), so cache-only rows stay identifiable. `None` only when
     /// neither source yields text.
     pub name: Option<String>,
+    /// Accessible description (AT-SPI `accessible-description`) as carried in
+    /// the cache item, or `None` when the entry exposes no description. Mirrors
+    /// the snapshot's [`ElementInfo::description`].
+    pub description: Option<String>,
     /// Lowercase names of the AT-SPI states set on the entry, filtered
     /// to the same set the snapshot emits.
     pub states: Vec<String>,
@@ -1210,6 +1230,13 @@ pub async fn cache_items(conn: &zbus::Connection, app_bus: &str) -> Result<Vec<C
     //
     // The tuple matches `atspi_common::CacheItem` field-for-field —
     // signature `a((so)(so)(so)iiassusau)` — except `role: u32`.
+    //
+    // The two `String` fields are, in wire order, the accessible **name**
+    // (before the role) and the accessible **description** (after it) — the
+    // order at-spi2-core's client and GTK4's `gtkatspicache.c` both emit
+    // (`name`, `role`, `description`). atspi 0.29 mislabels them `short_name`
+    // and `name` on its `CacheItem`, but the field that holds the AT-SPI name
+    // is the one *before* the role; the one after is the description.
     type RawCacheItem = (
         atspi::ObjectRefOwned, // object   (so)
         atspi::ObjectRefOwned, // app      (so)
@@ -1217,9 +1244,9 @@ pub async fn cache_items(conn: &zbus::Connection, app_bus: &str) -> Result<Vec<C
         i32,                   // index in parent  i
         i32,                   // child count      i
         atspi::InterfaceSet,   // interfaces       as
-        String,                // short name       s
-        u32,                   // role (tolerant)  u
         String,                // name             s
+        u32,                   // role (tolerant)  u
+        String,                // description      s
         atspi::StateSet,       // states           au
     );
 
@@ -1240,7 +1267,9 @@ pub async fn cache_items(conn: &zbus::Connection, app_bus: &str) -> Result<Vec<C
     // `map`'s closure can't be async, and resolving LABELLED_BY needs a D-Bus
     // round-trip per nameless entry, so collect with an explicit async loop.
     let mut cached = Vec::with_capacity(items.len());
-    for (object, _app, parent, _index, children, _ifaces, _short, role_idx, name, states) in items {
+    for (object, _app, parent, _index, children, _ifaces, name, role_idx, description, states) in
+        items
+    {
         let role = cache_role_name(role_idx);
         let emitted_states = EMITTED_STATES
             .iter()
@@ -1264,10 +1293,12 @@ pub async fn cache_items(conn: &zbus::Connection, app_bus: &str) -> Result<Vec<C
         } else {
             Some(name)
         };
+        let description = (!description.is_empty()).then_some(description);
         cached.push(CachedAccessible {
             ref_,
             role,
             name,
+            description,
             states: emitted_states,
             parent_path,
             child_count: children,
@@ -1721,6 +1752,9 @@ mod tests {
             depth,
             raw_role: role.to_string(),
             name: name.to_string(),
+            // The format tests don't exercise description; the dedicated
+            // `serialize_node_emits_description` test builds a node directly.
+            description: String::new(),
             states,
             attrs: attrs
                 .iter()
@@ -1809,6 +1843,45 @@ mod tests {
             "</Frame>\n",
         );
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn serialize_node_emits_description_after_name() {
+        // The `accessible-description` is emitted as a `description=` attribute,
+        // positioned right after `name` and only when non-empty (issue #55).
+        let mut nodes: HashMap<(String, String), RawNode> = HashMap::new();
+        let mut node = raw(
+            "app",
+            "/btn",
+            0,
+            "push button",
+            "Close Search",
+            StateSet::empty(),
+            &[],
+            None,
+            false,
+            &[],
+        );
+        node.description = "Close the search bar".to_string();
+        nodes.insert(key("app", "/btn"), node);
+
+        let mut out = String::new();
+        serialize_node(&nodes, &key("app", "/btn"), 0, &mut out);
+        assert_eq!(
+            out,
+            "<PushButton role=\"push button\" name=\"Close Search\" \
+             description=\"Close the search bar\" _ref=\"app|/btn\"/>\n"
+        );
+
+        // Detailed XPath evaluation surfaces it on ElementInfo, and the
+        // description attribute is treated as a builtin (not a toolkit attr).
+        let infos = evaluate_xpath_detailed(&out, "//PushButton").unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            infos[0].description.as_deref(),
+            Some("Close the search bar")
+        );
+        assert!(!infos[0].attributes.contains_key("description"));
     }
 
     #[test]

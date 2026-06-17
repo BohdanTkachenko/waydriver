@@ -342,6 +342,9 @@ fn build_pointer_targets_row() -> GtkBox {
     hover.add_css_class("card");
     hover.set_tooltip_text(Some("hover tooltip"));
     name(&hover, "hover-target");
+    // Carries both a Label (name) and a Description so the e2e suite can assert
+    // `Locator::description` reads the AT-SPI accessible-description (issue #55).
+    describe(&hover, "hover over me");
     let motion = EventControllerMotion::new();
     motion.connect_enter(|_, _, _| emit("pointer-enter hover-target"));
     motion.connect_leave(|_| emit("pointer-leave hover-target"));
@@ -1063,6 +1066,16 @@ fn request_open_uri(uri: &str) -> Result<(), glib::Error> {
 
 fn name(widget: &impl IsA<gtk4::Accessible>, accessible_name: &str) {
     widget.update_property(&[gtk4::accessible::Property::Label(accessible_name)]);
+}
+
+/// Set the AT-SPI `accessible-description` (distinct from the accessible
+/// *name*) — the read-only metadata exposed via `Locator::description`
+/// (issue #55). Mirrors a real widget that carries both a Label and a
+/// Description, like vikno's find-bar Close button.
+fn describe(widget: &impl IsA<gtk4::Accessible>, accessible_description: &str) {
+    widget.update_property(&[gtk4::accessible::Property::Description(
+        accessible_description,
+    )]);
 }
 
 /// Emit a structured event line on stdout, flushing so tests see it

@@ -326,6 +326,47 @@ async fn reported_locator_bugs_are_fixed() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Issue #55: an element's AT-SPI `accessible-description` is readable from the
+/// snapshot via `Locator::description`, distinct from its name. The fixture's
+/// `hover-target` Label carries both a Label (name "hover-target") and a
+/// Description ("hover over me"); this reads back both and asserts the
+/// description doesn't leak into the name, and that a widget without a
+/// description reads back `None`.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn fixture_exposes_accessible_description() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Scope the locators so none outlives the `kill` below (which requires the
+    // session Arc to be uniquely held).
+    {
+        let hover = session.locate("//*[@name='hover-target']");
+        assert_eq!(
+            hover.name().await?.as_deref(),
+            Some("hover-target"),
+            "premise: the label's accessible name is its Label property"
+        );
+        assert_eq!(
+            hover.description().await?.as_deref(),
+            Some("hover over me"),
+            "Locator::description should read the AT-SPI accessible-description"
+        );
+
+        // A widget with no Description set reads back None — description must not
+        // be backfilled from the name.
+        let entry = session.locate("//*[@name='text-entry']");
+        assert_eq!(
+            entry.description().await?,
+            None,
+            "an element without an accessible-description should read back None"
+        );
+    }
+
+    kill(session).await?;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "spawns mutter + pipewire; run manually with --ignored"]
 async fn fixture_exposes_adw_widgets() -> anyhow::Result<()> {

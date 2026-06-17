@@ -277,6 +277,12 @@ pub fn render_matches(xpath: &str, matches: &[ElementInfo]) -> serde_json::Value
             if let Some(raw) = &m.role_raw {
                 obj["role_raw"] = serde_json::Value::String(raw.clone());
             }
+            // Omitted (rather than null) when absent: most elements carry no
+            // description, so emitting it only when set keeps the payload lean
+            // — same convention as `role_raw`/`bounds`.
+            if let Some(desc) = &m.description {
+                obj["description"] = serde_json::Value::String(desc.clone());
+            }
             if let Some(b) = m.bounds {
                 obj["bounds"] = serde_json::json!({
                     "x": b.x,
@@ -332,6 +338,7 @@ mod tests {
             role: role.to_string(),
             role_raw: None,
             name: name.map(str::to_string),
+            description: None,
             attributes: std::collections::HashMap::new(),
             states: Vec::new(),
             bounds: None,
@@ -414,6 +421,26 @@ mod tests {
         assert_eq!(entry["bounds"]["y"], 34);
         assert_eq!(entry["bounds"]["width"], 100);
         assert_eq!(entry["bounds"]["height"], 28);
+    }
+
+    #[test]
+    fn render_matches_includes_description_when_present() {
+        let mut m = info("PushButton", Some("Close Search"));
+        m.description = Some("Close the search bar".to_string());
+        let v = render_matches("//PushButton", std::slice::from_ref(&m));
+        let entry = &v.as_array().unwrap()[0];
+        assert_eq!(entry["description"], "Close the search bar");
+    }
+
+    #[test]
+    fn render_matches_omits_description_when_absent() {
+        let m = info("PushButton", Some("OK"));
+        let v = render_matches("//PushButton", std::slice::from_ref(&m));
+        let entry = &v.as_array().unwrap()[0];
+        assert!(
+            entry.get("description").is_none(),
+            "description should be absent when element has none: {entry}"
+        );
     }
 
     #[test]

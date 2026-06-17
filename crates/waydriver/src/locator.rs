@@ -282,6 +282,13 @@ impl Locator {
         Ok(self.wait_for_existing().await?.name)
     }
 
+    /// Accessible description (AT-SPI `accessible-description`) of the matched
+    /// element, or `None` when the element has no description set. Read from
+    /// the snapshot — the companion to [`name`](Self::name).
+    pub async fn description(&self) -> Result<Option<String>> {
+        Ok(self.wait_for_existing().await?.description)
+    }
+
     /// Raw AT-SPI role name (e.g. `"push button"`, `"menu item"`).
     ///
     /// Falls back to the PascalCase XML element tag only when the snapshot
@@ -2070,6 +2077,7 @@ mod tests {
             role: role.into(),
             role_raw: None,
             name: name.map(str::to_string),
+            description: None,
             attributes: HashMap::new(),
             states: Vec::new(),
             bounds: None,
@@ -2380,6 +2388,7 @@ mod tests {
                 role: "Node".into(),
                 role_raw: None,
                 name: None,
+                description: None,
                 attributes: HashMap::new(),
                 states: states.iter().map(|s| (*s).into()).collect(),
                 bounds: None,
