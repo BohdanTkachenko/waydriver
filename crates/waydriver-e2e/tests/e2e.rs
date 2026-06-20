@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use waydriver::{
-    CompositorRuntime, Error, FillMode, InputBackend, SelectBy, Session, SessionConfig,
+    CompositorRuntime, Error, FillMode, InputBackend, Role, SelectBy, Session, SessionConfig,
 };
 use waydriver_capture_mutter::MutterCapture;
 use waydriver_compositor_mutter::{MutterCompositor, MutterState};
@@ -4165,7 +4165,7 @@ async fn cache_resolution_drives_widgets_end_to_end() -> anyhow::Result<()> {
     let (session, _state) = start_fixture_session("gtk4").await?;
 
     let sel = "//Button[@name='primary-button']";
-    let check = "//CheckBox[@name='agree-check']";
+    let check = "//Checkbox[@name='agree-check']";
 
     // Capture walk-mode ground truth (force the walk explicitly), then
     // flip to cache resolution and assert parity — same count and role.
@@ -4325,6 +4325,53 @@ async fn cache_walk_tree_parity_across_dynamic_states() -> anyhow::Result<()> {
     assert_eq!(
         walk_id, cache_id,
         "attribute selector must resolve identically via the walk fallback"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// Issue #12: the typed [`Role`] helpers resolve real GTK4 widgets, and do so
+/// identically to the equivalent hand-written XPath. Anchors the `Role` enum's
+/// element-name mappings to the toolkit's actual AT-SPI role tags.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn find_by_role_resolves_gtk4_widgets() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    // Role::Button resolves the same element as the equivalent raw XPath.
+    let by_role = session
+        .find_by_role(Role::Button, "primary-button")
+        .count()
+        .await?;
+    let by_xpath = session
+        .locate("//Button[@name='primary-button']")
+        .count()
+        .await?;
+    assert_eq!(
+        by_role, 1,
+        "find_by_role(Button) must resolve primary-button"
+    );
+    assert_eq!(by_role, by_xpath, "typed helper must match the raw XPath");
+
+    // Role::TextBox is the entry/text-view tag; the locator is fillable.
+    // Scoped so the Locator's session Arc clone drops before `kill`.
+    {
+        let entry = session.find_by_role(Role::TextBox, "text-entry");
+        entry.fill("role-helper").await?;
+        assert_eq!(entry.text().await?, "role-helper");
+    }
+
+    // The escape hatch composes the node-test verbatim, matching the toolkit's
+    // surprising tag for a check box (`Checkbox`, not `CheckBox`).
+    let check = session
+        .find_by_role(Role::Other("Checkbox".into()), "agree-check")
+        .count()
+        .await?;
+    assert_eq!(
+        check, 1,
+        "Role::Other(\"Checkbox\") must resolve agree-check"
     );
 
     kill(session).await?;

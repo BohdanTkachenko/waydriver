@@ -23,3 +23,27 @@ about stale element handles. Common methods:
 Single-target actions (`click`, `focus`, `set_text`, `text`, ...) error with
 `AmbiguousSelector` if the selector matches more than one element. Narrow
 with `.nth(i)` or a more specific XPath.
+
+## Role helpers
+
+For the common "match by role + name" case you don't have to hand-write the
+XPath. `Session::find_by_role` takes a typed `Role` and compiles to the
+equivalent selector (handling the element tag and quote-escaping for you):
+
+```rust
+use waydriver::Role;
+
+session.find_by_role(Role::Button, "Sign in").click().await?;       // //Button[@name='Sign in']
+session.find_by_role(Role::TextBox, "username").fill("alice").await?; // //TextBox[@name='username']
+session.find_by_role_id(Role::TextBox, "username").fill("alice").await?; // //TextBox[@id='username']
+```
+
+The returned `Locator` composes with the rest of the API (auto-waits,
+`wait_for_*`, `.nth(i)`, sub-locators) exactly like `locate(xpath)`.
+
+The `Role` variants are named after the element tags GTK4 / libadwaita actually
+emit over AT-SPI, which sometimes differ from the classic AT-SPI strings —
+`Checkbox` (not `CheckBox`), `Radio` (not `RadioButton`), `TextBox` for a text
+entry, `Meter` for a level bar. For a role without a named variant, use the
+escape hatches: `Role::Other("Calendar".into())` passes an element name through
+verbatim, or call the string API `Session::find_by_role_name("Calendar", "May")`.
