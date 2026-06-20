@@ -4150,3 +4150,183 @@ async fn atspi_event_cache_real_app_measurement() -> anyhow::Result<()> {
     eprintln!("=== end RESULT ===");
     Ok(())
 }
+
+// ── Cache-first locator resolution (issue #11) ───────────────────────────
+
+/// With cache resolution (the default), locators resolve against the bulk
+/// `Cache.GetItems` snapshot instead of the per-node walk. Drives the gtk4
+/// fixture through that path to prove parity: name/role/state selectors
+/// resolve, an action fires, and the lazily enriched bounds (which the
+/// cache reply doesn't carry) come back live.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn cache_resolution_drives_widgets_end_to_end() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    let sel = "//Button[@name='primary-button']";
+    let check = "//CheckBox[@name='agree-check']";
+
+    // Capture walk-mode ground truth (force the walk explicitly), then
+    // flip to cache resolution and assert parity — same count and role.
+    // (set_cache_resolution toggles the mode per call.)
+    session.set_cache_resolution(false);
+    let walk_count = session.locate(sel).count().await?;
+    let walk_role = session.locate(sel).role().await?;
+    assert_eq!(
+        walk_count, 1,
+        "primary-button should resolve uniquely (walk)"
+    );
+
+    session.set_cache_resolution(true);
+
+    let cache_count = session.locate(sel).count().await?;
+    let cache_role = session.locate(sel).role().await?;
+    assert_eq!(
+        cache_count, walk_count,
+        "cache resolution must find the same match count as the walk"
+    );
+    assert_eq!(
+        cache_role, walk_role,
+        "cache resolution must report the same role as the walk"
+    );
+
+    // State comes from the cache snapshot (no live read needed).
+    let checked = session.locate(check).is_checked().await?;
+    assert!(!checked, "agree-check starts unchecked");
+
+    // Bounds are NOT in the cache reply — exercises lazy live enrichment.
+    let bounds = session.locate(sel).bounds().await?;
+    assert!(
+        bounds.width > 0 && bounds.height > 0,
+        "cache-mode bounds must be enriched live and non-empty: {bounds:?}"
+    );
+
+    // Action path: resolve via cache, fire the real GTK click handler.
+    let cursor = session.stdout_cursor();
+    session.locate(sel).click().await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("clicked primary-button"),
+            Duration::from_secs(3),
+        )
+        .await?;
+
+    // Re-resolution reflects state changes: toggle the checkbox and
+    // confirm the flipped state reads back through the cache.
+    let cursor = session.stdout_cursor();
+    session.locate(check).click().await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("checked agree-check active=true"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    let checked_after = session.locate(check).is_checked().await?;
+    assert!(
+        checked_after,
+        "agree-check must read checked after the click"
+    );
+
+    kill(session).await?;
+    Ok(())
+}
+
+/// The set of `_ref` node identities in a snapshot — the strongest
+/// "same tree" comparison key (identity, not just count).
+fn ref_set(xml: &str) -> std::collections::BTreeSet<String> {
+    xml.match_indices("_ref=\"")
+        .map(|(i, _)| {
+            let rest = &xml[i + 6..];
+            rest[..rest.find('"').unwrap_or(0)].to_string()
+        })
+        .collect()
+}
+
+/// Assert the walk and the cache see the *same* set of nodes right now.
+/// On divergence, bail with the symmetric difference so the failure names
+/// the offending nodes instead of just a count mismatch.
+async fn assert_tree_parity(session: &Arc<Session>, label: &str) -> anyhow::Result<()> {
+    let walk = session.dump_tree().await?;
+    let cache = session.dump_tree_cached().await?;
+    let walk_refs = ref_set(&walk);
+    let cache_refs = ref_set(&cache);
+    if walk_refs != cache_refs {
+        let only_walk: Vec<_> = walk_refs.difference(&cache_refs).take(8).collect();
+        let only_cache: Vec<_> = cache_refs.difference(&walk_refs).take(8).collect();
+        anyhow::bail!(
+            "[{label}] cache/walk tree divergence: walk={} cache={} \
+             only_in_walk(<=8)={:?} only_in_cache(<=8)={:?}",
+            walk_refs.len(),
+            cache_refs.len(),
+            only_walk,
+            only_cache
+        );
+    }
+    eprintln!("[parity:{label}] walk == cache: {} nodes", walk_refs.len());
+    Ok(())
+}
+
+/// The reliability question behind issue #11: is the `Cache.GetItems` tree
+/// a faithful stand-in for the `GetChildren` walk — not just at startup
+/// but as the UI churns? Drives a modal dialog open and closed, asserting
+/// node-set parity at each step, then confirms an attribute selector
+/// (which can't be served from the cache) resolves identically in both
+/// modes via the walk fallback.
+#[tokio::test]
+#[ignore = "spawns mutter + pipewire; run manually with --ignored"]
+async fn cache_walk_tree_parity_across_dynamic_states() -> anyhow::Result<()> {
+    init_tracing();
+    let (session, _state) = start_fixture_session("gtk4").await?;
+
+    assert_tree_parity(&session, "startup").await?;
+
+    // Open a modal dialog — a whole subtree appears.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='open-dialog']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dialog-opened sample-dialog"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await; // let the cache settle
+    assert_tree_parity(&session, "dialog-open").await?;
+
+    // Close it — the subtree goes away.
+    let cursor = session.stdout_cursor();
+    session
+        .locate("//Button[@name='dialog-close']")
+        .click()
+        .await?;
+    session
+        .wait_for_stdout_line(
+            cursor,
+            |l| l.contains("dialog-closed sample-dialog"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_tree_parity(&session, "dialog-closed").await?;
+
+    // Attribute selectors aren't serviceable from the cache, so cache mode
+    // must transparently fall back to the walk and resolve them identically
+    // (here a nonexistent id → 0 in both, exercising the fallback path).
+    session.set_cache_resolution(false);
+    let walk_id = session.find_by_id("no-such-id").count().await?;
+    session.set_cache_resolution(true);
+    let cache_id = session.find_by_id("no-such-id").count().await?;
+    assert_eq!(
+        walk_id, cache_id,
+        "attribute selector must resolve identically via the walk fallback"
+    );
+
+    kill(session).await?;
+    Ok(())
+}

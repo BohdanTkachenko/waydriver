@@ -763,6 +763,20 @@ fn is_state_attr(key: &str) -> bool {
     EMITTED_STATES.iter().any(|(_, attr)| *attr == key)
 }
 
+/// Whether a cache-derived snapshot ([`snapshot_tree_from_cache`]) carries
+/// the attribute `key`, so an XPath predicate matching on it resolves
+/// correctly without falling back to the full `GetChildren` walk.
+///
+/// True for the builtins the cache reply supplies — `name`, `role`, and
+/// the emitted state flags (`checked`, `focused`, …) — plus `_ref`. It is
+/// deliberately **false** for `bbox` and any toolkit attribute from
+/// `Accessible.GetAttributes` (e.g. `id`): the cache doesn't carry those,
+/// so a selector touching them must use the walk. Cache-resolution code
+/// uses this to decide, per selector, whether the cache can serve it.
+pub fn snapshot_cache_has_attr(key: &str) -> bool {
+    matches!(key, "name" | "role" | "_ref") || is_state_attr(key)
+}
+
 /// Evaluate an XPath expression against a snapshot produced by
 /// [`snapshot_tree`] and return the AT-SPI `(bus, path)` tuples of the
 /// matching elements, in document order.
@@ -1077,6 +1091,55 @@ pub async fn try_do_action_on(
     }
 }
 
+/// Read an element's raw AT-SPI role name live (`Accessible.GetRoleName`)
+/// — the authoritative role string the snapshot walk uses. Used to
+/// correct cache-derived roles: the cache stores only a role *index*,
+/// which is mapped through the bundled `atspi` crate's `Role` enum and
+/// can be stale relative to the running at-spi2 core (e.g. a role the
+/// core renamed). A live read always matches the toolkit. Falls back to
+/// `"unknown"` on error, exactly like the walk's per-node role read.
+pub async fn role_name_on(conn: &zbus::Connection, bus: &str, path: &str) -> Result<String> {
+    let proxy = build_accessible(conn, bus, path)
+        .await
+        .map_err(|e| Error::atspi_with("role: build accessible", e))?;
+    Ok(proxy.get_role_name().await.unwrap_or_else(|e| {
+        tracing::warn!(%bus, %path, error = %e, "role: get_role_name failed; substituting \"unknown\"");
+        "unknown".into()
+    }))
+}
+
+/// Map a raw AT-SPI role name (as [`role_name_on`] / `get_role_name`
+/// returns) to the `(element_tag, role_raw)` pair an [`ElementInfo`]
+/// carries — the same mapping the snapshot emits, so a corrected role is
+/// indistinguishable from a walk-derived one.
+pub fn element_role_fields(raw: &str) -> (String, Option<String>) {
+    let tag = role_to_element_name(raw).unwrap_or_else(|| "Node".to_string());
+    (tag, Some(raw.to_string()))
+}
+
+/// Read an element's toolkit attributes live (the AT-SPI
+/// `Accessible.GetAttributes` map). Used to enrich cache-derived
+/// snapshots, whose `Cache.GetItems` source doesn't carry attributes.
+///
+/// Mirrors the snapshot walk's tolerance: a `MethodError` (element
+/// doesn't expose the attribute interface) maps to an empty map rather
+/// than an error, so callers can blanket-enrich without per-element
+/// capability checks. Transport-level failures propagate as `Err`.
+pub async fn attributes_on(
+    conn: &zbus::Connection,
+    bus: &str,
+    path: &str,
+) -> Result<HashMap<String, String>> {
+    let proxy = build_accessible(conn, bus, path)
+        .await
+        .map_err(|e| Error::atspi_with("attributes: build accessible", e))?;
+    match proxy.get_attributes().await {
+        Ok(attrs) => Ok(attrs),
+        Err(zbus::Error::MethodError(_, _, _)) => Ok(HashMap::new()),
+        Err(e) => Err(Error::atspi_with("attributes: get_attributes", e)),
+    }
+}
+
 /// Read screen/window-relative bounds for the element identified by
 /// `(bus, path)` via the AT-SPI Component interface.
 ///
@@ -1327,6 +1390,206 @@ pub async fn cache_items(conn: &zbus::Connection, app_bus: &str) -> Result<Vec<C
         });
     }
     Ok(cached)
+}
+
+/// Raw (non-PascalCased) AT-SPI role name for a cache role *index* —
+/// the form the snapshot walk puts in the `role="…"` attribute (e.g.
+/// `"push button"`, not `"PushButton"`). Unknown indices fall back to the
+/// same `unknown-role-<n>` label [`cache_role_name`] uses, so a cache
+/// snapshot and a walk snapshot carry identical `role` attributes.
+fn cache_raw_role_name(role_idx: u32) -> String {
+    match atspi::Role::try_from(role_idx) {
+        Ok(r) => r.name().to_string(),
+        Err(_) => format!("unknown-role-{role_idx}"),
+    }
+}
+
+/// One node of a cache-derived snapshot, carrying exactly the fields the
+/// AT-SPI cache (`Cache.GetItems`) supplies that the snapshot XML needs:
+/// identity, parent link + sibling index (for reconstructing child
+/// order), raw role, name, and states. Deliberately *no* `bbox` or
+/// toolkit attributes — the cache does not report them; see
+/// [`snapshot_tree_from_cache`].
+#[derive(Debug, Clone)]
+struct CacheSnapshotNode {
+    bus: String,
+    path: String,
+    parent_path: Option<String>,
+    index_in_parent: i32,
+    raw_role: String,
+    name: String,
+    states: StateSet,
+}
+
+/// Render a snapshot-format XML document from a flat set of cache nodes,
+/// rooted at `root_path`. Pure (no I/O) so the tree-reconstruction and
+/// formatting logic is unit-testable without a live D-Bus cache.
+///
+/// The output matches [`snapshot_tree`]'s element shape — same tag
+/// names, same `role` / `name` / state attributes, same `_ref` — with
+/// two deliberate omissions the cache can't fill: `bbox` and toolkit
+/// attributes. Consumers that need those (bounds-based actions,
+/// attribute selectors) must enrich matched nodes with a live per-node
+/// read; structural and role/name/state selectors resolve directly.
+///
+/// Children are ordered by `index_in_parent` to reproduce the AT-SPI
+/// child order XPath positional predicates depend on. A `visited` guard
+/// and a depth cap (matching the walk's `depth > 20`) keep a cyclic or
+/// pathological cache from looping forever.
+fn render_cache_snapshot(nodes: Vec<CacheSnapshotNode>, root_path: &str) -> String {
+    use std::collections::{HashMap, HashSet};
+
+    let by_path: HashMap<&str, &CacheSnapshotNode> =
+        nodes.iter().map(|n| (n.path.as_str(), n)).collect();
+    let mut children: HashMap<&str, Vec<&CacheSnapshotNode>> = HashMap::new();
+    for n in &nodes {
+        if let Some(parent) = n.parent_path.as_deref() {
+            children.entry(parent).or_default().push(n);
+        }
+    }
+    for kids in children.values_mut() {
+        kids.sort_by_key(|n| n.index_in_parent);
+    }
+
+    let mut output = String::new();
+    output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    if let Some(root) = by_path.get(root_path) {
+        let mut visited = HashSet::new();
+        render_cache_node(root, &children, 0, &mut visited, &mut output);
+    }
+    output
+}
+
+fn render_cache_node<'a>(
+    node: &'a CacheSnapshotNode,
+    children: &HashMap<&'a str, Vec<&'a CacheSnapshotNode>>,
+    depth: usize,
+    visited: &mut std::collections::HashSet<&'a str>,
+    output: &mut String,
+) {
+    let element_name = role_to_element_name(&node.raw_role).unwrap_or_else(|| "Node".to_string());
+    let indent = "  ".repeat(depth);
+    let _ = write!(output, "{indent}<{element_name}");
+    let _ = write!(output, " role=\"{}\"", xml_escape(&node.raw_role));
+    if !node.name.is_empty() {
+        let _ = write!(output, " name=\"{}\"", xml_escape(&node.name));
+    }
+    for (state, attr) in EMITTED_STATES {
+        if node.states.contains(*state) {
+            let _ = write!(output, " {attr}=\"true\"");
+        }
+    }
+    let _ = write!(
+        output,
+        " _ref=\"{}|{}\"",
+        xml_escape(&node.bus),
+        xml_escape(&node.path)
+    );
+
+    // Guard against cycles / re-entry (a malformed cache could point two
+    // parents at one child) and runaway depth, mirroring the walk's cap.
+    let kids = if depth > 20 || !visited.insert(node.path.as_str()) {
+        &[][..]
+    } else {
+        children
+            .get(node.path.as_str())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    };
+    if kids.is_empty() {
+        output.push_str("/>\n");
+        return;
+    }
+    output.push_str(">\n");
+    for child in kids {
+        render_cache_node(child, children, depth + 1, visited, output);
+    }
+    let _ = writeln!(output, "{indent}</{element_name}>");
+}
+
+/// Build a snapshot-format XML document from the application's AT-SPI
+/// cache (`Cache.GetItems`) instead of walking `GetChildren` node by
+/// node. One bulk D-Bus round-trip returns the entire realized tree, so
+/// for large apps this is dramatically cheaper than [`snapshot_tree`] —
+/// the GTK accessibility bridge largely serializes per-call introspection
+/// on its main loop, so the walk's cost grows with *node count* while the
+/// cache read grows with *reply size*.
+///
+/// **Fidelity caveat:** the cache reply carries role, name, states, and
+/// tree structure, but **not** `Component` bounds (`bbox`) or arbitrary
+/// toolkit attributes. The returned XML therefore omits both. It is a
+/// faithful drop-in for structural and role/name/state XPath selectors;
+/// selectors that match on toolkit attributes, and any consumer reading
+/// `bbox`, must enrich the matched node with a live per-element read
+/// ([`extents_on`], `get_attributes`). See issue #11.
+pub async fn snapshot_tree_from_cache(
+    conn: &zbus::Connection,
+    app_bus: &str,
+    app_path: &str,
+) -> Result<String> {
+    // Field order matches `cache_items`' `RawCacheItem`: the `String`
+    // before the role is the accessible **name**, the one after it is the
+    // **description** (atspi 0.29 mislabels them). We only need the name.
+    type RawCacheItem = (
+        atspi::ObjectRefOwned, // object   (so)
+        atspi::ObjectRefOwned, // app      (so)
+        atspi::ObjectRefOwned, // parent   (so)
+        i32,                   // index in parent  i
+        i32,                   // child count      i
+        atspi::InterfaceSet,   // interfaces       as
+        String,                // name             s
+        u32,                   // role (tolerant)  u
+        String,                // description      s
+        atspi::StateSet,       // states           au
+    );
+
+    let proxy = zbus::Proxy::new(
+        conn,
+        app_bus.to_string(),
+        "/org/a11y/atspi/cache",
+        "org.a11y.atspi.Cache",
+    )
+    .await
+    .map_err(|e| Error::atspi_with("cache proxy build", e))?;
+
+    let items: Vec<RawCacheItem> = proxy
+        .call("GetItems", &())
+        .await
+        .map_err(|e| Error::atspi_with("Cache.GetItems", e))?;
+
+    let nodes = items
+        .into_iter()
+        .map(
+            |(
+                object,
+                _app,
+                parent,
+                index,
+                _children,
+                _ifaces,
+                name,
+                role_idx,
+                _description,
+                states,
+            )| {
+                let parent_path = match parent.path_as_str() {
+                    "/org/a11y/atspi/null" | "" => None,
+                    p => Some(p.to_string()),
+                };
+                CacheSnapshotNode {
+                    bus: object.name_as_str().unwrap_or(app_bus).to_string(),
+                    path: object.path_as_str().to_string(),
+                    parent_path,
+                    index_in_parent: index,
+                    raw_role: cache_raw_role_name(role_idx),
+                    name,
+                    states,
+                }
+            },
+        )
+        .collect();
+
+    Ok(render_cache_snapshot(nodes, app_path))
 }
 
 /// Ask the toolkit to scroll the element identified by `(bus, path)` into
@@ -1695,6 +1958,83 @@ mod tests {
         let frame = cache_role_name(atspi::Role::Frame as u32);
         assert_eq!(frame, "Frame");
         assert!(!frame.starts_with("unknown-role-"));
+    }
+
+    fn cnode(
+        path: &str,
+        parent: Option<&str>,
+        index: i32,
+        role: &str,
+        name: &str,
+        states: StateSet,
+    ) -> CacheSnapshotNode {
+        CacheSnapshotNode {
+            bus: ":1.5".to_string(),
+            path: path.to_string(),
+            parent_path: parent.map(str::to_string),
+            index_in_parent: index,
+            raw_role: role.to_string(),
+            name: name.to_string(),
+            states,
+        }
+    }
+
+    #[test]
+    fn render_cache_snapshot_builds_ordered_tree() {
+        // Children supplied out of order; renderer must sort by
+        // index_in_parent so XPath positional predicates stay correct.
+        let nodes = vec![
+            cnode("/root", None, 0, "frame", "win", StateSet::default()),
+            cnode(
+                "/b",
+                Some("/root"),
+                1,
+                "push button",
+                "second",
+                [State::Focused].into_iter().collect(),
+            ),
+            cnode(
+                "/a",
+                Some("/root"),
+                0,
+                "push button",
+                "first",
+                StateSet::default(),
+            ),
+        ];
+        let xml = render_cache_snapshot(nodes, "/root");
+
+        // Format parity with the walk: PascalCase tag, raw role attr,
+        // name attr, _ref, and the focused state surfaced as an attribute.
+        assert!(xml.contains(r#"<Frame role="frame" name="win" _ref=":1.5|/root">"#));
+        assert!(xml.contains(r#"name="first" _ref=":1.5|/a"#));
+        assert!(xml.contains(r#"focused="true""#));
+        // Sibling order follows index, not insertion order.
+        let first = xml.find("first").expect("first present");
+        let second = xml.find("second").expect("second present");
+        assert!(first < second, "children must render in index order");
+        // The cache carries no bounds or toolkit attrs — none emitted.
+        assert!(!xml.contains("bbox="));
+    }
+
+    #[test]
+    fn render_cache_snapshot_tolerates_parent_cycle() {
+        // Two nodes naming each other as parent must not infinite-loop;
+        // the visited-guard breaks the cycle and the render terminates.
+        let nodes = vec![
+            cnode("/x", Some("/y"), 0, "panel", "x", StateSet::default()),
+            cnode("/y", Some("/x"), 0, "panel", "y", StateSet::default()),
+        ];
+        let xml = render_cache_snapshot(nodes, "/x");
+        assert!(xml.contains("_ref=\":1.5|/x\""));
+    }
+
+    #[test]
+    fn render_cache_snapshot_unknown_root_yields_header_only() {
+        let nodes = vec![cnode("/a", None, 0, "panel", "a", StateSet::default())];
+        let xml = render_cache_snapshot(nodes, "/missing");
+        assert!(xml.contains("<?xml"));
+        assert!(!xml.contains("_ref="));
     }
 
     #[test]

@@ -513,6 +513,17 @@ pub struct Session {
     /// [`set_default_timeout`] can mutate it behind an `Arc<Session>`
     /// without requiring interior-mutability gymnastics on every field.
     default_timeout_ns: AtomicU64,
+    /// When set, [`Locator`](crate::Locator) resolution reads the AT-SPI
+    /// tree from the app's `Cache.GetItems` (one bulk round-trip) instead
+    /// of walking `GetChildren` node by node — far cheaper on large trees
+    /// (issue #11). **Off by default**; opt in via
+    /// [`set_cache_resolution`]. `AtomicBool` so it can flip behind an
+    /// `Arc<Session>`. Transparent walk fallbacks keep it never less
+    /// correct than the walk: a cache *miss* re-resolves against the walk
+    /// (which also warms the cache), attribute selectors and failed/empty
+    /// reads take the walk, and bounds/role/attributes are enriched live
+    /// per matched element.
+    cache_resolution: std::sync::atomic::AtomicBool,
     /// Whether this session runs against the isolated per-session GSettings
     /// keyfile store, copied from [`SessionConfig::gsettings_isolated`] at
     /// start. [`set_setting`](Self::set_setting) requires it: a live keyfile
@@ -810,6 +821,7 @@ impl Session {
             app_pid,
             gtk_actions: tokio::sync::OnceCell::new(),
             default_timeout_ns: AtomicU64::new(resolve_default_timeout().as_nanos() as u64),
+            cache_resolution: std::sync::atomic::AtomicBool::new(false),
             gsettings_isolated: cfg.gsettings_isolated,
             cancellation,
             app,
@@ -1243,12 +1255,14 @@ impl Session {
     /// settle — so the first motion after a fresh session binds pointer focus
     /// before the press — then a separate press/settle/release of `button`.
     /// With the warmup disabled it falls through to a single motion + click.
-    pub(crate) async fn cold_start_click(
-        &self,
-        cx: f64,
-        cy: f64,
-        button: PointerButton,
-    ) -> Result<()> {
+    /// Move the pointer to `(cx, cy)` via the calibrated cold-start
+    /// warmup: approach from an offset point, settle, then move onto the
+    /// target and settle again. This binds pointer focus to the widget
+    /// before any button event — a bare absolute warp followed by an
+    /// immediate press routes the press from the pointer's *previous*
+    /// position, which is the source of synthetic-click flakiness on
+    /// headless mutter. Tuning comes from `visual_click_tuning`.
+    pub(crate) async fn pointer_warmup_to(&self, cx: f64, cy: f64) -> Result<()> {
         let t = self.visual_click_tuning;
         if t.cold_start_warmup_enabled {
             let warmup_x = (cx - t.cold_start_warmup_offset_px).max(0.0);
@@ -1257,11 +1271,25 @@ impl Session {
             tokio::time::sleep(t.cold_start_motion_settle).await;
             self.pointer_motion_absolute(cx, cy).await?;
             tokio::time::sleep(t.cold_start_motion_settle).await;
+        } else {
+            self.pointer_motion_absolute(cx, cy).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn cold_start_click(
+        &self,
+        cx: f64,
+        cy: f64,
+        button: PointerButton,
+    ) -> Result<()> {
+        self.pointer_warmup_to(cx, cy).await?;
+        let t = self.visual_click_tuning;
+        if t.cold_start_warmup_enabled {
             self.pointer_button_down(button).await?;
             tokio::time::sleep(t.cold_start_press_settle).await;
             self.pointer_button_up(button).await?;
         } else {
-            self.pointer_motion_absolute(cx, cy).await?;
             self.pointer_button(button).await?;
         }
         Ok(())
@@ -1290,6 +1318,40 @@ impl Session {
     /// to 5 seconds. Mutable via [`set_default_timeout`](Self::set_default_timeout).
     pub fn default_timeout(&self) -> Duration {
         Duration::from_nanos(self.default_timeout_ns.load(Ordering::Relaxed))
+    }
+
+    /// Whether [`Locator`](crate::Locator) resolution reads the AT-SPI tree
+    /// from the app's `Cache.GetItems` instead of walking `GetChildren`.
+    /// **Off by default.** See [`set_cache_resolution`](Self::set_cache_resolution).
+    pub fn cache_resolution(&self) -> bool {
+        self.cache_resolution
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Switch [`Locator`](crate::Locator) resolution between the per-node
+    /// `GetChildren` walk (**the default**) and the bulk `Cache.GetItems`
+    /// read.
+    ///
+    /// Cache resolution is dramatically cheaper on large trees — one D-Bus
+    /// round-trip instead of one per node (issue #11) — and is transparent:
+    /// it's never less correct than the walk, because the locator falls
+    /// back to the walk whenever the cache can't serve a request:
+    ///
+    /// - a cache **miss** (zero matches) re-resolves against the walk,
+    ///   which also realizes the accessibles and warms the cache — so a
+    ///   cold/lazy cache self-heals on first use, no manual warm-up;
+    /// - selectors matching toolkit attributes (e.g.
+    ///   [`find_by_id`](Self::find_by_id)) take the walk, since the cache
+    ///   omits those attributes; so does a failed or empty cache read.
+    ///
+    /// The cache also omits Component bounds and carries a role *index*
+    /// (mapped via a possibly-stale enum), so `bounds()` / `scroll_into_view`
+    /// / pointer fallbacks, `attribute(s)`, and `role()` fetch those live
+    /// per matched element. Pass `false` to force the walk for every
+    /// resolution.
+    pub fn set_cache_resolution(&self, on: bool) {
+        self.cache_resolution
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Override the default timeout for this session. Takes effect on the
@@ -1419,6 +1481,24 @@ impl Session {
             .as_ref()
             .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
         atspi_client::snapshot_tree(a11y, &self.app_bus_name, &self.app_path).await
+    }
+
+    /// Serialize the accessibility tree to XML from the application's
+    /// AT-SPI **cache** (`Cache.GetItems`) rather than walking
+    /// `GetChildren` node by node like [`dump_tree`](Self::dump_tree).
+    ///
+    /// One bulk D-Bus round-trip returns the whole realized tree, so on
+    /// large apps (deep widget hierarchies, thousand-row lists) this is
+    /// far cheaper (issue #11). The XML shares [`dump_tree`](Self::dump_tree)'s
+    /// format and is a faithful drop-in for structural and role/name/state
+    /// XPath selectors. Two fields the cache does not report are omitted:
+    /// `bbox` (Component bounds) and arbitrary toolkit attributes.
+    pub async fn dump_tree_cached(&self) -> Result<String> {
+        let a11y = self
+            .a11y_connection
+            .as_ref()
+            .ok_or_else(|| Error::atspi("session has no AT-SPI connection"))?;
+        atspi_client::snapshot_tree_from_cache(a11y, &self.app_bus_name, &self.app_path).await
     }
 
     /// Walk keyboard focus through the app by pressing **Tab** `steps`
@@ -2118,6 +2198,7 @@ impl Session {
             app_pid: None,
             gtk_actions: tokio::sync::OnceCell::new(),
             default_timeout_ns: AtomicU64::new(FALLBACK_DEFAULT_TIMEOUT.as_nanos() as u64),
+            cache_resolution: std::sync::atomic::AtomicBool::new(false),
             // Mock sessions have no real isolated keyfile store, so live
             // `set_setting` is unavailable (it returns the isolation-required
             // error); tests that need it construct a real session.

@@ -105,6 +105,13 @@ const DOUBLE_CLICK_GAP: Duration = Duration::from_millis(40);
 /// GTK4 without adding noticeable latency.
 const DRAG_INTERMEDIATE_STEPS: u32 = 3;
 
+/// Settle after the button-down and between each drag motion step.
+/// Synthetic pointer events fired back-to-back can coalesce or arrive
+/// before GTK's drag gesture has armed, so it never begins a drag; a
+/// short pause per step lets the gesture observe a real press-then-move
+/// sequence. Tuned for headless mutter + GTK4.
+const DRAG_STEP_SETTLE: Duration = Duration::from_millis(60);
+
 /// How [`Locator::select_option`] identifies the option to pick.
 ///
 /// Playwright's `selectOption` accepts any of a label, a value, or an
@@ -263,11 +270,9 @@ impl Locator {
     /// More efficient than calling `all()` and then metadata methods on each
     /// returned locator, which would re-snapshot per match.
     pub async fn inspect_all(&self) -> Result<Vec<ElementInfo>> {
-        let a11y = self.a11y()?;
-        let xml =
-            atspi_client::snapshot_tree(a11y, &self.session.app_bus_name, &self.session.app_path)
-                .await?;
-        atspi_client::evaluate_xpath_detailed(&xml, &self.xpath)
+        let mut hits = self.resolve_detailed(&self.xpath).await?;
+        self.enrich_role(&mut hits).await?;
+        Ok(hits)
     }
 
     // ── Live metadata (auto-waits for the element to exist) ────────────────
@@ -295,18 +300,23 @@ impl Locator {
     /// lacks a `role` attribute — which shouldn't happen for live snapshots,
     /// but can in hand-crafted test XML.
     pub async fn role(&self) -> Result<String> {
-        let info = self.wait_for_existing().await?;
+        let mut info = self.wait_for_existing().await?;
+        self.enrich_role(std::slice::from_mut(&mut info)).await?;
         Ok(info.role_raw.unwrap_or(info.role))
     }
 
     /// Read a single toolkit attribute by key.
     pub async fn attribute(&self, key: &str) -> Result<Option<String>> {
-        Ok(self.wait_for_existing().await?.attributes.remove(key))
+        let mut info = self.wait_for_existing().await?;
+        self.enrich_attributes(&mut info).await?;
+        Ok(info.attributes.remove(key))
     }
 
     /// All toolkit attributes as a map.
     pub async fn attributes(&self) -> Result<HashMap<String, String>> {
-        Ok(self.wait_for_existing().await?.attributes)
+        let mut info = self.wait_for_existing().await?;
+        self.enrich_attributes(&mut info).await?;
+        Ok(info.attributes)
     }
 
     /// Whether the matched element currently has the AT-SPI `State::Showing`
@@ -1055,8 +1065,12 @@ impl Locator {
     /// Does **not** call [`scroll_into_view`](Self::scroll_into_view) —
     /// invoke it explicitly if the element may be off-screen.
     pub async fn hover(&self) -> Result<()> {
-        let (x, y) = self.wait_and_center().await?;
-        self.session.pointer_motion_absolute(x, y).await
+        let (cx, cy) = self.wait_and_center().await?;
+        // The cold-start warmup approaches from an offset point and
+        // settles onto the centre — that motion crosses the widget
+        // boundary, which GTK's EventControllerMotion needs to fire
+        // `enter`. A bare warp to the centre produces no crossing.
+        self.session.pointer_warmup_to(cx, cy).await
     }
 
     /// Double-click the matched element at its centre with the primary
@@ -1071,8 +1085,10 @@ impl Locator {
     ///
     /// Auto-waits for the element to be resolvable, showing, and enabled.
     pub async fn double_click(&self) -> Result<()> {
-        let (x, y) = self.wait_and_center().await?;
-        self.session.pointer_motion_absolute(x, y).await?;
+        let (cx, cy) = self.wait_and_center().await?;
+        // Warm up onto the widget (binds pointer focus) before the two
+        // presses, which must land inside the system double-click window.
+        self.session.pointer_warmup_to(cx, cy).await?;
         self.session
             .pointer_button(crate::backend::PointerButton::Left)
             .await?;
@@ -1370,10 +1386,11 @@ impl Locator {
     ///
     /// Auto-waits for the element to be resolvable, showing, and enabled.
     pub async fn right_click(&self) -> Result<()> {
-        let (x, y) = self.wait_and_center().await?;
-        self.session.pointer_motion_absolute(x, y).await?;
+        let (cx, cy) = self.wait_and_center().await?;
+        // Same calibrated warmup as pointer_click — a bare warp + press
+        // routes the press from the pointer's previous position and flakes.
         self.session
-            .pointer_button(crate::backend::PointerButton::Right)
+            .cold_start_click(cx, cy, crate::backend::PointerButton::Right)
             .await
     }
 
@@ -1430,20 +1447,29 @@ impl Locator {
     /// released before the error bubbles up so the next call doesn't inherit
     /// a stuck mouse state.
     async fn drag_between(&self, sx: f64, sy: f64, tx: f64, ty: f64) -> Result<()> {
-        self.session.pointer_motion_absolute(sx, sy).await?;
+        // Warm up onto the source (binds pointer focus / fires the enter
+        // crossing) before pressing — GTK's DragSource won't begin a drag
+        // from a bare warp onto the centre.
+        self.session.pointer_warmup_to(sx, sy).await?;
         self.session
             .pointer_button_down(crate::backend::PointerButton::Left)
             .await?;
+        // Let the press settle on the source before moving — the gesture
+        // won't arm if the first motion arrives in the same beat.
+        tokio::time::sleep(DRAG_STEP_SETTLE).await;
 
-        // Move in small increments so DnD start thresholds fire. On any
-        // error, release the button before bubbling up so the next call
-        // doesn't inherit a stuck mouse state.
+        // Move in small increments, settling between each, so the drag
+        // gesture's begin-threshold fires and events arrive as distinct
+        // motions rather than one coalesced jump. On any error, release
+        // the button before bubbling up so the next call doesn't inherit a
+        // stuck mouse state.
         let result = async {
             for i in 1..=DRAG_INTERMEDIATE_STEPS {
                 let t = i as f64 / DRAG_INTERMEDIATE_STEPS as f64;
                 let x = sx + (tx - sx) * t;
                 let y = sy + (ty - sy) * t;
                 self.session.pointer_motion_absolute(x, y).await?;
+                tokio::time::sleep(DRAG_STEP_SETTLE).await;
             }
             Ok::<(), Error>(())
         }
@@ -1499,13 +1525,16 @@ impl Locator {
         // (outermost-first), so we reverse in Rust.
         let ancestors_xpath = format!("({xp})/ancestor::*", xp = self.xpath);
         let mut ancestors = atspi_client::evaluate_xpath_detailed(&xml, &ancestors_xpath)?;
+        self.enrich_bounds(&mut ancestors).await?;
         ancestors.reverse();
 
         // Seed the overflow test with the target's own bounds. Then for
         // each ancestor, compare the PREVIOUS chain node's bounds to
         // this ancestor's — if the previous is strictly larger in any
         // axis, this ancestor is clipping it and is the viewport.
-        let target = atspi_client::evaluate_xpath_detailed(&xml, &self.xpath)?
+        let mut target_hits = atspi_client::evaluate_xpath_detailed(&xml, &self.xpath)?;
+        self.enrich_bounds(&mut target_hits).await?;
+        let target = target_hits
             .into_iter()
             .next()
             .ok_or_else(|| Error::ElementNotFound {
@@ -1720,22 +1749,147 @@ impl Locator {
             .unwrap_or_else(|| self.session.default_timeout())
     }
 
-    async fn snapshot(&self) -> Result<String> {
+    /// Whether this locator's selector should resolve against the cache
+    /// snapshot. True only when cache resolution is enabled *and* the
+    /// selector doesn't touch an attribute the cache can't supply (`id`,
+    /// other toolkit attrs, `bbox`) — those force the walk. See
+    /// [`xpath_needs_walk`].
+    fn wants_cache(&self) -> bool {
+        self.session.cache_resolution() && !xpath_needs_walk(&self.xpath)
+    }
+
+    /// The cache-derived snapshot for this selector, or `None` when the
+    /// cache can't serve it (cache resolution off, the selector touches a
+    /// non-cache attribute, or the cache read failed / came back empty).
+    /// A non-`None` result is not a guarantee the *selector* matches —
+    /// the AT-SPI cache is populated lazily, so a cold cache can return a
+    /// partial tree; callers evaluate and fall through to the walk on a
+    /// miss (see [`resolve_all_once`]/[`resolve_detailed`]).
+    async fn cache_snapshot(&self) -> Option<String> {
+        if !self.wants_cache() {
+            return None;
+        }
+        let a11y = self.a11y().ok()?;
+        match atspi_client::snapshot_tree_from_cache(
+            a11y,
+            &self.session.app_bus_name,
+            &self.session.app_path,
+        )
+        .await
+        {
+            Ok(xml) if xml.contains("_ref=\"") => Some(xml),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(xpath = %self.xpath, error = %e, "cache snapshot failed; using walk");
+                None
+            }
+        }
+    }
+
+    /// The authoritative per-node `GetChildren` walk snapshot. The act of
+    /// walking realizes the accessibles, warming the AT-SPI cache.
+    async fn walk_snapshot(&self) -> Result<String> {
         let a11y = self.a11y()?;
         atspi_client::snapshot_tree(a11y, &self.session.app_bus_name, &self.session.app_path).await
     }
 
-    /// Single-shot: snapshot + evaluate_xpath, no retry.
+    /// Best available full-tree snapshot: the cache when it can serve this
+    /// selector, otherwise the walk.
+    async fn snapshot(&self) -> Result<String> {
+        match self.cache_snapshot().await {
+            Some(xml) => Ok(xml),
+            None => self.walk_snapshot().await,
+        }
+    }
+
+    /// Snapshot + `evaluate_xpath_detailed`, with cache-mode bounds
+    /// enrichment and a miss→walk fallback. On a cache miss (zero matches)
+    /// re-resolves against the walk, which both resolves correctly and
+    /// warms the cache for next time.
+    async fn resolve_detailed(&self, xpath: &str) -> Result<Vec<ElementInfo>> {
+        if let Some(xml) = self.cache_snapshot().await {
+            let mut hits = atspi_client::evaluate_xpath_detailed(&xml, xpath)?;
+            if !hits.is_empty() {
+                self.enrich_bounds(&mut hits).await?;
+                return Ok(hits);
+            }
+        }
+        let xml = self.walk_snapshot().await?;
+        atspi_client::evaluate_xpath_detailed(&xml, xpath)
+    }
+
+    /// Populate missing `bounds` on cache-derived `ElementInfo`s with a
+    /// live window-relative extents read. No-op in walk mode and for any
+    /// node that already has bounds.
+    async fn enrich_bounds(&self, hits: &mut [ElementInfo]) -> Result<()> {
+        if !self.wants_cache() {
+            return Ok(());
+        }
+        let a11y = self.a11y()?;
+        for info in hits.iter_mut() {
+            if info.bounds.is_none() {
+                info.bounds = atspi_client::extents_on(
+                    a11y,
+                    &info.ref_.0,
+                    &info.ref_.1,
+                    atspi::CoordType::Window,
+                )
+                .await
+                .ok()
+                .flatten();
+            }
+        }
+        Ok(())
+    }
+
+    /// Correct cache-derived roles with a live `get_role_name` read. The
+    /// cache stores a role *index* mapped through a possibly-stale enum;
+    /// the live name always matches the walk. No-op in walk mode. Applied
+    /// only where a resolved role is surfaced (`role`, `inspect_all`) —
+    /// role-based selectors don't need it, a stale cache tag just misses
+    /// and falls through to the walk.
+    async fn enrich_role(&self, hits: &mut [ElementInfo]) -> Result<()> {
+        if !self.wants_cache() {
+            return Ok(());
+        }
+        let a11y = self.a11y()?;
+        for info in hits.iter_mut() {
+            let raw = atspi_client::role_name_on(a11y, &info.ref_.0, &info.ref_.1).await?;
+            let (role, role_raw) = atspi_client::element_role_fields(&raw);
+            info.role = role;
+            info.role_raw = role_raw;
+        }
+        Ok(())
+    }
+
+    /// In cache mode the snapshot omits toolkit attributes; fetch them
+    /// live so `attribute(s)` behaves like walk mode. No-op otherwise.
+    async fn enrich_attributes(&self, info: &mut ElementInfo) -> Result<()> {
+        if self.wants_cache() {
+            let a11y = self.a11y()?;
+            info.attributes = atspi_client::attributes_on(a11y, &info.ref_.0, &info.ref_.1).await?;
+        }
+        Ok(())
+    }
+
+    /// Single-shot: snapshot + evaluate_xpath, no retry. On a cache miss
+    /// (zero matches against the cache), falls through to the walk so a
+    /// cold/incomplete cache can't report a false "not found".
     async fn resolve_all_once(&self) -> Result<Vec<(String, String)>> {
-        let xml = self.snapshot().await?;
+        if let Some(xml) = self.cache_snapshot().await {
+            let hits = atspi_client::evaluate_xpath(&xml, &self.xpath)?;
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+        let xml = self.walk_snapshot().await?;
         atspi_client::evaluate_xpath(&xml, &self.xpath)
     }
 
     /// Single-shot: snapshot + evaluate_xpath_detailed + expect-one, no retry.
     /// `ElementNotFound` if zero matches, `AmbiguousSelector` if more than one.
     async fn resolve_once_info(&self) -> Result<ElementInfo> {
-        let xml = self.snapshot().await?;
-        let mut hits = atspi_client::evaluate_xpath_detailed(&xml, &self.xpath)?;
+        let mut hits = self.resolve_detailed(&self.xpath).await?;
         select_exactly_one(&self.xpath, &hits)?;
         Ok(hits.pop().unwrap())
     }
@@ -1870,6 +2024,47 @@ fn wheel_direction(elem: &crate::atspi::Rect, scrollable: &crate::atspi::Rect) -
 /// auto-wait and `is_enabled` accept either.
 fn is_enabled_in(states: &[String]) -> bool {
     states.iter().any(|s| s == "enabled" || s == "sensitive")
+}
+
+/// Whether `xpath` references an attribute a cache-derived snapshot can't
+/// supply — in which case cache resolution would silently fail to match
+/// and the selector must use the `GetChildren` walk instead.
+///
+/// Scans for `@name` tokens (skipping string literals so an `@` inside a
+/// quoted value isn't mistaken for an attribute reference) and returns
+/// `true` if any references an attribute outside the cache-known set
+/// (see [`atspi_client::snapshot_cache_has_attr`]). `@*` and other
+/// non-name forms after `@` conservatively force the walk. The heuristic
+/// only ever errs toward the walk — slower but correct.
+fn xpath_needs_walk(xpath: &str) -> bool {
+    let bytes = xpath.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'@' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.'))
+                {
+                    j += 1;
+                }
+                if j == start || !atspi_client::snapshot_cache_has_attr(&xpath[start..j]) {
+                    return true;
+                }
+                i = j;
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// Resolve a [`SelectBy::Label`] against a container's direct a11y
@@ -2045,8 +2240,8 @@ fn is_retriable(e: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_retriable, poll_with_retry, select_exactly_one, single_has_state, ElementInfo, Error,
-        HashMap,
+        is_retriable, poll_with_retry, select_exactly_one, single_has_state, xpath_needs_walk,
+        ElementInfo, Error, HashMap,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2162,6 +2357,38 @@ mod tests {
             .to_string();
         assert!(msg.contains("PushButton[name=\"Close\"]"), "msg: {msg}");
         assert!(msg.contains("Button[name=\"Close\"]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn xpath_needs_walk_cache_safe_selectors() {
+        // name / role / state predicates and pure structure are all
+        // serviceable from the cache snapshot.
+        assert!(!xpath_needs_walk("//*[@name='primary-button']"));
+        assert!(!xpath_needs_walk("//Button[@name='OK']"));
+        assert!(!xpath_needs_walk("//*[@role='push button']"));
+        assert!(!xpath_needs_walk("//CheckBox[@checked='true']"));
+        assert!(!xpath_needs_walk("//Dialog//*[@focused='true']"));
+        assert!(!xpath_needs_walk("(//Button)[2]/ancestor::*"));
+        assert!(!xpath_needs_walk("//Panel/*"));
+    }
+
+    #[test]
+    fn xpath_needs_walk_attribute_selectors_force_walk() {
+        // `id` and other toolkit attributes aren't in the cache reply.
+        assert!(xpath_needs_walk("//*[@id='submit-btn']"));
+        assert!(xpath_needs_walk("//Entry[@placeholder-text='name']"));
+        assert!(xpath_needs_walk("//*[@bbox]"));
+        assert!(xpath_needs_walk("//*[@*]"));
+        // Mixed: one cache-safe and one not → still needs the walk.
+        assert!(xpath_needs_walk("//*[@name='x' and @id='y']"));
+    }
+
+    #[test]
+    fn xpath_needs_walk_ignores_at_inside_literals() {
+        // An `@` inside a quoted string is a value, not an attribute
+        // reference — must not trip the heuristic into the walk.
+        assert!(!xpath_needs_walk("//*[@name='user@example.com']"));
+        assert!(!xpath_needs_walk(r#"//*[@name="a@b"]"#));
     }
 
     // ── Real Locator methods against a test Session ─────────────────────────
