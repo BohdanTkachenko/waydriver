@@ -4165,7 +4165,13 @@ async fn cache_resolution_drives_widgets_end_to_end() -> anyhow::Result<()> {
     let (session, _state) = start_fixture_session("gtk4").await?;
 
     let sel = "//Button[@name='primary-button']";
-    let check = "//Checkbox[@name='agree-check']";
+    // This test resolves `check` only in cache mode (below), and the cache
+    // snapshot tags a check box `CheckBox` (the `atspi` table spelling) — the
+    // `GetChildren` walk tags it `Checkbox`. A raw selector doesn't get the
+    // `Role` union, so it must use the cache spelling to actually resolve from
+    // the cache; `//Checkbox` here would silently fall back to the walk and
+    // defeat the point of the test. (Don't "correct" this to `//Checkbox`.)
+    let check = "//CheckBox[@name='agree-check']";
 
     // Capture walk-mode ground truth (force the walk explicitly), then
     // flip to cache resolution and assert parity — same count and role.
