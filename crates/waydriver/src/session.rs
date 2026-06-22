@@ -16,6 +16,7 @@ use crate::capture::VideoRecorder;
 use crate::error::{Error, Result};
 use crate::gaction;
 use crate::locator::Locator;
+use crate::role::Role;
 
 /// Fallback default timeout for auto-wait and explicit `wait_for_*` methods
 /// when the `WAYDRIVER_DEFAULT_TIMEOUT_MS` env var isn't set.
@@ -2104,6 +2105,36 @@ impl Session {
     pub fn find_by_role_name(self: &Arc<Self>, role: &str, name: &str) -> Locator {
         self.locate(&find_by_role_name_xpath(role, name))
     }
+
+    /// Locator matching an element by typed [`Role`] and accessible name —
+    /// the ergonomic shorthand for the common case. For example,
+    /// `find_by_role(Role::Button, "OK")` compiles to `//Button[@name='OK']`.
+    ///
+    /// Roles whose walk- and cache-snapshot tags differ (see
+    /// [`Role::element_names`]) compile to a union node-test so the cache can
+    /// serve the lookup — e.g. `find_by_role(Role::CheckBox, "agree")` becomes
+    /// `//*[(self::CheckBox or self::Checkbox) and @name='agree']`.
+    ///
+    /// For a role without a named variant, use [`Role::Other`] or the string
+    /// API [`find_by_role_name`](Self::find_by_role_name).
+    pub fn find_by_role(self: &Arc<Self>, role: Role, name: &str) -> Locator {
+        self.locate(&find_by_role_union_xpath(
+            &role.element_names(),
+            "name",
+            name,
+        ))
+    }
+
+    /// Locator matching an element by typed [`Role`] and toolkit `id`. For
+    /// example, `find_by_role_id(Role::Button, "submit")` compiles to
+    /// `//Button[@id='submit']` (a divergent role expands to a union node-test
+    /// as in [`find_by_role`](Self::find_by_role)). Prefer this over
+    /// [`find_by_id`](Self::find_by_id) to disambiguate an id reused across
+    /// roles, or for locale-stable lookups where the accessible name varies but
+    /// the id doesn't.
+    pub fn find_by_role_id(self: &Arc<Self>, role: Role, id: &str) -> Locator {
+        self.locate(&find_by_role_union_xpath(&role.element_names(), "id", id))
+    }
 }
 
 /// Center-derive the toplevel's on-screen origin `(x, y)` from the
@@ -2141,6 +2172,29 @@ fn find_by_name_xpath(name: &str) -> String {
 
 fn find_by_role_name_xpath(role: &str, name: &str) -> String {
     format!("//{}[@name={}]", role, xpath_literal(name))
+}
+
+/// Compose the XPath for a typed-[`Role`](crate::Role) lookup over one or more
+/// candidate element tags, matching `@attr` against `value`.
+///
+/// A single tag yields a plain node-test (`//Tag[@attr='v']`); multiple tags
+/// yield a `self::` union (`//*[(self::A or self::B) and @attr='v']`) so a role
+/// whose walk- and cache-snapshot tags differ resolves from either snapshot.
+/// Only `@name`/`@id` appear, so the selector stays cache-eligible (the union
+/// tokens carry no `@`, so `xpath_needs_walk` leaves it on the cache path).
+fn find_by_role_union_xpath(tags: &[&str], attr: &str, value: &str) -> String {
+    let lit = xpath_literal(value);
+    match tags {
+        [single] => format!("//{single}[@{attr}={lit}]"),
+        many => {
+            let union = many
+                .iter()
+                .map(|t| format!("self::{t}"))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            format!("//*[({union}) and @{attr}={lit}]")
+        }
+    }
 }
 
 /// Render a string as an XPath 1.0 string literal, choosing quote style so
@@ -2729,6 +2783,42 @@ mod tests {
         assert_eq!(
             find_by_role_name_xpath("MenuItem", "File"),
             "//MenuItem[@name='File']"
+        );
+    }
+
+    #[test]
+    fn find_by_role_union_xpath_single_tag_is_a_plain_node_test() {
+        // A non-divergent role (one tag) keeps the simple node-test shape.
+        assert_eq!(
+            find_by_role_union_xpath(&["Text"], "id", "username"),
+            "//Text[@id='username']"
+        );
+        assert_eq!(
+            find_by_role_union_xpath(&["Button"], "name", "OK"),
+            "//Button[@name='OK']"
+        );
+    }
+
+    #[test]
+    fn find_by_role_union_xpath_multi_tag_builds_self_axis_union() {
+        // A divergent role expands to a `self::` union so either snapshot's
+        // tag matches, with the `@attr` predicate ANDed in.
+        assert_eq!(
+            find_by_role_union_xpath(&["CheckBox", "Checkbox"], "name", "agree"),
+            "//*[(self::CheckBox or self::Checkbox) and @name='agree']"
+        );
+        assert_eq!(
+            find_by_role_union_xpath(&["TextBox", "Text", "Entry"], "id", "user"),
+            "//*[(self::TextBox or self::Text or self::Entry) and @id='user']"
+        );
+    }
+
+    #[test]
+    fn find_by_role_union_xpath_escapes_value_through_xpath_literal() {
+        // The value flows through `xpath_literal`, so a quote switches quoting.
+        assert_eq!(
+            find_by_role_union_xpath(&["Button"], "id", "it's"),
+            "//Button[@id=\"it's\"]"
         );
     }
 

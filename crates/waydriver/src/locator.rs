@@ -2537,6 +2537,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_find_by_role_composes_xpath() {
+        let s = test_session();
+        assert_eq!(
+            s.find_by_role(crate::Role::Button, "OK").xpath(),
+            "//Button[@name='OK']"
+        );
+        // The escape hatch passes its element name through verbatim.
+        assert_eq!(
+            s.find_by_role(crate::Role::Other("Calendar".into()), "May")
+                .xpath(),
+            "//Calendar[@name='May']"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_find_by_role_id_composes_xpath() {
+        let s = test_session();
+        // A non-divergent role keeps the plain node-test.
+        assert_eq!(
+            s.find_by_role_id(crate::Role::Button, "submit").xpath(),
+            "//Button[@id='submit']"
+        );
+        // A divergent role (TextBox/Text/Entry) expands to a self:: union so
+        // either snapshot path's tag resolves.
+        assert_eq!(
+            s.find_by_role_id(crate::Role::TextBox, "username").xpath(),
+            "//*[(self::TextBox or self::Text or self::Entry) and @id='username']"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_find_by_role_divergent_composes_union_xpath() {
+        let s = test_session();
+        assert_eq!(
+            s.find_by_role(crate::Role::CheckBox, "agree-check").xpath(),
+            "//*[(self::CheckBox or self::Checkbox) and @name='agree-check']"
+        );
+    }
+
+    #[tokio::test]
     async fn locator_locate_appends_descendant_when_relative() {
         let s = test_session();
         let dialog = s.locate("//Dialog[@name='Confirm']");

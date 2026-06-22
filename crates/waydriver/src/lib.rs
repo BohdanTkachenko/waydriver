@@ -24,6 +24,8 @@ pub mod gsettings;
 pub mod keysym;
 /// XPath-based lazy locators over the AT-SPI tree.
 pub mod locator;
+/// Typed AT-SPI roles for the ergonomic locator helpers.
+pub mod role;
 /// Test session lifecycle management.
 pub mod session;
 /// Mock D-Bus services that capture an app's external effects (desktop
@@ -42,6 +44,7 @@ pub use backend::{
 pub use error::{Error, Result};
 pub use gsettings::{GSettingEntry, GSettingsConfig};
 pub use locator::{FillMode, Locator, SelectBy};
+pub use role::Role;
 pub use session::{
     SecondaryInstance, Session, SessionConfig, VisualRegionTuning, VisualTextTuning,
 };
