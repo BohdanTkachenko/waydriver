@@ -49,12 +49,14 @@ macro_rules! single_xpath_action {
         call = $method:ident
     ) => {{
         let xpath = $params.xpath.clone();
-        $self.run_action(
+        let wait = $params.timeout.timeout_ms;
+        $self.run_action_within(
             &$params.session_id,
             $action,
-            serde_json::json!({ "xpath": $params.xpath }),
+            serde_json::json!({ "xpath": $params.xpath, "timeout_ms": $params.timeout.timeout_ms }),
+            $self.op_budget(wait, true),
             |s| async move {
-                s.locate(&xpath)
+                crate::tools::locate(&s, &xpath, wait)
                     .$method()
                     .await
                     .map(|_| format!(concat!($verb, " {}"), xpath))
@@ -168,16 +170,19 @@ impl UiTestServer {
     ) -> Result<CallToolResult, McpError> {
         let source_xpath = params.source_xpath.clone();
         let target_xpath = params.target_xpath.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "drag_to",
             serde_json::json!({
                 "source_xpath": params.source_xpath,
                 "target_xpath": params.target_xpath,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, true),
             |s| async move {
-                let source = s.locate(&source_xpath);
-                let target = s.locate(&target_xpath);
+                let source = crate::tools::locate(&s, &source_xpath, wait);
+                let target = crate::tools::locate(&s, &target_xpath, wait);
                 source
                     .drag_to(&target)
                     .await
@@ -203,16 +208,19 @@ impl UiTestServer {
         let source_xpath = params.source_xpath.clone();
         let x = params.x;
         let y = params.y;
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "drag_to_coords",
             serde_json::json!({
                 "source_xpath": params.source_xpath,
                 "x": params.x,
                 "y": params.y,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, true),
             |s| async move {
-                s.locate(&source_xpath)
+                crate::tools::locate(&s, &source_xpath, wait)
                     .drag_to_coords(x, y)
                     .await
                     .map(|_| format!("Dragged {source_xpath} to ({x}, {y})"))
@@ -231,12 +239,14 @@ impl UiTestServer {
     ) -> Result<CallToolResult, McpError> {
         let xpath = params.xpath.clone();
         let text = params.text.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "set_text",
-            serde_json::json!({ "xpath": params.xpath, "text": params.text }),
+            serde_json::json!({ "xpath": params.xpath, "text": params.text, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, true),
             |s| async move {
-                s.locate(&xpath)
+                crate::tools::locate(&s, &xpath, wait)
                     .set_text(&text)
                     .await
                     .map(|_| format!("Set text on {xpath}"))
@@ -272,7 +282,8 @@ impl UiTestServer {
 
         let xpath = params.xpath.clone();
         let text = params.text.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "fill",
             serde_json::json!({
@@ -280,9 +291,11 @@ impl UiTestServer {
                 "text": params.text,
                 "mode": params.mode,
                 "assume_focused": params.assume_focused,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, true),
             |s| async move {
-                let locator = s.locate(&xpath);
+                let locator = crate::tools::locate(&s, &xpath, wait);
                 let result = if assume_focused {
                     locator.fill_assume_focused(&text, mode).await
                 } else {
@@ -330,20 +343,23 @@ impl UiTestServer {
         let xpath = params.xpath.clone();
         let by = params.by;
         let value = params.value.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "select_option",
             serde_json::json!({
                 "xpath": params.xpath,
                 "by": params.by,
                 "value": params.value,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, true),
             |s| async move {
                 let selector = match &parsed {
                     ParsedBy::Label(name) => waydriver::SelectBy::Label(name.as_str()),
                     ParsedBy::Index(i) => waydriver::SelectBy::Index(*i),
                 };
-                s.locate(&xpath)
+                crate::tools::locate(&s, &xpath, wait)
                     .select_option(selector)
                     .await
                     .map(|_| format!("Selected {by}={value:?} on {xpath}"))
@@ -369,16 +385,19 @@ impl UiTestServer {
         let xpath = params.xpath.clone();
         let axis = params.axis;
         let steps = params.steps;
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "scroll",
             serde_json::json!({
                 "xpath": params.xpath,
                 "axis": params.axis,
                 "steps": params.steps,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, true),
             |s| async move {
-                s.locate(&xpath)
+                crate::tools::locate(&s, &xpath, wait)
                     .scroll(axis.to_waydriver(), steps)
                     .await
                     .map(|_| format!("Scrolled {xpath} by {steps} {axis:?} detent(s)"))
@@ -395,10 +414,12 @@ impl UiTestServer {
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Result<CallToolResult, McpError> {
         let text = params.text.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "type_text",
-            serde_json::json!({ "text": params.text }),
+            serde_json::json!({ "text": params.text, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move { s.type_text(&text).await.map(|_| format!("Typed '{text}'")) },
         )
         .await
@@ -425,10 +446,12 @@ impl UiTestServer {
         }
 
         let key = params.key.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "press_key",
-            serde_json::json!({ "key": params.key }),
+            serde_json::json!({ "key": params.key, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move {
                 s.press_chord(&key)
                     .await
@@ -454,10 +477,12 @@ impl UiTestServer {
         Parameters(params): Parameters<ActivateActionParams>,
     ) -> Result<CallToolResult, McpError> {
         let action = params.action.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "activate_action",
-            serde_json::json!({ "action": params.action }),
+            serde_json::json!({ "action": params.action, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move {
                 s.activate_action(&action)
                     .await
@@ -474,10 +499,12 @@ impl UiTestServer {
     ) -> Result<CallToolResult, McpError> {
         let dx = params.dx;
         let dy = params.dy;
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "move_pointer",
-            serde_json::json!({ "dx": params.dx, "dy": params.dy }),
+            serde_json::json!({ "dx": params.dx, "dy": params.dy, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move {
                 s.pointer_motion_relative(dx, dy)
                     .await
@@ -500,10 +527,12 @@ impl UiTestServer {
     ) -> Result<CallToolResult, McpError> {
         let x = params.x;
         let y = params.y;
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "move_pointer_absolute",
-            serde_json::json!({ "x": params.x, "y": params.y }),
+            serde_json::json!({ "x": params.x, "y": params.y, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move {
                 s.pointer_motion_absolute(x, y)
                     .await
@@ -533,14 +562,17 @@ impl UiTestServer {
         let text = params.text.clone();
         let scope_xpath = params.scope_xpath.clone();
         let match_mode = params.match_mode.unwrap_or_default();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "click_by_text",
             serde_json::json!({
                 "text": params.text,
                 "scope_xpath": params.scope_xpath,
                 "match_mode": params.match_mode,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, false),
             |s| async move {
                 let locator = match &scope_xpath {
                     Some(xpath) => s.locate(xpath).find_by_text(&text).await?,
@@ -581,7 +613,8 @@ impl UiTestServer {
         let text = params.text.clone();
         let region_index = params.region_index;
         let match_mode = params.match_mode.unwrap_or_default();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "click_text_region",
             serde_json::json!({
@@ -589,7 +622,9 @@ impl UiTestServer {
                 "scope_xpath": params.scope_xpath,
                 "region_index": params.region_index,
                 "match_mode": params.match_mode,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, false),
             |s| async move {
                 let scope = s.locate(&scope_xpath);
                 let inner = scope
@@ -644,14 +679,17 @@ impl UiTestServer {
         let png_path = params.png_path.clone();
         let scope_xpath = params.scope_xpath.clone();
         let threshold = params.threshold;
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "click_image",
             serde_json::json!({
                 "png_path": params.png_path,
                 "scope_xpath": params.scope_xpath,
                 "threshold": params.threshold,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, false),
             |s| async move {
                 let png_bytes = std::fs::read(&png_path).map_err(|e| {
                     waydriver::Error::process_with(format!("read PNG {png_path:?}"), e)
@@ -687,10 +725,12 @@ impl UiTestServer {
         // having to teach the JSON schema about every button.
         let button_code = params.button.unwrap_or(0x110);
         let button = waydriver::PointerButton::from_evdev_code(button_code);
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "pointer_click",
-            serde_json::json!({ "button": button_code }),
+            serde_json::json!({ "button": button_code, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move {
                 s.pointer_button(button)
                     .await
@@ -716,10 +756,17 @@ impl UiTestServer {
     ) -> Result<CallToolResult, McpError> {
         let args = params.args.clone();
         let timeout = params.timeout_secs.map(Duration::from_secs);
-        self.run_action(
+        // This op intentionally waits up to `timeout_secs` (default 15) for the
+        // secondary to exit, which can exceed the server-wide op budget. Extend
+        // the budget by that wait so the backstop only bounds the surrounding
+        // infrastructure, never the intended wait.
+        let op_budget =
+            self.default_op_timeout + Duration::from_secs(params.timeout_secs.unwrap_or(15));
+        self.run_action_within(
             &params.session_id,
             "launch_secondary_instance",
             serde_json::json!({ "args": params.args, "timeout_secs": params.timeout_secs }),
+            op_budget,
             |s| async move {
                 let outcome = match timeout {
                     Some(t) => s.launch_secondary_with_timeout(args, t).await?,

@@ -40,6 +40,13 @@ pub struct UiTestServer {
     /// Default for external-effect capture (mock notification + portal sinks)
     /// when a start_session call doesn't pass its own `capture_external_effects`.
     pub(crate) default_capture_external_effects: bool,
+    /// Hard ceiling on a single session op (everything routed through
+    /// `run_action` plus the capture tools that bypass it). Guarantees a
+    /// wedged session — e.g. one whose window never composites, where a
+    /// screenshot or input D-Bus call would block forever — returns an
+    /// `Error::Timeout` instead of hanging the MCP client. The analogue of
+    /// `kill_session`'s 5s budget for every other op.
+    pub(crate) default_op_timeout: Duration,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -114,6 +121,12 @@ impl UiTestServer {
     /// *this* session (via `kill_session`) wakes auto-wait loops via
     /// the session's `CancellationToken`, so even a stuck wait resolves
     /// promptly as `Error::Cancelled`.
+    ///
+    /// Convenience wrapper applying the server default budget. Tools that
+    /// honour a per-call `timeout_ms` override call [`run_action_within`]
+    /// directly with a computed budget; this stays the zero-override path
+    /// (used by tests and any tool without a timeout knob).
+    #[allow(dead_code)]
     pub(crate) async fn run_action<F, Fut>(
         &self,
         session_id: &str,
@@ -125,8 +138,48 @@ impl UiTestServer {
         F: FnOnce(Arc<waydriver::Session>) -> Fut,
         Fut: std::future::Future<Output = Result<String, waydriver::Error>>,
     {
+        self.run_action_within(
+            session_id,
+            action,
+            log_params,
+            self.default_op_timeout,
+            work,
+        )
+        .await
+    }
+
+    /// `run_action` with an explicit per-op timeout budget. Wait-style tools
+    /// (`wait_for_stdout_line`, `launch_secondary_instance`) carry their own
+    /// caller-supplied wait that can legitimately exceed the server-wide
+    /// `default_op_timeout`; they call this directly with their wait plus a
+    /// slack so the backstop bounds only the infrastructure overhead and never
+    /// preempts an intentional long wait. Everything else goes through
+    /// `run_action`, which passes `default_op_timeout`.
+    pub(crate) async fn run_action_within<F, Fut>(
+        &self,
+        session_id: &str,
+        action: &'static str,
+        log_params: serde_json::Value,
+        op_timeout: Duration,
+        work: F,
+    ) -> Result<CallToolResult, McpError>
+    where
+        F: FnOnce(Arc<waydriver::Session>) -> Fut,
+        Fut: std::future::Future<Output = Result<String, waydriver::Error>>,
+    {
         let held = self.acquire(session_id).await?;
-        let result = work(Arc::clone(&held.session)).await;
+        // Bound the work the same way `kill_session` bounds shutdown: past the
+        // budget the future is dropped (cancelling the in-flight D-Bus/IO
+        // primitives) and the caller gets a clear timeout instead of blocking
+        // on a wedged session. `acquire` stays outside the budget — it only
+        // contends with a concurrent `kill_session`, never the session itself.
+        let result = match tokio::time::timeout(op_timeout, work(Arc::clone(&held.session))).await {
+            Ok(r) => r,
+            Err(_) => Err(waydriver::Error::Timeout(format!(
+                "session {session_id} {action} exceeded {}s budget",
+                op_timeout.as_secs()
+            ))),
+        };
 
         // Materialize a stringy view for log_event while still holding
         // the typed error, so we can route the typed error through
@@ -149,6 +202,53 @@ impl UiTestServer {
 
         let success = result.map_err(waydriver_to_mcp)?;
         Ok(CallToolResult::success(vec![Content::text(success)]))
+    }
+
+    /// Run `fut` under `budget`, returning `Some(output)` if it finished in
+    /// time and `None` if it timed out. Used by the capture tools, which
+    /// bypass `run_action` (their `log_event` needs the screenshot filename)
+    /// but still must not hang on a wedged session — they map `None` to their
+    /// own outcome error via [`op_timeout_message`].
+    pub(crate) async fn bounded<T>(
+        &self,
+        budget: Duration,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        tokio::time::timeout(budget, fut).await.ok()
+    }
+
+    /// Resolve the effective op budget for a call from the caller's optional
+    /// `timeout_ms` override.
+    ///
+    /// - `None` → the server default (`--op-timeout-secs`).
+    /// - `Some(ms)`, `extend = false` → `ms` as the hard ceiling. For tools
+    ///   whose only timeout *is* this backstop (direct input, capture, OCR),
+    ///   so the call errors at ~`ms`.
+    /// - `Some(ms)`, `extend = true` → `ms` plus the server default as slack.
+    ///   For element-driven tools, where `ms` is the locator auto-wait
+    ///   (applied via [`tools::locate`](crate::tools::locate)) and the backstop
+    ///   must sit *above* it so the infra guard never preempts the wait.
+    pub(crate) fn op_budget(&self, timeout_ms: Option<u64>, extend: bool) -> Duration {
+        match timeout_ms {
+            None => self.default_op_timeout,
+            Some(ms) if extend => Duration::from_millis(ms) + self.default_op_timeout,
+            Some(ms) => Duration::from_millis(ms),
+        }
+    }
+
+    /// The timeout message the capture tools surface when [`bounded`] trips,
+    /// matching the phrasing `run_action` uses for its `Error::Timeout`.
+    /// `budget` is the effective per-call budget (post-override).
+    pub(crate) fn op_timeout_message(
+        &self,
+        session_id: &str,
+        action: &str,
+        budget: Duration,
+    ) -> String {
+        format!(
+            "session {session_id} {action} exceeded {}s budget",
+            budget.as_secs()
+        )
     }
 }
 
@@ -174,6 +274,7 @@ impl UiTestServer {
         default_video_bitrate: u32,
         default_setup_timeout: Duration,
         default_capture_external_effects: bool,
+        default_op_timeout: Duration,
     ) -> Self {
         let tool_router = Self::lifecycle_router()
             + Self::inspection_router()
@@ -190,6 +291,7 @@ impl UiTestServer {
             default_video_bitrate,
             default_setup_timeout,
             default_capture_external_effects,
+            default_op_timeout,
             tool_router,
         }
     }
@@ -273,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
         record_video = cli.record_video,
         video_bitrate = cli.video_bitrate,
         setup_timeout_secs = cli.setup_timeout_secs,
+        op_timeout_secs = cli.op_timeout_secs,
         "waydriver-mcp starting"
     );
 
@@ -286,6 +389,7 @@ async fn main() -> anyhow::Result<()> {
         cli.video_bitrate,
         Duration::from_secs(cli.setup_timeout_secs),
         cli.capture_external_effects,
+        Duration::from_secs(cli.op_timeout_secs),
     )
     .serve(stdio())
     .await
@@ -312,9 +416,9 @@ mod tests {
     use waydriver::Session;
 
     use crate::params::{
-        ClickParams, FocusParams, MovePointerParams, PointerClickParams, PressKeyParams,
-        QueryParams, ReadTextParams, SelectOptionByParam, SelectOptionParams, SessionIdParams,
-        SetTextParams, TypeTextParams,
+        ClickParams, FocusParams, KillSessionParams, MovePointerParams, PointerClickParams,
+        PressKeyParams, QueryParams, ReadTextParams, SelectOptionByParam, SelectOptionParams,
+        SessionIdParams, SetTextParams, TypeTextParams,
     };
     use crate::tools::lifecycle::{resolve_video_output, seed_viewer};
 
@@ -329,11 +433,19 @@ mod tests {
             2_000_000,
             Duration::from_secs(90),
             false,
+            Duration::from_secs(30),
         )
     }
 
     fn session_id(id: &str) -> Parameters<SessionIdParams> {
         Parameters(SessionIdParams {
+            session_id: id.into(),
+            timeout: Default::default(),
+        })
+    }
+
+    fn kill_id(id: &str) -> Parameters<KillSessionParams> {
+        Parameters(KillSessionParams {
             session_id: id.into(),
         })
     }
@@ -505,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn kill_session_not_found() {
         let s = server();
-        let err = s.kill_session(session_id("bogus")).await.unwrap_err();
+        let err = s.kill_session(kill_id("bogus")).await.unwrap_err();
         assert!(err.message.contains("session not found"));
     }
 
@@ -523,6 +635,7 @@ mod tests {
             .click(Parameters(ClickParams {
                 session_id: "bogus".into(),
                 xpath: "//PushButton".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -536,6 +649,7 @@ mod tests {
             .focus(Parameters(FocusParams {
                 session_id: "bogus".into(),
                 xpath: "//TextBox".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -549,6 +663,7 @@ mod tests {
             .query(Parameters(QueryParams {
                 session_id: "bogus".into(),
                 xpath: "//PushButton".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -563,6 +678,7 @@ mod tests {
                 session_id: "bogus".into(),
                 xpath: "//Text".into(),
                 text: "hi".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -578,6 +694,7 @@ mod tests {
                 xpath: "//ComboBox".into(),
                 by: SelectOptionByParam::Label,
                 value: "Small".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -591,6 +708,7 @@ mod tests {
             .read_text(Parameters(ReadTextParams {
                 session_id: "bogus".into(),
                 xpath: "//Label".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -604,6 +722,7 @@ mod tests {
             .type_text(Parameters(TypeTextParams {
                 session_id: "bogus".into(),
                 text: "hello".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -617,6 +736,7 @@ mod tests {
             .press_key(Parameters(PressKeyParams {
                 session_id: "bogus".into(),
                 key: "Return".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -631,6 +751,7 @@ mod tests {
                 session_id: "bogus".into(),
                 dx: 10.0,
                 dy: 20.0,
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -644,6 +765,7 @@ mod tests {
             .pointer_click(Parameters(PointerClickParams {
                 session_id: "bogus".into(),
                 button: None,
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -665,6 +787,7 @@ mod tests {
             .press_key(Parameters(PressKeyParams {
                 session_id: "test-1".into(),
                 key: "NoSuchKey".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap_err();
@@ -699,6 +822,7 @@ mod tests {
             .type_text(Parameters(TypeTextParams {
                 session_id: "test-1".into(),
                 text: "hello".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap();
@@ -715,6 +839,7 @@ mod tests {
             .press_key(Parameters(PressKeyParams {
                 session_id: "test-1".into(),
                 key: "Return".into(),
+                timeout: Default::default(),
             }))
             .await
             .unwrap();
@@ -732,6 +857,7 @@ mod tests {
                 session_id: "test-1".into(),
                 dx: 10.0,
                 dy: -5.0,
+                timeout: Default::default(),
             }))
             .await
             .unwrap();
@@ -749,6 +875,7 @@ mod tests {
             .pointer_click(Parameters(PointerClickParams {
                 session_id: "test-1".into(),
                 button: None,
+                timeout: Default::default(),
             }))
             .await
             .unwrap();
@@ -769,6 +896,7 @@ mod tests {
             .pointer_click(Parameters(PointerClickParams {
                 session_id: "test-1".into(),
                 button: Some(0x111), // BTN_RIGHT
+                timeout: Default::default(),
             }))
             .await
             .unwrap();
@@ -901,10 +1029,11 @@ mod tests {
             2_000_000,
             Duration::from_secs(90),
             false,
+            Duration::from_secs(30),
         );
         insert_test_session_with(&s, "test-1", "calculator", "wayland-test-1", false).await;
 
-        let result = s.kill_session(session_id("test-1")).await.unwrap();
+        let result = s.kill_session(kill_id("test-1")).await.unwrap();
         assert!(content_text(&result).contains("killed"));
         assert!(
             tokio::fs::metadata(tmp.path().join("test-1").join("events.jsonl"))
@@ -925,6 +1054,7 @@ mod tests {
             2_000_000,
             Duration::from_secs(90),
             false,
+            Duration::from_secs(30),
         );
         assert_eq!(s.report_dir, PathBuf::from("/tmp/custom-out"));
     }
@@ -1045,6 +1175,7 @@ mod tests {
             2_000_000,
             Duration::from_secs(90),
             false,
+            Duration::from_secs(30),
         );
         insert_test_session(&s, "abc", "calc", "wayland-abc").await;
         let sessions = s.sessions.read().await;
@@ -1058,7 +1189,7 @@ mod tests {
         let s = server();
         insert_test_session(&s, "test-1", "calculator", "wayland-test-1").await;
 
-        let result = s.kill_session(session_id("test-1")).await.unwrap();
+        let result = s.kill_session(kill_id("test-1")).await.unwrap();
         let text = content_text(&result);
         assert!(text.contains("test-1"));
         assert!(text.contains("killed"));
@@ -1124,6 +1255,59 @@ mod tests {
         assert!(html.contains("<video"));
     }
 
+    // ── Per-op timeout override (op_budget) ────────────────────────────
+
+    #[test]
+    fn op_budget_falls_back_to_server_default_when_unset() {
+        let s = server(); // default_op_timeout = 30s
+        assert_eq!(s.op_budget(None, false), Duration::from_secs(30));
+        assert_eq!(s.op_budget(None, true), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn op_budget_direct_uses_override_as_hard_ceiling() {
+        // Non-element tools: timeout_ms IS the budget, so the call errors
+        // at ~timeout_ms.
+        let s = server();
+        assert_eq!(s.op_budget(Some(2000), false), Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn op_budget_element_extends_budget_above_the_wait() {
+        // Element tools: timeout_ms is the locator auto-wait; the backstop
+        // must sit above it (+ server default) so it never preempts the wait.
+        let s = server(); // 30s default
+        assert_eq!(
+            s.op_budget(Some(2000), true),
+            Duration::from_millis(2000) + Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_action_within_caps_a_wedged_op_at_the_override() {
+        // A per-call timeout_ms shrinks the budget below the server default,
+        // so a wedged op surfaces a timeout fast.
+        let s = server(); // 30s default
+        insert_test_session(&s, "sid", "app", "wayland-x").await;
+
+        let start = std::time::Instant::now();
+        let err = s
+            .run_action_within(
+                "sid",
+                "wedged",
+                serde_json::json!({}),
+                Duration::from_millis(50), // simulates op_budget(Some(50), false)
+                |_| async move { std::future::pending::<Result<String, waydriver::Error>>().await },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("exceeded") && err.message.contains("budget"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "override must cap the op well under the 30s default"
+        );
+    }
+
     // ── run_action helper ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -1184,6 +1368,7 @@ mod tests {
             2_000_000,
             Duration::from_secs(90),
             false,
+            Duration::from_secs(30),
         );
         tokio::fs::create_dir_all(tmp.path().join("sid"))
             .await
@@ -1226,6 +1411,7 @@ mod tests {
             2_000_000,
             Duration::from_secs(90),
             false,
+            Duration::from_secs(30),
         );
         tokio::fs::create_dir_all(tmp.path().join("sid"))
             .await
@@ -1249,6 +1435,78 @@ mod tests {
         assert!(msg.contains("write png"), "missing operation: {msg}");
         assert!(msg.contains("disk full"), "missing source: {msg}");
         assert!(msg.contains(" | "), "missing chain separator: {msg}");
+    }
+
+    // ── Per-op timeout backstop ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_action_times_out_a_wedged_op() {
+        // The core of issue #61: an op that never returns (a wedged session
+        // whose D-Bus/capture call hangs) must not block the client. With a
+        // short op budget, run_action surfaces a clear timeout instead.
+        let tmp = TempDir::new().unwrap();
+        let mut s = UiTestServer::new(
+            tmp.path().to_path_buf(),
+            "1024x768".into(),
+            1.0,
+            true,
+            true,
+            false,
+            2_000_000,
+            Duration::from_secs(90),
+            false,
+            Duration::from_secs(30),
+        );
+        // Shrink the budget so the test is fast; mirrors --op-timeout-secs.
+        s.default_op_timeout = Duration::from_millis(50);
+        insert_test_session(&s, "sid", "app", "wayland-x").await;
+
+        let start = std::time::Instant::now();
+        let err = s
+            .run_action("sid", "wedged", serde_json::json!({}), |_| async move {
+                // Never observes the cancellation token, never returns —
+                // exactly the wedged-op shape the budget must bound.
+                std::future::pending::<Result<String, waydriver::Error>>().await
+            })
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(
+            err.message.contains("exceeded") && err.message.contains("budget"),
+            "expected a budget-timeout message, got: {}",
+            err.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "run_action must return at the budget, not hang; elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_action_within_honors_extended_budget() {
+        // Wait-style tools pass an extended budget so an intentional wait
+        // longer than default_op_timeout still completes.
+        let mut s = server();
+        s.default_op_timeout = Duration::from_millis(20);
+        insert_test_session(&s, "sid", "app", "wayland-x").await;
+
+        // Work takes 80ms — longer than the 20ms default budget, but the
+        // tool grants an extended 500ms budget, so it must succeed.
+        let result = s
+            .run_action_within(
+                "sid",
+                "waity",
+                serde_json::json!({}),
+                Duration::from_millis(500),
+                |_| async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    Ok::<_, waydriver::Error>("done".to_string())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(content_text(&result), "done");
     }
 
     // ── Cooperative cancellation ───────────────────────────────────────
@@ -1328,6 +1586,7 @@ mod tests {
             2_000_000,
             Duration::from_secs(90),
             false,
+            Duration::from_secs(30),
         );
         insert_test_session(&s, "sid", "app", "wayland-x").await;
 
@@ -1356,7 +1615,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let start = std::time::Instant::now();
-        let kill_result = s.kill_session(session_id("sid")).await.unwrap();
+        let kill_result = s.kill_session(kill_id("sid")).await.unwrap();
         let elapsed = start.elapsed();
 
         assert!(content_text(&kill_result).contains("killed"));

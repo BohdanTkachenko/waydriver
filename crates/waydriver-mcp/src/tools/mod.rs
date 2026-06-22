@@ -17,3 +17,20 @@ pub mod capture;
 pub mod inspection;
 pub mod interaction;
 pub mod lifecycle;
+
+/// Build a locator for `xpath`, applying the caller's optional per-op
+/// `timeout_ms` as the element auto-wait deadline. When `None`, the locator
+/// keeps the session default (`FALLBACK_DEFAULT_TIMEOUT`, 5s). Centralised
+/// here so every element-driven tool surfaces the same `timeout_ms` override
+/// identically instead of each re-implementing the `with_timeout` plumbing.
+pub(crate) fn locate(
+    session: &std::sync::Arc<waydriver::Session>,
+    xpath: &str,
+    timeout_ms: Option<u64>,
+) -> waydriver::Locator {
+    let locator = session.locate(xpath);
+    match timeout_ms {
+        Some(ms) => locator.with_timeout(std::time::Duration::from_millis(ms)),
+        None => locator,
+    }
+}

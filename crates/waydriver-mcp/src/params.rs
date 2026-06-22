@@ -11,6 +11,24 @@
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+/// Per-call timeout override, flattened into every session-scoped tool's
+/// params so each call can bound (or extend) its own deadline.
+///
+/// Flattened (not a nested object) so the wire shape stays
+/// `{ "session_id": ..., "timeout_ms": 2000 }` — `timeout_ms` sits alongside
+/// the tool's own fields rather than under a `timeout: {}` sub-object.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct OpTimeout {
+    /// Maximum time, in milliseconds, this call may run before it returns a
+    /// timeout error. Omit to use the server default (`--op-timeout-secs`,
+    /// 30s by default). For element-driven tools (click, fill, query, …) this
+    /// is *also* the auto-wait deadline — how long to wait for the selector to
+    /// resolve and the element to become actionable — with the infrastructure
+    /// backstop lifted above it so an intentional long wait is never preempted.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct StartSessionParams {
     /// Command to launch (e.g. "gnome-calculator")
@@ -134,10 +152,23 @@ pub struct SetSettingParams {
     /// numbers bare ("1.5"), strings single-quoted ("'prefer-dark'"), arrays
     /// bracketed ("['scale-monitor-framebuffer']").
     pub value: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionIdParams {
+    /// Session ID returned by start_session
+    pub session_id: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
+}
+
+/// Params for `kill_session`. Deliberately *not* an `OpTimeout` carrier:
+/// teardown is bounded by its own dedicated `KILL_TIMEOUT` (5s) in the
+/// library, so a per-call `timeout_ms` override would be misleading here.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KillSessionParams {
     /// Session ID returned by start_session
     pub session_id: String,
 }
@@ -166,6 +197,8 @@ pub struct ActivateActionParams {
     /// A string target may be appended with the GMenu detailed-name syntax,
     /// e.g. `app.section::adw`.
     pub action: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -175,6 +208,8 @@ pub struct QueryParams {
     /// XPath selector evaluated against the accessibility tree snapshot
     /// (e.g. `//PushButton[@name='OK']`, `//Dialog[@name='Confirm']//PushButton`).
     pub xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -183,6 +218,8 @@ pub struct ClickParams {
     pub session_id: String,
     /// XPath selector; must resolve to exactly one element at click time.
     pub xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -191,6 +228,8 @@ pub struct FocusParams {
     pub session_id: String,
     /// XPath selector; must resolve to exactly one focusable element.
     pub xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -199,6 +238,8 @@ pub struct HoverParams {
     pub session_id: String,
     /// XPath selector; must resolve to exactly one element at hover time.
     pub xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -207,6 +248,8 @@ pub struct DoubleClickParams {
     pub session_id: String,
     /// XPath selector; must resolve to exactly one element.
     pub xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -215,6 +258,8 @@ pub struct RightClickParams {
     pub session_id: String,
     /// XPath selector; must resolve to exactly one element.
     pub xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -225,6 +270,8 @@ pub struct DragToParams {
     pub source_xpath: String,
     /// XPath selector for the drop target; must resolve to exactly one element.
     pub target_xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -239,6 +286,8 @@ pub struct DragToCoordsParams {
     /// Screen-absolute Y coordinate (logical pixels) to drop at. May lie off
     /// the source window — e.g. empty space with no element under it.
     pub y: f64,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -249,6 +298,8 @@ pub struct SetTextParams {
     pub xpath: String,
     /// Text to write to the element (replaces existing contents).
     pub text: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 /// How to clear existing content before typing in `fill`.
@@ -303,6 +354,8 @@ pub struct FillParams {
     /// `grab_focus` and propagates any error.
     #[serde(default)]
     pub assume_focused: bool,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 /// Discriminator for [`SelectOptionParams::by`].
@@ -351,6 +404,8 @@ pub struct SelectOptionParams {
     /// Either the accessible name to match (when `by == "label"`) or
     /// a decimal integer (when `by == "index"`).
     pub value: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -359,6 +414,8 @@ pub struct ReadTextParams {
     pub session_id: String,
     /// XPath selector; must resolve to exactly one element supporting the Text interface.
     pub xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -368,6 +425,8 @@ pub struct ReadValueParams {
     /// XPath selector; must resolve to exactly one element supporting the
     /// AT-SPI Value interface (scroll bar, slider, progress bar, spin button).
     pub xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -376,6 +435,8 @@ pub struct TypeTextParams {
     pub session_id: String,
     /// Text to type
     pub text: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -384,6 +445,8 @@ pub struct PressKeyParams {
     pub session_id: String,
     /// Key name: "Return", "Tab", "Escape", "a", "1", etc.
     pub key: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -394,6 +457,8 @@ pub struct MovePointerParams {
     pub dx: f64,
     /// Vertical offset in logical pixels (positive = down)
     pub dy: f64,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -402,6 +467,8 @@ pub struct PointerClickParams {
     pub session_id: String,
     /// Linux evdev button code (default: 0x110 = BTN_LEFT)
     pub button: Option<u32>,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -412,6 +479,8 @@ pub struct MovePointerAbsoluteParams {
     pub x: f64,
     /// Absolute screen Y in logical pixels
     pub y: f64,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 /// Axis a `scroll` wheel event travels along.
@@ -456,6 +525,8 @@ pub struct ScrollParams {
     /// Number of wheel detents. Positive scrolls down / right, negative up /
     /// left; one detent ≈ one notch of a physical wheel.
     pub steps: i32,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 /// How OCR-recognised words are matched against the search text.
@@ -509,6 +580,8 @@ pub struct ClickByTextParams {
     /// labels in the same scope would substring-match each other.
     #[serde(default)]
     pub match_mode: Option<MatchModeParam>,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -531,6 +604,8 @@ pub struct ClickTextRegionParams {
     /// OCR match mode — see `click_by_text`. Defaults to `substring`.
     #[serde(default)]
     pub match_mode: Option<MatchModeParam>,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -547,6 +622,8 @@ pub struct FindTextParams {
     /// OCR match mode — see `click_by_text`. Defaults to `substring`.
     #[serde(default)]
     pub match_mode: Option<MatchModeParam>,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -561,6 +638,8 @@ pub struct FindTextRegionsParams {
     /// OCR match mode — see `click_by_text`. Defaults to `substring`.
     #[serde(default)]
     pub match_mode: Option<MatchModeParam>,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -571,6 +650,8 @@ pub struct ListTextParams {
     /// region. Defaults to the first element with bounds (the toplevel
     /// widget area) when omitted.
     pub scope_xpath: Option<String>,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -580,6 +661,8 @@ pub struct ElementScreenshotParams {
     /// XPath of the element to screenshot. The full-frame capture is
     /// cropped to the element's AT-SPI bounds.
     pub xpath: String,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -599,6 +682,8 @@ pub struct BaselineCompareParams {
     /// omitted. `matched` is informational; the tool never fails on a
     /// visual mismatch.
     pub tolerance: Option<f64>,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -616,6 +701,8 @@ pub struct ImageMatchParams {
     /// NCC match threshold in [0, 1]. Higher = stricter. Library
     /// default is 0.9 when omitted.
     pub threshold: Option<f32>,
+    #[serde(flatten)]
+    pub timeout: OpTimeout,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -639,6 +726,39 @@ pub struct WaitForStdoutLineParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn click_params_timeout_flattens_and_defaults_to_none() {
+        let p: ClickParams =
+            serde_json::from_value(serde_json::json!({ "session_id": "s", "xpath": "//X" }))
+                .unwrap();
+        assert_eq!(p.timeout.timeout_ms, None);
+    }
+
+    #[test]
+    fn click_params_timeout_parses_flat_field() {
+        // timeout_ms sits at the top level alongside session_id/xpath, not
+        // under a nested object — that's the point of #[serde(flatten)].
+        let p: ClickParams = serde_json::from_value(
+            serde_json::json!({ "session_id": "s", "xpath": "//X", "timeout_ms": 2500 }),
+        )
+        .unwrap();
+        assert_eq!(p.timeout.timeout_ms, Some(2500));
+    }
+
+    #[test]
+    fn click_params_schema_exposes_timeout_ms_at_top_level() {
+        // The generated JSON Schema must surface timeout_ms as a sibling
+        // property so MCP clients see it on the tool — flatten done right.
+        let schema = schemars::schema_for!(ClickParams);
+        let json = serde_json::to_value(&schema).unwrap();
+        let props = json
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("object schema with properties");
+        assert!(props.contains_key("timeout_ms"), "schema: {json}");
+        assert!(props.contains_key("xpath"));
+    }
 
     #[test]
     fn start_session_params_report_defaults_to_true() {

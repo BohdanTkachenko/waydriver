@@ -68,10 +68,12 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "dump_tree",
-            serde_json::json!({}),
+            serde_json::json!({ "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move { s.dump_tree().await },
         )
         .await
@@ -89,12 +91,14 @@ impl UiTestServer {
         Parameters(params): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
         let xpath = params.xpath.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "query",
-            serde_json::json!({ "xpath": params.xpath }),
+            serde_json::json!({ "xpath": params.xpath, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, true),
             |s| async move {
-                let matches = s.locate(&xpath).inspect_all().await?;
+                let matches = crate::tools::locate(&s, &xpath, wait).inspect_all().await?;
                 // serde_json failure on a value we just constructed is
                 // essentially impossible, but a typed error is cheaper
                 // than a panic — wrap it as an infra failure.
@@ -114,11 +118,13 @@ impl UiTestServer {
         Parameters(params): Parameters<ReadTextParams>,
     ) -> Result<CallToolResult, McpError> {
         let xpath = params.xpath.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "read_text",
-            serde_json::json!({ "xpath": params.xpath }),
-            |s| async move { s.locate(&xpath).text().await },
+            serde_json::json!({ "xpath": params.xpath, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, true),
+            |s| async move { crate::tools::locate(&s, &xpath, wait).text().await },
         )
         .await
     }
@@ -137,12 +143,14 @@ impl UiTestServer {
         Parameters(params): Parameters<ReadValueParams>,
     ) -> Result<CallToolResult, McpError> {
         let xpath = params.xpath.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "read_value",
-            serde_json::json!({ "xpath": params.xpath }),
+            serde_json::json!({ "xpath": params.xpath, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, true),
             |s| async move {
-                let v = s.locate(&xpath).value().await?;
+                let v = crate::tools::locate(&s, &xpath, wait).value().await?;
                 serde_json::to_string_pretty(&serde_json::json!({
                     "current": v.current,
                     "minimum": v.minimum,
@@ -171,14 +179,17 @@ impl UiTestServer {
         let text = params.text.clone();
         let scope_xpath = params.scope_xpath.clone();
         let match_mode = params.match_mode.unwrap_or_default();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "find_text",
             serde_json::json!({
                 "text": params.text,
                 "scope_xpath": params.scope_xpath,
                 "match_mode": params.match_mode,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, false),
             |s| async move {
                 let locator = match &scope_xpath {
                     Some(xpath) => s.locate(xpath).find_by_text(&text).await?,
@@ -225,14 +236,17 @@ impl UiTestServer {
         let scope_xpath = params.scope_xpath.clone();
         let text = params.text.clone();
         let match_mode = params.match_mode.unwrap_or_default();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "find_text_regions",
             serde_json::json!({
                 "text": params.text,
                 "scope_xpath": params.scope_xpath,
                 "match_mode": params.match_mode,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, false),
             |s| async move {
                 let scope = s.locate(&scope_xpath);
                 let inner = scope
@@ -278,10 +292,12 @@ impl UiTestServer {
             .scope_xpath
             .clone()
             .unwrap_or_else(|| DEFAULT_OCR_SCOPE.to_string());
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "list_text",
-            serde_json::json!({ "scope_xpath": params.scope_xpath }),
+            serde_json::json!({ "scope_xpath": params.scope_xpath, "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move {
                 let hits = s.locate(&scope_xpath).list_text().await?;
                 let payload: Vec<_> = hits
@@ -317,14 +333,17 @@ impl UiTestServer {
         let png_path = params.png_path.clone();
         let scope_xpath = params.scope_xpath.clone();
         let threshold = params.threshold;
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "find_image",
             serde_json::json!({
                 "png_path": params.png_path,
                 "scope_xpath": params.scope_xpath,
                 "threshold": params.threshold,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, false),
             |s| async move {
                 let png_bytes = std::fs::read(&png_path).map_err(|e| {
                     waydriver::Error::process_with(format!("read PNG {png_path:?}"), e)
@@ -372,7 +391,13 @@ impl UiTestServer {
         let contains = params.contains.clone();
         let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(5000));
         let after_opt = params.after;
-        self.run_action(
+        // This op intentionally waits up to `timeout_ms` (default 5000) for a
+        // matching line, which can exceed the server-wide op budget. Extend the
+        // budget by that wait so the backstop only bounds the surrounding
+        // infrastructure, never the intended wait — the inner wait already
+        // returns Error::Timeout at its own deadline.
+        let op_budget = self.default_op_timeout + timeout;
+        self.run_action_within(
             &params.session_id,
             "wait_for_stdout_line",
             serde_json::json!({
@@ -380,6 +405,7 @@ impl UiTestServer {
                 "timeout_ms": params.timeout_ms,
                 "after": params.after,
             }),
+            op_budget,
             |s| async move {
                 // None = "from now on" — snapshot the current end of buffer
                 // so prior history doesn't count. The Session API requires
@@ -412,10 +438,12 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "get_captured_effects",
-            serde_json::json!({}),
+            serde_json::json!({ "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move {
                 let payload = if s.external_effects_enabled() {
                     let notifications: Vec<_> =
@@ -453,10 +481,12 @@ impl UiTestServer {
         &self,
         Parameters(params): Parameters<SessionIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "list_actions",
-            serde_json::json!({}),
+            serde_json::json!({ "timeout_ms": params.timeout.timeout_ms }),
+            self.op_budget(wait, false),
             |s| async move {
                 let actions = s.list_actions().await?;
                 // serde_json failure on a Vec<String> we just built is

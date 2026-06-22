@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -10,7 +11,55 @@ use crate::error::{Error, Result};
 /// Serializes `grab_png_sync` calls so concurrent sessions don't race on the
 /// process-wide `PIPEWIRE_REMOTE` / `XDG_RUNTIME_DIR` env vars that
 /// `pipewiresrc` reads during pipeline startup.
+///
+/// This lock is held across the pipeline's blocking startup (where
+/// `pipewiresrc` connects to the PipeWire daemon and reads those env vars), so
+/// a capture against a wedged session — one whose window never composites and
+/// whose `pipewiresrc` connect therefore never completes — can pin it. The
+/// lock can't be released early without corrupting the env vars the wedged
+/// connect is still mid-read of, and a native connect stuck in C can't be
+/// force-cancelled in-process. So callers acquire it via [`lock_capture`] with
+/// a deadline: a *new* capture that finds the lock still held long past any
+/// legitimate capture's duration concludes the holder has wedged and fails
+/// fast with a clear timeout, rather than queueing behind it forever. That
+/// confines the damage to "captures error until restart" instead of "every
+/// future capture, on every session, hangs the client indefinitely."
 static GRAB_PNG_LOCK: Mutex<()> = Mutex::new(());
+
+/// Max time [`lock_capture`] waits for [`GRAB_PNG_LOCK`] before concluding the
+/// current holder has wedged. A legitimate capture holds the lock only for
+/// pipeline startup + a single frame pull — at most ~10s (the `try_pull_sample`
+/// / preroll budgets below) plus slack. A wait past this means the holder is
+/// stuck (e.g. `pipewiresrc` blocked connecting to a non-responsive session),
+/// so we fail fast instead of blocking on it.
+const CAPTURE_LOCK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Acquire [`GRAB_PNG_LOCK`], giving up with [`Error::Timeout`] if it can't be
+/// taken within `timeout`. Unlike a plain `.lock()`, this never blocks
+/// indefinitely behind a capture that wedged while holding it — see the lock's
+/// own docs for why a wedged holder can't be recovered in-process.
+fn lock_capture(timeout: Duration) -> Result<MutexGuard<'static, ()>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match GRAB_PNG_LOCK.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(e)) => {
+                return Err(Error::screenshot(format!("grab_png lock poisoned: {e}")));
+            }
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(Error::Timeout(format!(
+                        "capture subsystem busy or wedged: GRAB_PNG_LOCK not acquired within {}s \
+                         (a prior screenshot/recording on a non-responsive session is likely \
+                         stuck connecting to PipeWire)",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+}
 
 /// RAII guard that sets process-wide env vars and restores their prior values
 /// on drop.
@@ -107,9 +156,7 @@ pub async fn grab_png(node_id: u32, pipewire_socket: &Path) -> Result<Vec<u8>> {
 }
 
 fn grab_png_sync(node_id: u32, pipewire_socket: &Path, runtime_dir: &Path) -> Result<Vec<u8>> {
-    let _guard = GRAB_PNG_LOCK
-        .lock()
-        .map_err(|e| Error::screenshot(format!("grab_png lock poisoned: {e}")))?;
+    let _guard = lock_capture(CAPTURE_LOCK_TIMEOUT)?;
 
     gst::init().map_err(|e| Error::screenshot_with("gstreamer init failed", e))?;
 
@@ -143,10 +190,15 @@ fn grab_png_sync(node_id: u32, pipewire_socket: &Path, runtime_dir: &Path) -> Re
         .set_state(gst::State::Playing)
         .map_err(|e| Error::screenshot_with("failed to start pipeline", e))?;
 
-    // Pull a sample with a timeout.
-    let sample = appsink
-        .try_pull_sample(gst::ClockTime::from_seconds(10))
-        .ok_or_else(|| Error::screenshot("timed out waiting for PNG frame"))?;
+    // Pull a sample with a timeout. Tear the pipeline back down to NULL on
+    // *every* outcome (frame, timeout, or malformed buffer) before returning,
+    // so a failed pull can't leave a PLAYING pipeline — and its streaming
+    // thread — alive past the lock release. We hold the result and run the
+    // teardown first so the lock is held for the shortest bounded window.
+    let pull = appsink.try_pull_sample(gst::ClockTime::from_seconds(10));
+    let _ = pipeline.set_state(gst::State::Null);
+
+    let sample = pull.ok_or_else(|| Error::screenshot("timed out waiting for PNG frame"))?;
 
     let buffer = sample
         .buffer()
@@ -157,10 +209,6 @@ fn grab_png_sync(node_id: u32, pipewire_socket: &Path, runtime_dir: &Path) -> Re
         .map_err(|e| Error::screenshot_with("failed to map buffer", e))?;
 
     let png_bytes = map.as_slice().to_vec();
-
-    pipeline
-        .set_state(gst::State::Null)
-        .map_err(|e| Error::screenshot_with("failed to stop pipeline", e))?;
 
     tracing::info!(bytes = png_bytes.len(), "screenshot captured");
     Ok(png_bytes)
@@ -305,9 +353,11 @@ fn start_recording_sync(
     bitrate: u32,
     fps: u32,
 ) -> Result<VideoRecorder> {
-    let _guard = GRAB_PNG_LOCK
-        .lock()
-        .map_err(|e| Error::screenshot(format!("grab_png lock poisoned: {e}")))?;
+    // Shares GRAB_PNG_LOCK with the screenshot path (both mutate the same
+    // process-wide env vars), so a wedged screenshot must not be able to block
+    // recording startup forever, nor vice versa — acquire with the same
+    // bounded wait.
+    let _guard = lock_capture(CAPTURE_LOCK_TIMEOUT)?;
 
     gst::init().map_err(|e| Error::screenshot_with("gstreamer init failed", e))?;
 
@@ -554,6 +604,37 @@ mod tests {
             "/tmp/wd-test-root"
         );
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+    }
+
+    #[test]
+    fn lock_capture_acquires_when_free() {
+        // Generous timeout so a concurrently-running test that briefly holds
+        // the lock (the env tests) can't flake this; they release in µs.
+        let g = lock_capture(Duration::from_secs(5)).expect("should acquire a free lock");
+        drop(g);
+    }
+
+    #[test]
+    fn lock_capture_times_out_when_held() {
+        // A capture wedged while holding GRAB_PNG_LOCK must not make the next
+        // caller block forever — lock_capture gives up with Error::Timeout.
+        // Hold the real lock in a background thread for long enough that the
+        // short-timeout acquisition below is guaranteed to expire while held.
+        let holder = std::thread::spawn(|| {
+            let g = GRAB_PNG_LOCK.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            drop(g);
+        });
+        // Let the holder take the lock before we try.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let res = lock_capture(Duration::from_millis(50));
+        assert!(
+            matches!(res, Err(Error::Timeout(_))),
+            "expected Error::Timeout while lock held, got: {res:?}"
+        );
+
+        holder.join().unwrap();
     }
 
     #[test]

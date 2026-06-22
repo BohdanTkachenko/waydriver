@@ -32,7 +32,7 @@ use crate::cli::{
     resolve_resolution, resolve_scale, resolve_xdg_isolation,
 };
 use crate::mcp_error::waydriver_to_mcp;
-use crate::params::{SessionIdParams, SetSettingParams, StartSessionParams};
+use crate::params::{KillSessionParams, SetSettingParams, StartSessionParams};
 use crate::report::{append_event, now_ms, render_index_html};
 use crate::session::ManagedSession;
 use crate::UiTestServer;
@@ -323,14 +323,17 @@ impl UiTestServer {
         let schema = params.schema.clone();
         let key = params.key.clone();
         let value = params.value.clone();
-        self.run_action(
+        let wait = params.timeout.timeout_ms;
+        self.run_action_within(
             &params.session_id,
             "set_setting",
             serde_json::json!({
                 "schema": params.schema,
                 "key": params.key,
                 "value": params.value,
+                "timeout_ms": params.timeout.timeout_ms,
             }),
+            self.op_budget(wait, false),
             |s| async move {
                 s.set_setting(&schema, &key, &value)
                     .await
@@ -366,7 +369,7 @@ impl UiTestServer {
     #[tool(description = "Kill a test session and clean up all processes")]
     pub(crate) async fn kill_session(
         &self,
-        Parameters(params): Parameters<SessionIdParams>,
+        Parameters(params): Parameters<KillSessionParams>,
     ) -> Result<CallToolResult, McpError> {
         // Step 1: remove from the map so no new tool call can acquire
         // this session. The map write lock is held only for the

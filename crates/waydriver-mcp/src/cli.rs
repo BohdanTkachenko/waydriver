@@ -88,6 +88,19 @@ pub struct Cli {
         env = "WAYDRIVER_CAPTURE_EXTERNAL_EFFECTS"
     )]
     pub capture_external_effects: bool,
+    /// Hard ceiling, in seconds, on a single session operation (screenshot,
+    /// input, locator action, query, value read). If an op stalls past this
+    /// budget — e.g. a wedged session whose window never composites, where a
+    /// capture or D-Bus call would otherwise block forever — the call returns
+    /// an `Error::Timeout` instead of hanging the MCP client. Mirrors
+    /// `kill_session`'s existing 5s budget but for every other op. Wait-style
+    /// tools (`wait_for_stdout_line`, `launch_secondary_instance`) extend this
+    /// budget by their own caller-supplied wait, so an intentional long wait is
+    /// never cut short — the op timeout only bounds the infrastructure slack on
+    /// top of it. Lower it for fast-failing automated agents; raise it for slow
+    /// compositors.
+    #[arg(long, default_value_t = 30, env = "WAYDRIVER_OP_TIMEOUT_SECS")]
+    pub op_timeout_secs: u64,
 }
 
 /// Resolve the effective report dir for a new session: per-session override
@@ -290,6 +303,18 @@ mod tests {
     fn cli_accepts_setup_timeout_flag() {
         let cli = Cli::try_parse_from(["waydriver-mcp", "--setup-timeout-secs", "30"]).unwrap();
         assert_eq!(cli.setup_timeout_secs, 30);
+    }
+
+    #[test]
+    fn cli_op_timeout_defaults_to_thirty() {
+        let cli = Cli::try_parse_from(["waydriver-mcp"]).unwrap();
+        assert_eq!(cli.op_timeout_secs, 30);
+    }
+
+    #[test]
+    fn cli_accepts_op_timeout_flag() {
+        let cli = Cli::try_parse_from(["waydriver-mcp", "--op-timeout-secs", "10"]).unwrap();
+        assert_eq!(cli.op_timeout_secs, 10);
     }
 
     #[test]

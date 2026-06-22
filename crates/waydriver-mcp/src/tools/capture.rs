@@ -29,17 +29,30 @@ impl UiTestServer {
         // same acquire() primitive so we still get cancel/drain semantics.
         let held = self.acquire(&params.session_id).await?;
 
-        let outcome: Result<PathBuf, String> = async {
-            let png_bytes = held
-                .session
-                .take_screenshot()
-                .await
-                .map_err(|e| e.to_string())?;
-            held.persist_screenshot(&params.session_id, &png_bytes)
-                .await
-                .map_err(|e| format!("persist screenshot: {e}"))
-        }
-        .await;
+        // Bound the capture the same way `run_action` bounds every other op:
+        // a wedged session whose window never composites can stall the
+        // GStreamer pipeline indefinitely (and holds the process-wide
+        // grab_png lock while it does), so without this an unattended client
+        // would hang here. Past the budget we drop the future and return a
+        // clear timeout. take_screenshot bypasses run_action (log_event needs
+        // the screenshot filename), hence the explicit wrap here. No element
+        // wait is involved, so `timeout_ms` is the hard ceiling (extend=false).
+        let budget = self.op_budget(params.timeout.timeout_ms, false);
+        let outcome: Result<PathBuf, String> = self
+            .bounded(budget, async {
+                let png_bytes = held
+                    .session
+                    .take_screenshot()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                held.persist_screenshot(&params.session_id, &png_bytes)
+                    .await
+                    .map_err(|e| format!("persist screenshot: {e}"))
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(self.op_timeout_message(&params.session_id, "take_screenshot", budget))
+            });
         let ok_display = outcome.as_ref().ok().map(|p| p.display().to_string());
         let screenshot_name = outcome
             .as_ref()
@@ -54,7 +67,7 @@ impl UiTestServer {
             .log_event(
                 &params.session_id,
                 "take_screenshot",
-                serde_json::json!({}),
+                serde_json::json!({ "timeout_ms": params.timeout.timeout_ms }),
                 log_outcome,
                 screenshot_name.as_deref(),
             )
@@ -85,18 +98,26 @@ impl UiTestServer {
         let held = self.acquire(&params.session_id).await?;
 
         let xpath = params.xpath.clone();
-        let outcome: Result<PathBuf, String> = async {
-            let png_bytes = held
-                .session
-                .locate(&xpath)
-                .screenshot()
-                .await
-                .map_err(|e| e.to_string())?;
-            held.persist_screenshot(&params.session_id, &png_bytes)
-                .await
-                .map_err(|e| format!("persist screenshot: {e}"))
-        }
-        .await;
+        // Bounded for the same reason as take_screenshot: a wedged session can
+        // stall capture indefinitely, and this path bypasses run_action. This
+        // one locates an element first, so `timeout_ms` is the element
+        // auto-wait and the budget extends above it (extend=true).
+        let wait = params.timeout.timeout_ms;
+        let budget = self.op_budget(wait, true);
+        let outcome: Result<PathBuf, String> = self
+            .bounded(budget, async {
+                let png_bytes = crate::tools::locate(&held.session, &xpath, wait)
+                    .screenshot()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                held.persist_screenshot(&params.session_id, &png_bytes)
+                    .await
+                    .map_err(|e| format!("persist screenshot: {e}"))
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(self.op_timeout_message(&params.session_id, "take_element_screenshot", budget))
+            });
         let ok_display = outcome.as_ref().ok().map(|p| p.display().to_string());
         let screenshot_name = outcome
             .as_ref()
@@ -111,7 +132,7 @@ impl UiTestServer {
             .log_event(
                 &params.session_id,
                 "take_element_screenshot",
-                serde_json::json!({ "xpath": params.xpath }),
+                serde_json::json!({ "xpath": params.xpath, "timeout_ms": params.timeout.timeout_ms }),
                 log_outcome,
                 screenshot_name.as_deref(),
             )
@@ -152,78 +173,90 @@ impl UiTestServer {
         let baseline_path = params.baseline_path.clone();
         let tolerance = params.tolerance.unwrap_or(DEFAULT_BASELINE_TOLERANCE);
 
-        let outcome: Result<(PathBuf, String), String> = async {
-            let crop = held
-                .session
-                .locate(&xpath)
-                .screenshot()
-                .await
-                .map_err(|e| e.to_string())?;
-            let crop_path = held
-                .persist_screenshot(&params.session_id, &crop)
-                .await
-                .map_err(|e| format!("persist screenshot: {e}"))?;
+        // Bounded for the same reason as the other capture tools; the inner
+        // CIEDE2000 diff is already off-runtime via spawn_blocking, so the
+        // budget here guards the capture + IO, not the CPU compare. Locates an
+        // element, so `timeout_ms` is the element auto-wait (extend=true).
+        let wait = params.timeout.timeout_ms;
+        let budget = self.op_budget(wait, true);
+        let outcome: Result<(PathBuf, String), String> = self
+            .bounded(budget, async {
+                let crop = crate::tools::locate(&held.session, &xpath, wait)
+                    .screenshot()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let crop_path = held
+                    .persist_screenshot(&params.session_id, &crop)
+                    .await
+                    .map_err(|e| format!("persist screenshot: {e}"))?;
 
-            let baseline = tokio::fs::read(&baseline_path)
-                .await
-                .map_err(|e| format!("read baseline {baseline_path:?}: {e}"))?;
+                let baseline = tokio::fs::read(&baseline_path)
+                    .await
+                    .map_err(|e| format!("read baseline {baseline_path:?}: {e}"))?;
 
-            // Per-pixel CIEDE2000 is CPU-bound — keep it off the runtime.
-            let cmp = {
-                let (crop, baseline) = (crop.clone(), baseline.clone());
-                tokio::task::spawn_blocking(move || {
-                    waydriver::visual::compare_to_baseline(&crop, &baseline, tolerance)
-                })
-                .await
-                .map_err(|e| format!("compare task panicked: {e}"))?
-                .map_err(|e| e.to_string())?
-            };
+                // Per-pixel CIEDE2000 is CPU-bound — keep it off the runtime.
+                let cmp = {
+                    let (crop, baseline) = (crop.clone(), baseline.clone());
+                    tokio::task::spawn_blocking(move || {
+                        waydriver::visual::compare_to_baseline(&crop, &baseline, tolerance)
+                    })
+                    .await
+                    .map_err(|e| format!("compare task panicked: {e}"))?
+                    .map_err(|e| e.to_string())?
+                };
 
-            let mut payload = serde_json::json!({
-                "matched": cmp.matched,
-                "score": cmp.score,
-                "mean_delta_e": cmp.mean_delta_e,
-                "max_delta_e": cmp.max_delta_e,
-                "ncc": cmp.ncc,
-                "diff_pixels": cmp.diff_pixels,
-                "total_pixels": cmp.total_pixels,
-                "width": cmp.width,
-                "height": cmp.height,
-                "tolerance": cmp.tolerance,
-            });
+                let mut payload = serde_json::json!({
+                    "matched": cmp.matched,
+                    "score": cmp.score,
+                    "mean_delta_e": cmp.mean_delta_e,
+                    "max_delta_e": cmp.max_delta_e,
+                    "ncc": cmp.ncc,
+                    "diff_pixels": cmp.diff_pixels,
+                    "total_pixels": cmp.total_pixels,
+                    "width": cmp.width,
+                    "height": cmp.height,
+                    "tolerance": cmp.tolerance,
+                });
 
-            if !cmp.matched {
-                // Best-effort diff artifact next to the crop; a failure to
-                // render or write it must not fail the comparison itself.
-                let diff = tokio::task::spawn_blocking(move || {
-                    waydriver::visual::diff_to_baseline(&crop, &baseline)
-                })
-                .await;
-                match diff {
-                    Ok(Ok(diff_png)) => {
-                        let stem = crop_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("crop");
-                        let diff_path = crop_path.with_file_name(format!("{stem}-diff.png"));
-                        match tokio::fs::write(&diff_path, &diff_png).await {
-                            Ok(()) => {
-                                payload["diff_path"] =
-                                    serde_json::Value::String(diff_path.display().to_string());
+                if !cmp.matched {
+                    // Best-effort diff artifact next to the crop; a failure to
+                    // render or write it must not fail the comparison itself.
+                    let diff = tokio::task::spawn_blocking(move || {
+                        waydriver::visual::diff_to_baseline(&crop, &baseline)
+                    })
+                    .await;
+                    match diff {
+                        Ok(Ok(diff_png)) => {
+                            let stem = crop_path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("crop");
+                            let diff_path = crop_path.with_file_name(format!("{stem}-diff.png"));
+                            match tokio::fs::write(&diff_path, &diff_png).await {
+                                Ok(()) => {
+                                    payload["diff_path"] =
+                                        serde_json::Value::String(diff_path.display().to_string());
+                                }
+                                Err(e) => tracing::warn!(error = %e, "write diff image failed"),
                             }
-                            Err(e) => tracing::warn!(error = %e, "write diff image failed"),
                         }
+                        Ok(Err(e)) => tracing::warn!(error = %e, "render diff image failed"),
+                        Err(e) => tracing::warn!(error = %e, "diff task panicked"),
                     }
-                    Ok(Err(e)) => tracing::warn!(error = %e, "render diff image failed"),
-                    Err(e) => tracing::warn!(error = %e, "diff task panicked"),
                 }
-            }
 
-            let json = serde_json::to_string_pretty(&payload)
-                .map_err(|e| format!("serialize result: {e}"))?;
-            Ok((crop_path, json))
-        }
-        .await;
+                let json = serde_json::to_string_pretty(&payload)
+                    .map_err(|e| format!("serialize result: {e}"))?;
+                Ok((crop_path, json))
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(self.op_timeout_message(
+                    &params.session_id,
+                    "compare_element_to_baseline",
+                    budget,
+                ))
+            });
 
         let screenshot_name = outcome
             .as_ref()
@@ -241,6 +274,7 @@ impl UiTestServer {
                     "xpath": params.xpath,
                     "baseline_path": params.baseline_path,
                     "tolerance": tolerance,
+                    "timeout_ms": params.timeout.timeout_ms,
                 }),
                 log_outcome,
                 screenshot_name.as_deref(),
