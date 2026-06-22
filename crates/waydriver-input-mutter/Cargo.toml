@@ -13,8 +13,8 @@ keywords = ["wayland", "mutter", "input", "testing", "automation"]
 categories = ["development-tools::testing"]
 
 [dependencies]
-waydriver = { path = "../waydriver", version = "0.3.5" }
-waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter", version = "0.3.5" }
+waydriver = { path = "../waydriver", version = "0.3.6" }
+waydriver-compositor-mutter = { path = "../waydriver-compositor-mutter", version = "0.3.6" }
 async-trait.workspace = true
 serde.workspace = true
 tokio.workspace = true

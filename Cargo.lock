@@ -3599,7 +3599,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "atspi",
@@ -3629,7 +3629,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-capture-mutter"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3642,7 +3642,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-compositor-mutter"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "libc",
@@ -3657,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-e2e"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -3680,7 +3680,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-examples"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "tokio",
@@ -3694,7 +3694,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-fixture-gtk"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-input-mutter"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "serde",
@@ -3715,7 +3715,7 @@ dependencies = [
 
 [[package]]
 name = "waydriver-mcp"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "async-trait",
