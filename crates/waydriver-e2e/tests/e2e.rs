@@ -4363,15 +4363,24 @@ async fn find_by_role_resolves_gtk4_widgets() -> anyhow::Result<()> {
         assert_eq!(entry.text().await?, "role-helper");
     }
 
-    // The escape hatch composes the node-test verbatim, matching the toolkit's
-    // surprising tag for a check box (`Checkbox`, not `CheckBox`).
+    // Role::Checkbox is a divergent role: the walk tags a check box `Checkbox`
+    // but the cache tags it `CheckBox`. The typed helper compiles a union, so
+    // it resolves the widget regardless of which snapshot serves the lookup —
+    // where a single-tag `//Checkbox` would miss the cache and need a walk.
     let check = session
-        .find_by_role(Role::Other("Checkbox".into()), "agree-check")
+        .find_by_role(Role::Checkbox, "agree-check")
         .count()
         .await?;
-    assert_eq!(
-        check, 1,
-        "Role::Other(\"Checkbox\") must resolve agree-check"
+    assert_eq!(check, 1, "find_by_role(Checkbox) must resolve agree-check");
+
+    // The union selector is itself cache-eligible (only `@name`), so cache-first
+    // resolution serves it directly. Confirm the cache really does tag the check
+    // box `CheckBox` — the spelling the Role::Checkbox union must also match.
+    let cache_tree = session.dump_tree_cached().await?;
+    assert!(
+        cache_tree.contains("<CheckBox") && cache_tree.contains("name=\"agree-check\""),
+        "premise: the cache tags the check box `CheckBox`, the spelling the \
+         Role::Checkbox union must also match"
     );
 
     kill(session).await?;

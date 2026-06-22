@@ -2554,9 +2554,25 @@ mod tests {
     #[tokio::test]
     async fn session_find_by_role_id_composes_xpath() {
         let s = test_session();
+        // A non-divergent role keeps the plain node-test.
+        assert_eq!(
+            s.find_by_role_id(crate::Role::Button, "submit").xpath(),
+            "//Button[@id='submit']"
+        );
+        // A divergent role (TextBox/Text/Entry) expands to a self:: union so
+        // either snapshot path's tag resolves.
         assert_eq!(
             s.find_by_role_id(crate::Role::TextBox, "username").xpath(),
-            "//TextBox[@id='username']"
+            "//*[(self::TextBox or self::Text or self::Entry) and @id='username']"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_find_by_role_divergent_composes_union_xpath() {
+        let s = test_session();
+        assert_eq!(
+            s.find_by_role(crate::Role::Checkbox, "agree-check").xpath(),
+            "//*[(self::Checkbox or self::CheckBox) and @name='agree-check']"
         );
     }
 
