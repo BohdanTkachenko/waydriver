@@ -2571,8 +2571,8 @@ mod tests {
     async fn session_find_by_role_divergent_composes_union_xpath() {
         let s = test_session();
         assert_eq!(
-            s.find_by_role(crate::Role::Checkbox, "agree-check").xpath(),
-            "//*[(self::Checkbox or self::CheckBox) and @name='agree-check']"
+            s.find_by_role(crate::Role::CheckBox, "agree-check").xpath(),
+            "//*[(self::CheckBox or self::Checkbox) and @name='agree-check']"
         );
     }
 

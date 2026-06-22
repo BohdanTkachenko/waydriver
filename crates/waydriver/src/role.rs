@@ -8,18 +8,19 @@
 //! tags differ — see below), the typed counterpart to the string-based
 //! [`find_by_role_name`](crate::Session::find_by_role_name).
 //!
-//! The element names match what GTK4 / libadwaita actually emit over AT-SPI —
-//! verified by dumping the real accessibility tree of the test fixture, not
-//! the classic AT-SPI role strings. The toolkit's names are sometimes
-//! surprising (`Checkbox` not `CheckBox`, `Radio` not `RadioButton`, `TextBox`
-//! for an entry, `Meter` for a level bar), so each variant is named after the
-//! tag the `GetChildren` walk produces.
+//! Variant names are idiomatic CamelCase and equal their reference
+//! [`element_name`](Role::element_name) — the tag as it appears in a node-test.
+//! Those tags are what GTK4 / libadwaita actually expose over AT-SPI (verified
+//! by dumping the fixture tree), not the classic AT-SPI role strings, and the
+//! toolkit's names are sometimes surprising: `TextBox` for an entry, `Meter`
+//! for a level bar, `Radio` for a radio button.
 //!
 //! waydriver's two snapshot paths disagree on that tag for some roles: the
-//! walk uses GTK4's `GetRoleName` while the `Cache.GetItems` path uses the
-//! `atspi` role table (`Checkbox` vs `CheckBox`, `TextBox` vs `Text`, `Tab` vs
-//! `PageTab`). [`Role::element_names`] carries both spellings so a typed lookup
-//! resolves from the cache directly instead of falling back to the walk.
+//! `GetChildren` walk uses GTK4's `GetRoleName` while the `Cache.GetItems` path
+//! uses the `atspi` role table (`CheckBox` vs `Checkbox`, `TextBox` vs `Text`,
+//! `Tab` vs `PageTab`). [`Role::element_names`] carries both spellings so a
+//! typed lookup resolves from the cache directly instead of falling back to the
+//! walk.
 
 /// A common GTK4 / libadwaita accessibility role, used as typed shorthand for
 /// the element name in a locator query.
@@ -44,8 +45,8 @@ pub enum Role {
     Button,
     /// A two-state toggle button (`ToggleButton`).
     ToggleButton,
-    /// A check box (`Checkbox`).
-    Checkbox,
+    /// A check box (`CheckBox`).
+    CheckBox,
     /// A radio button (`Radio`).
     Radio,
     /// A switch (`Switch`).
@@ -101,7 +102,7 @@ impl Role {
         match self {
             Role::Button => "Button",
             Role::ToggleButton => "ToggleButton",
-            Role::Checkbox => "Checkbox",
+            Role::CheckBox => "CheckBox",
             Role::Radio => "Radio",
             Role::Switch => "Switch",
             Role::ComboBox => "ComboBox",
@@ -133,25 +134,25 @@ impl Role {
     /// waydriver derives a node's tag by PascalCasing the AT-SPI role-name
     /// string, and the two snapshot sources disagree on that string for some
     /// roles: the `GetChildren` walk uses GTK4's `GetRoleName` (e.g.
-    /// `"checkbox"` → `Checkbox`) while the `Cache.GetItems` path uses the
-    /// `atspi` role table (e.g. `"check box"` → `CheckBox`). A selector built
-    /// from a single tag would miss the cache snapshot and only resolve once
-    /// the locator falls back to the walk — defeating cache-first resolution.
+    /// `"check box"` → `CheckBox`) while the `Cache.GetItems` path uses the
+    /// `atspi` role table (e.g. `"checkbox"` → `Checkbox`). A selector built
+    /// from a single tag would miss one snapshot and only resolve once the
+    /// locator falls back to the walk — defeating cache-first resolution.
     ///
     /// So [`find_by_role`](crate::Session::find_by_role) matches the **union**
     /// of these tags, which lets the cache serve the lookup directly while the
-    /// walk still resolves on a cold cache. The first entry is always
-    /// [`element_name`](Self::element_name) (the walk tag); any extras are the
-    /// cache-path spellings. Aliases that never occur are harmless — the
+    /// walk still resolves on a cold cache. The first entry is always the
+    /// reference [`element_name`](Self::element_name); any extras are the
+    /// alternate snapshot spellings. Aliases that never occur are harmless — the
     /// accessible-name predicate is always ANDed in, and the walk remains the
-    /// correctness backstop. The divergences (`Checkbox`/`CheckBox`,
+    /// correctness backstop. The divergences (`CheckBox`/`Checkbox`,
     /// `TextBox`/`Text`, `Tab`/`PageTab`, `TabList`/`PageTabList`,
     /// `Radio`/`RadioButton`, `Meter`/`LevelBar`) are verified by dumping the
     /// fixture's walk and cache trees; `Window`/`Frame` tracks the same
     /// walk-vs-`atspi`-table split observed for the toplevel.
     pub fn element_names(&self) -> Vec<&str> {
         match self {
-            Role::Checkbox => vec!["Checkbox", "CheckBox"],
+            Role::CheckBox => vec!["CheckBox", "Checkbox"],
             Role::TextBox => vec!["TextBox", "Text", "Entry"],
             Role::Radio => vec!["Radio", "RadioButton"],
             Role::Meter => vec!["Meter", "LevelBar"],
@@ -171,8 +172,8 @@ mod tests {
     fn named_roles_map_to_gtk4_element_names() {
         assert_eq!(Role::Button.element_name(), "Button");
         assert_eq!(Role::TextBox.element_name(), "TextBox");
-        // GTK4's toolkit names differ from the classic AT-SPI strings.
-        assert_eq!(Role::Checkbox.element_name(), "Checkbox");
+        // The reference tag equals the (CamelCase) variant name.
+        assert_eq!(Role::CheckBox.element_name(), "CheckBox");
         assert_eq!(Role::Radio.element_name(), "Radio");
         assert_eq!(Role::Meter.element_name(), "Meter");
     }
@@ -195,14 +196,15 @@ mod tests {
     }
 
     #[test]
-    fn divergent_roles_carry_walk_tag_first_then_cache_aliases() {
-        // The walk tag (== element_name) is always first; cache spellings follow.
-        for role in [Role::Checkbox, Role::TextBox, Role::Radio, Role::Meter] {
+    fn divergent_roles_carry_reference_tag_first_then_aliases() {
+        // The reference tag (== element_name) is always first; the alternate
+        // snapshot spellings follow.
+        for role in [Role::CheckBox, Role::TextBox, Role::Radio, Role::Meter] {
             let names = role.element_names();
             assert_eq!(names[0], role.element_name());
-            assert!(names.len() > 1, "{role:?} should expose a cache alias");
+            assert!(names.len() > 1, "{role:?} should expose an alias");
         }
-        assert_eq!(Role::Checkbox.element_names(), vec!["Checkbox", "CheckBox"]);
+        assert_eq!(Role::CheckBox.element_names(), vec!["CheckBox", "Checkbox"]);
         assert_eq!(Role::Tab.element_names(), vec!["Tab", "PageTab"]);
     }
 }

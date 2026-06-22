@@ -2112,8 +2112,8 @@ impl Session {
     ///
     /// Roles whose walk- and cache-snapshot tags differ (see
     /// [`Role::element_names`]) compile to a union node-test so the cache can
-    /// serve the lookup — e.g. `find_by_role(Role::Checkbox, "agree")` becomes
-    /// `//*[(self::Checkbox or self::CheckBox) and @name='agree']`.
+    /// serve the lookup — e.g. `find_by_role(Role::CheckBox, "agree")` becomes
+    /// `//*[(self::CheckBox or self::Checkbox) and @name='agree']`.
     ///
     /// For a role without a named variant, use [`Role::Other`] or the string
     /// API [`find_by_role_name`](Self::find_by_role_name).
@@ -2804,8 +2804,8 @@ mod tests {
         // A divergent role expands to a `self::` union so either snapshot's
         // tag matches, with the `@attr` predicate ANDed in.
         assert_eq!(
-            find_by_role_union_xpath(&["Checkbox", "CheckBox"], "name", "agree"),
-            "//*[(self::Checkbox or self::CheckBox) and @name='agree']"
+            find_by_role_union_xpath(&["CheckBox", "Checkbox"], "name", "agree"),
+            "//*[(self::CheckBox or self::Checkbox) and @name='agree']"
         );
         assert_eq!(
             find_by_role_union_xpath(&["TextBox", "Text", "Entry"], "id", "user"),
