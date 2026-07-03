@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.3.11](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.3.10...waydriver-v0.3.11) - 2026-07-03
+
+### Other
+
+- release v0.3.10
+
 ## [0.3.10](https://github.com/BohdanTkachenko/waydriver/compare/waydriver-v0.3.9...waydriver-v0.3.10) - 2026-07-03
 
 ### Fixed
