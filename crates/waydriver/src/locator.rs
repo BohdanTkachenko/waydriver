@@ -1007,23 +1007,21 @@ impl Locator {
 
     /// Park the pointer over the centre of `bounds` (a window-relative rect).
     ///
-    /// Mutter's RemoteDesktop exposes only *relative* pointer motion, so the
-    /// simplest way to reach a known absolute coordinate is to clamp to the
-    /// top-left corner with a large negative delta, then offset to the
-    /// target's screen-absolute centre. `bounds` is window-relative;
-    /// [`Session::to_screen_bounds`](crate::Session::to_screen_bounds)
+    /// Uses the same calibrated warmup as [`hover`](Self::hover) / clicks —
+    /// approach from an offset point, settle, then move onto the target and
+    /// settle again — because a bare warp doesn't cross the widget boundary,
+    /// so GTK's `EventControllerScroll` never sees pointer focus bind and
+    /// silently drops the wheel events that follow (same root cause as #65,
+    /// just for the axis path instead of buttons). `bounds` is
+    /// window-relative; [`Session::to_screen_bounds`](crate::Session::to_screen_bounds)
     /// translates it first so the pointer lands on the right surface even when
     /// the toplevel isn't at the screen origin. Shared by [`scroll`](Self::scroll)
     /// and the wheel fallback in [`scroll_into_view`](Self::scroll_into_view).
     async fn park_pointer_over(&self, bounds: crate::atspi::Rect) -> Result<()> {
         let screen = self.session.to_screen_bounds(bounds).await?;
         self.session
-            .pointer_motion_relative(-10_000.0, -10_000.0)
-            .await?;
-        self.session
-            .pointer_motion_relative(screen.center_x() as f64, screen.center_y() as f64)
-            .await?;
-        Ok(())
+            .pointer_warmup_to(screen.center_x() as f64, screen.center_y() as f64)
+            .await
     }
 
     /// Scroll the matched element by `steps` wheel detents along `axis`.
