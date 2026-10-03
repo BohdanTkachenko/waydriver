@@ -91,6 +91,91 @@
             exec ${pkgs.dbus}/bin/dbus-run-session -- \
               cargo test -p waydriver-e2e -- --ignored --test-threads=1 "$@"
           '';
+
+          # The ocrs models behind the `visual` locator, fetched at build time
+          # so the server never downloads them on first use. The hashes are
+          # the ones `crates/waydriver/src/visual/models.rs` checks downloads
+          # against; bump both together.
+          ocrsModels = {
+            detection = pkgs.fetchurl {
+              url = "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.rten";
+              sha256 = "f15cfb56bd02c4bf478a20343986504a1f01e1665c2b3a0ad66340f054b1b5ca";
+            };
+            recognition = pkgs.fetchurl {
+              url = "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten";
+              sha256 = "e484866d4cce403175bd8d00b128feb08ab42e208de30e42cd9889d8f1735a6e";
+            };
+          };
+
+          # The private session bus the `mcp` wrapper runs the server on. Its
+          # only activatable services are at-spi2-core's. With the system's
+          # session.conf instead, the bus also activates the host's
+          # xdg-desktop-portal, which on a bus with no desktop session behind
+          # it never answers. GDK queries the portal synchronously at
+          # startup, so every app then stalls for D-Bus's 25s timeout and
+          # misses the 10s AT-SPI registry deadline.
+          sessionBusConfig = pkgs.writeText "waydriver-session.conf" ''
+            <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+             "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+            <busconfig>
+              <type>session</type>
+              <keep_umask/>
+              <listen>unix:tmpdir=/tmp</listen>
+              <auth>EXTERNAL</auth>
+              <servicedir>${pkgs.at-spi2-core}/share/dbus-1/services</servicedir>
+              <policy context="default">
+                <allow send_destination="*" eavesdrop="true"/>
+                <allow eavesdrop="true"/>
+                <allow own="*"/>
+              </policy>
+            </busconfig>
+          '';
+
+          # The MCP server with its runtime deps injected. A package, not
+          # just an app, so a NixOS / home-manager config can put it in an
+          # `mcpServers` entry (`lib.getExe waydriver.packages.<system>.mcp`).
+          #
+          # It runs on a fresh session bus, as the Docker entrypoint and
+          # `e2e-tests` do, since the host login bus can't activate the
+          # nix-store `org.a11y.Bus.service` (and a container may have no
+          # session bus at all). Three things make that work:
+          #
+          # - ATSPI_DBUS_IMPLEMENTATION=dbus-daemon: nixpkgs builds
+          #   at-spi-bus-launcher to try dbus-broker first, and
+          #   dbus-broker-launch asks systemd on the session bus to start it,
+          #   which a private bus has no systemd to answer.
+          # - sessionBusConfig above, for the portal.
+          # - stdout: the bus and every service it activates inherit the
+          #   wrapper's stdout, which is the MCP stdio transport, and
+          #   at-spi2-registryd prints a banner there in the middle of the
+          #   JSON-RPC stream. The bus gets stderr; only the server gets the
+          #   real stdout back.
+          mcp = pkgs.writeShellScriptBin "waydriver-mcp" ''
+            export PATH="${
+              pkgs.lib.makeBinPath [
+                pkgs.dbus
+                pkgs.at-spi2-core
+                pkgs.mutter
+                pkgs.pipewire
+                pkgs.wireplumber
+                pkgs.gst_all_1.gstreamer
+                pkgs.gst_all_1.gst-plugins-base
+                pkgs.gst_all_1.gst-plugins-good
+              ]
+            }:$PATH"
+            # at-spi-bus-launcher lives in libexec
+            export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
+            export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${pkgs.gsettings-desktop-schemas}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+            # GStreamer plugin paths (core, base, good, pipewire)
+            export GST_PLUGIN_PATH="${gstPluginPath}"
+            export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon
+            export WAYDRIVER_OCRS_DETECTION_MODEL="''${WAYDRIVER_OCRS_DETECTION_MODEL:-${ocrsModels.detection}}"
+            export WAYDRIVER_OCRS_RECOGNITION_MODEL="''${WAYDRIVER_OCRS_RECOGNITION_MODEL:-${ocrsModels.recognition}}"
+            exec 3>&1 1>&2
+            exec ${pkgs.dbus}/bin/dbus-run-session --config-file=${sessionBusConfig} -- \
+              ${pkgs.bash}/bin/bash -c 'exec "$0" "$@" 1>&3 3>&-' \
+              ${self.packages.${system}.default}/bin/waydriver-mcp "$@"
+          '';
         in
         {
           packages = {
@@ -119,6 +204,8 @@
                 pipewire
               ];
             };
+
+            inherit mcp;
 
             dev-profile = pkgs.buildEnv {
               name = "waydriver-dev-profile";
@@ -182,38 +269,11 @@
                 "${script}/bin/waydriver-docker-build-e2e";
             };
 
-            # nix run .# — launches the MCP server with runtime deps on PATH
+            # nix run .#mcp — launches the MCP server with runtime deps
+            # injected (see `mcp` above)
             mcp = {
               type = "app";
-              program =
-                let
-                  wrapper = pkgs.writeShellScriptBin "waydriver-mcp" ''
-                    export PATH="${
-                      pkgs.lib.makeBinPath [
-                        pkgs.dbus
-                        pkgs.at-spi2-core
-                        pkgs.mutter
-                        pkgs.pipewire
-                        pkgs.wireplumber
-                        pkgs.gst_all_1.gstreamer
-                        pkgs.gst_all_1.gst-plugins-base
-                        pkgs.gst_all_1.gst-plugins-good
-                      ]
-                    }:$PATH"
-                    # at-spi-bus-launcher lives in libexec
-                    export PATH="${pkgs.at-spi2-core}/libexec:$PATH"
-                    # D-Bus service files for AT-SPI registry auto-activation
-                    export XDG_DATA_DIRS="${pkgs.at-spi2-core}/share:${
-                      pkgs.lib.concatStringsSep ":" [
-                        "${pkgs.gsettings-desktop-schemas}/share"
-                      ]
-                    }:''${XDG_DATA_DIRS:-/run/current-system/sw/share}"
-                    # GStreamer plugin paths (core, base, good, pipewire)
-                    export GST_PLUGIN_PATH="${gstPluginPath}"
-                    exec ${self.packages.${system}.default}/bin/waydriver-mcp "$@"
-                  '';
-                in
-                "${wrapper}/bin/waydriver-mcp";
+              program = "${mcp}/bin/waydriver-mcp";
             };
           };
 
